@@ -10,7 +10,7 @@ import {
   signDer
 } from "./crypto.js";
 import { encodeName } from "./name.js";
-import { certificateToPem, pemToDer } from "./pem.js";
+import { certificateToPem, pemToDer, pemToDerWithLabel, splitPemBlocks } from "./pem.js";
 import { parseCertificateDer, type ParsedCertificate } from "./parser.js";
 import type {
   CertificateAuthority,
@@ -150,7 +150,10 @@ export async function issueClientCert(options: IssueClientCertOptions): Promise<
 }
 
 export async function importCertificateAuthority(options: ImportCertificateAuthorityOptions): Promise<CertificateAuthority> {
-  const certDer = pemToDer(options.certPem);
+  const issuerChainPem = options.issuerChainPem ?? "";
+  assertIssuerChainPem(issuerChainPem);
+
+  const certDer = pemToDerWithLabel(options.certPem, "CERTIFICATE");
   const parsed = await parseCertificateDer(certDer);
   const privateKey = await importPrivateKeyPem(options.privateKeyPem);
   await assertKeyPairMatches(privateKey, parsed.publicKey);
@@ -162,7 +165,7 @@ export async function importCertificateAuthority(options: ImportCertificateAutho
     certDer: cloneBytes(certDer),
     privateKey,
     publicKey: parsed.publicKey,
-    issuerChainPem: options.issuerChainPem ?? ""
+    issuerChainPem
   };
 
   caMetadata.set(ca, {
@@ -171,6 +174,19 @@ export async function importCertificateAuthority(options: ImportCertificateAutho
   });
 
   return ca;
+}
+
+function assertIssuerChainPem(chainPem: string): void {
+  if (chainPem.trim().length === 0) {
+    return;
+  }
+  const blocks = splitPemBlocks(chainPem);
+  if (blocks.length === 0) {
+    throw new Error("issuerChainPem must contain CERTIFICATE blocks");
+  }
+  for (const block of blocks) {
+    pemToDerWithLabel(block, "CERTIFICATE");
+  }
 }
 
 async function assembleCertificateAuthority(

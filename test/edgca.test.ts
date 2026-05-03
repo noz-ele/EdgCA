@@ -178,6 +178,152 @@ describe("subject encoding", () => {
   });
 });
 
+describe("input validation", () => {
+  it("rejects subject entries with non-string fields", async () => {
+    await expect(
+      createRootCA({
+        subject: [{ type: "CN", value: 123 as never }],
+        days: 365
+      })
+    ).rejects.toThrow("must be a string");
+  });
+
+  it("rejects empty subject value", async () => {
+    await expect(
+      createRootCA({
+        subject: [{ type: "CN", value: "" }],
+        days: 365
+      })
+    ).rejects.toThrow("must not be empty");
+  });
+
+  it("rejects negative pathLenConstraint", async () => {
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        pathLenConstraint: -1
+      })
+    ).rejects.toThrow("pathLenConstraint");
+  });
+
+  it("rejects non-integer pathLenConstraint", async () => {
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        pathLenConstraint: 1.5
+      })
+    ).rejects.toThrow("pathLenConstraint");
+  });
+
+  it("rejects oversized serialNumber Uint8Array", async () => {
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        serialNumber: new Uint8Array(21)
+      })
+    ).rejects.toThrow("20 octets");
+  });
+
+  it("rejects empty serialNumber Uint8Array", async () => {
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        serialNumber: new Uint8Array(0)
+      })
+    ).rejects.toThrow("must not be empty");
+  });
+
+  it("accepts a 20-byte serialNumber with high bit cleared", async () => {
+    const bytes = new Uint8Array(20).fill(0x01);
+    const root = await createRootCA({
+      subject: rootSubject,
+      days: 365,
+      serialNumber: bytes
+    });
+    expect(root.certPem.startsWith("-----BEGIN CERTIFICATE-----")).toBe(true);
+  });
+
+  it("rejects invalid dnsName format", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    await expect(
+      issueClientCert({
+        ca: root,
+        subject: clientSubject,
+        days: 30,
+        dnsNames: ["bad name with spaces"]
+      })
+    ).rejects.toThrow("dNSName");
+  });
+
+  it("rejects empty dnsName", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    await expect(
+      issueClientCert({
+        ca: root,
+        subject: clientSubject,
+        days: 30,
+        dnsNames: [""]
+      })
+    ).rejects.toThrow("dNSName");
+  });
+
+  it("rejects importCertificateAuthority when certPem has wrong label", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    await expect(
+      importCertificateAuthority({
+        certPem: root.privateKeyPem,
+        privateKeyPem: root.privateKeyPem
+      })
+    ).rejects.toThrow("expected CERTIFICATE");
+  });
+
+  it("rejects importCertificateAuthority when privateKeyPem has wrong label", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    await expect(
+      importCertificateAuthority({
+        certPem: root.certPem,
+        privateKeyPem: root.certPem
+      })
+    ).rejects.toThrow("expected PRIVATE KEY");
+  });
+
+  it("rejects importCertificateAuthority when issuerChainPem contains a non-CERTIFICATE block", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 30
+    });
+    await expect(
+      importCertificateAuthority({
+        certPem: intermediate.certPem,
+        privateKeyPem: intermediate.privateKeyPem,
+        issuerChainPem: intermediate.privateKeyPem
+      })
+    ).rejects.toThrow("expected CERTIFICATE");
+  });
+
+  it("rejects importCertificateAuthority when issuerChainPem is non-empty garbage", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 30
+    });
+    await expect(
+      importCertificateAuthority({
+        certPem: intermediate.certPem,
+        privateKeyPem: intermediate.privateKeyPem,
+        issuerChainPem: "not a pem block"
+      })
+    ).rejects.toThrow("CERTIFICATE blocks");
+  });
+});
+
 describe("low-level encoders", () => {
   it("converts P-256 ECDSA raw signatures to DER and back", () => {
     const raw = new Uint8Array(64);

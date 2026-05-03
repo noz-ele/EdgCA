@@ -24,6 +24,18 @@ export function pemToDer(pem: string): Uint8Array {
   return binaryToBytes(atob(base64));
 }
 
+export function pemToDerWithLabel(pem: string, label: string): Uint8Array {
+  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`-----BEGIN ${escaped}-----([\\s\\S]*?)-----END ${escaped}-----`);
+  const match = pattern.exec(pem);
+  if (!match?.[1]) {
+    throw new Error(`Invalid PEM block: expected ${label}`);
+  }
+
+  const base64 = match[1].replace(/\s+/g, "");
+  return binaryToBytes(atob(base64));
+}
+
 export function splitPemBlocks(pem: string): string[] {
   const blocks: string[] = [];
   const pattern = /-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/g;

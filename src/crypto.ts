@@ -1,6 +1,6 @@
 import { arrayBufferFromBytes, concatBytes } from "./bytes.js";
 import { integer, readChildren, readElement, sequence, TAG } from "./der.js";
-import { pemToDer, privateKeyDerToPem, publicKeyDerToPem } from "./pem.js";
+import { pemToDerWithLabel, privateKeyDerToPem, publicKeyDerToPem } from "./pem.js";
 
 const EC_ALGORITHM: EcKeyGenParams = {
   name: "ECDSA",
@@ -53,7 +53,7 @@ export async function exportSpki(key: CryptoKey): Promise<Uint8Array> {
 }
 
 export async function importPrivateKeyPem(pem: string): Promise<CryptoKey> {
-  return crypto.subtle.importKey("pkcs8", arrayBufferFromBytes(pemToDer(pem)), EC_ALGORITHM, true, ["sign"]);
+  return crypto.subtle.importKey("pkcs8", arrayBufferFromBytes(pemToDerWithLabel(pem, "PRIVATE KEY")), EC_ALGORITHM, true, ["sign"]);
 }
 
 export async function importPublicKeySpki(spki: Uint8Array): Promise<CryptoKey> {

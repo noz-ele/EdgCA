@@ -11,7 +11,19 @@ export function encodeName(subject: Subject): Uint8Array {
   }
 
   return sequence(
-    ...subject.map((attribute) => {
+    ...subject.map((attribute, index) => {
+      if (!attribute || typeof attribute !== "object") {
+        throw new Error(`subject[${index}] must be an object with type and value`);
+      }
+      if (typeof attribute.type !== "string") {
+        throw new Error(`subject[${index}].type must be a string`);
+      }
+      if (typeof attribute.value !== "string") {
+        throw new Error(`subject[${index}].value must be a string`);
+      }
+      if (attribute.value.length === 0) {
+        throw new Error(`subject[${index}].value must not be empty`);
+      }
       const attributeOid = resolveAttributeOid(attribute.type);
       const value = attribute.type === "C" ? printableString(attribute.value) : utf8String(attribute.value);
       return set(sequence(oid(attributeOid), value));

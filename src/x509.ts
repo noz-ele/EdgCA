@@ -10,6 +10,7 @@ import {
   ia5String,
   octetString,
   oid,
+  readElement,
   sequence,
   TAG,
   utcTime
@@ -66,6 +67,12 @@ export function ecdsaWithSha256AlgorithmIdentifier(): Uint8Array {
 }
 
 export function basicConstraintsExtension(ca: boolean, pathLenConstraint?: number): Uint8Array {
+  if (pathLenConstraint !== undefined) {
+    if (typeof pathLenConstraint !== "number" || !Number.isInteger(pathLenConstraint) || pathLenConstraint < 0) {
+      throw new Error("pathLenConstraint must be a non-negative integer");
+    }
+  }
+
   const children = ca
     ? pathLenConstraint === undefined
       ? [boolean(true)]
@@ -109,6 +116,9 @@ export function subjectAltNameExtension(dnsNames?: readonly string[], ipAddresse
   const names: Uint8Array[] = [];
 
   for (const dnsName of dnsNames ?? []) {
+    if (typeof dnsName !== "string" || dnsName.length > 253 || !DNS_NAME_PATTERN.test(dnsName)) {
+      throw new Error(`Invalid SAN dNSName: ${dnsName}`);
+    }
     names.push(der(0x82, asciiBytes(dnsName)));
   }
 
@@ -119,6 +129,8 @@ export function subjectAltNameExtension(dnsNames?: readonly string[], ipAddresse
   return names.length > 0 ? extension(OID.subjectAltName, false, sequence(...names)) : undefined;
 }
 
+const DNS_NAME_PATTERN = /^(\*\.)?[A-Za-z0-9_\-]+(\.[A-Za-z0-9_\-]+)*$/;
+
 function extension(extensionOid: string, critical: boolean, valueDer: Uint8Array): Uint8Array {
   return sequence(
     oid(extensionOid),
@@ -128,6 +140,15 @@ function extension(extensionOid: string, critical: boolean, valueDer: Uint8Array
 }
 
 function encodeSerialNumber(serialNumber?: SerialNumber): Uint8Array {
+  const encoded = encodeSerialNumberDer(serialNumber);
+  const element = readElement(encoded);
+  if (element.length > 20) {
+    throw new Error("serialNumber encoded value must not exceed 20 octets");
+  }
+  return encoded;
+}
+
+function encodeSerialNumberDer(serialNumber?: SerialNumber): Uint8Array {
   if (serialNumber === undefined) {
     const bytes = new Uint8Array(16);
     crypto.getRandomValues(bytes);
@@ -136,6 +157,16 @@ function encodeSerialNumber(serialNumber?: SerialNumber): Uint8Array {
       bytes[15] = 1;
     }
     return integer(bytes);
+  }
+
+  if (serialNumber instanceof Uint8Array) {
+    if (serialNumber.length === 0) {
+      throw new Error("serialNumber Uint8Array must not be empty");
+    }
+    if (serialNumber.length > 20) {
+      throw new Error("serialNumber Uint8Array must not exceed 20 octets");
+    }
+    return integer(serialNumber);
   }
 
   if (typeof serialNumber === "string") {
