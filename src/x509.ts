@@ -7,7 +7,6 @@ import {
   explicit,
   generalizedTime,
   integer,
-  ia5String,
   octetString,
   oid,
   readElement,

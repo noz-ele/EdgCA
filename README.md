@@ -61,6 +61,8 @@ console.log(client.certChainPem);
 root CA -> intermediate CA -> mTLS client certificate
 ```
 
+EdgCA の CA 階層はこの形を最大とし、intermediate CA からさらに intermediate CA を発行する chain は対象外です。
+
 `client.certChainPem` は次の順で出力されます。
 
 ```text

@@ -1,4 +1,4 @@
-import { cloneBytes, concatBytes } from "./bytes.js";
+import { bytesEqual, cloneBytes } from "./bytes.js";
 import {
   assertKeyPairMatches,
   exportSpki,
@@ -42,8 +42,9 @@ export async function createRootCA(options: CreateRootCAOptions): Promise<Certif
   const subjectNameDer = encodeName(options.subject);
   const spki = await exportSpki(keyPair.publicKey);
   const keyIdentifier = await keyIdentifierFromSpki(spki);
+  const pathLenConstraint = resolveRootPathLenConstraint(options.pathLenConstraint);
   const extensions = [
-    basicConstraintsExtension(true, options.pathLenConstraint),
+    basicConstraintsExtension(true, pathLenConstraint),
     keyUsageExtension(["keyCertSign", "cRLSign"]),
     subjectKeyIdentifierExtension(keyIdentifier),
     authorityKeyIdentifierExtension(keyIdentifier)
@@ -80,7 +81,7 @@ export async function issueIntermediateCA(options: IssueIntermediateCAOptions): 
   const subjectKeyIdentifier = await keyIdentifierFromSpki(spki);
   const authorityKeyIdentifier = issuer.subjectKeyIdentifier ?? await keyIdentifierFromSpki(issuer.subjectPublicKeyInfoDer);
   const extensions = [
-    basicConstraintsExtension(true, options.pathLenConstraint ?? 0),
+    basicConstraintsExtension(true, 0),
     keyUsageExtension(["keyCertSign", "cRLSign"]),
     subjectKeyIdentifierExtension(subjectKeyIdentifier),
     authorityKeyIdentifierExtension(authorityKeyIdentifier)
@@ -142,7 +143,7 @@ export async function issueClientCert(options: IssueClientCertOptions): Promise<
     certPem,
     privateKeyPem: await privateKeyToPem(keyPair.privateKey),
     publicKeyPem: await publicKeyToPem(keyPair.publicKey),
-    certDer,
+    certDer: cloneBytes(certDer),
     privateKey: keyPair.privateKey,
     publicKey: keyPair.publicKey,
     certChainPem: joinPemChain([certPem, options.ca.certPem, issuer.issuerChainPem])
@@ -198,7 +199,7 @@ async function assembleCertificateAuthority(
     certPem: certificateToPem(certDer),
     privateKeyPem: await privateKeyToPem(keyPair.privateKey),
     publicKeyPem: await publicKeyToPem(keyPair.publicKey),
-    certDer,
+    certDer: cloneBytes(certDer),
     privateKey: keyPair.privateKey,
     publicKey: keyPair.publicKey,
     issuerChainPem
@@ -236,12 +237,30 @@ function assertCanIssueIntermediate(issuer: CaMetadata, requestedPathLenConstrai
     throw new Error("Issuer pathLenConstraint=0 does not allow issuing another intermediate CA");
   }
 
-  if (issuer.pathLenConstraint !== undefined) {
-    const requested = requestedPathLenConstraint ?? 0;
-    if (requested > issuer.pathLenConstraint - 1) {
-      throw new Error("Requested pathLenConstraint exceeds issuer limit");
-    }
+  if (!isRootCa(issuer)) {
+    throw new Error("Only root CAs may issue intermediate CAs");
   }
+
+  const requested = requestedPathLenConstraint ?? 0;
+  if (requested !== 0) {
+    throw new Error("Intermediate pathLenConstraint must be 0");
+  }
+}
+
+function resolveRootPathLenConstraint(pathLenConstraint: number | undefined): number {
+  if (pathLenConstraint === undefined) {
+    return 1;
+  }
+
+  if (pathLenConstraint !== 0 && pathLenConstraint !== 1) {
+    throw new Error("Root pathLenConstraint must be 0 or 1");
+  }
+
+  return pathLenConstraint;
+}
+
+function isRootCa(issuer: CaMetadata): boolean {
+  return issuer.issuerChainPem.trim().length === 0 && bytesEqual(issuer.issuerNameDer, issuer.subjectNameDer);
 }
 
 function joinPemChain(parts: readonly string[]): string {
