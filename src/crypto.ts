@@ -56,6 +56,15 @@ export async function importPrivateKeyPem(pem: string): Promise<CryptoKey> {
   return crypto.subtle.importKey("pkcs8", arrayBufferFromBytes(pemToDerWithLabel(pem, "PRIVATE KEY")), EC_ALGORITHM, true, ["sign"]);
 }
 
+export async function keyPairFromPrivateKeyPem(pem: string): Promise<CryptoKeyPair> {
+  const privateKey = await importPrivateKeyPem(pem);
+  const jwk = await crypto.subtle.exportKey("jwk", privateKey);
+  delete jwk.d;
+  jwk.key_ops = ["verify"];
+  const publicKey = await crypto.subtle.importKey("jwk", jwk, EC_ALGORITHM, true, ["verify"]);
+  return { privateKey, publicKey };
+}
+
 export async function importPublicKeySpki(spki: Uint8Array): Promise<CryptoKey> {
   return crypto.subtle.importKey("spki", arrayBufferFromBytes(spki), EC_ALGORITHM, true, ["verify"]);
 }

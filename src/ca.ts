@@ -5,6 +5,7 @@ import {
   generateKeyPair,
   importPrivateKeyPem,
   keyIdentifierFromSpki,
+  keyPairFromPrivateKeyPem,
   privateKeyToPem,
   publicKeyToPem,
   signDer
@@ -38,7 +39,7 @@ interface CaMetadata extends ParsedCertificate {
 const caMetadata = new WeakMap<CertificateAuthority, CaMetadata>();
 
 export async function createRootCA(options: CreateRootCAOptions): Promise<CertificateAuthority> {
-  const keyPair = await generateKeyPair();
+  const keyPair = await resolveKeyPair(options.privateKeyPem);
   const subjectNameDer = encodeName(options.subject);
   const spki = await exportSpki(keyPair.publicKey);
   const keyIdentifier = await keyIdentifierFromSpki(spki);
@@ -75,7 +76,7 @@ export async function issueIntermediateCA(options: IssueIntermediateCAOptions): 
   assertCanIssueCertificate(issuer);
   assertCanIssueIntermediate(issuer, options.pathLenConstraint);
 
-  const keyPair = await generateKeyPair();
+  const keyPair = await resolveKeyPair(options.privateKeyPem);
   const subjectNameDer = encodeName(options.subject);
   const spki = await exportSpki(keyPair.publicKey);
   const subjectKeyIdentifier = await keyIdentifierFromSpki(spki);
@@ -188,6 +189,13 @@ function assertIssuerChainPem(chainPem: string): void {
   for (const block of blocks) {
     pemToDerWithLabel(block, "CERTIFICATE");
   }
+}
+
+async function resolveKeyPair(privateKeyPem: string | undefined): Promise<CryptoKeyPair> {
+  if (privateKeyPem) {
+    return keyPairFromPrivateKeyPem(privateKeyPem);
+  }
+  return generateKeyPair();
 }
 
 async function assembleCertificateAuthority(

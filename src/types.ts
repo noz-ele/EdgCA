@@ -54,6 +54,7 @@ export interface CreateRootCAOptions {
   notBefore?: Date;
   serialNumber?: SerialNumber;
   pathLenConstraint?: number;
+  privateKeyPem?: string;
 }
 
 export interface IssueIntermediateCAOptions {
@@ -63,6 +64,7 @@ export interface IssueIntermediateCAOptions {
   notBefore?: Date;
   serialNumber?: SerialNumber;
   pathLenConstraint?: number;
+  privateKeyPem?: string;
 }
 
 export interface IssueClientCertOptions {

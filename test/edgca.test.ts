@@ -196,6 +196,55 @@ describe("EdgCA issuing API", () => {
     ]);
   });
 
+  it("reuses a caller-provided private key for the root CA", async () => {
+    const seed = await createRootCA({ subject: rootSubject, days: 365 });
+    const reissued = await createRootCA({
+      subject: rootSubject,
+      days: 365,
+      privateKeyPem: seed.privateKeyPem
+    });
+
+    expect(reissued.privateKeyPem).toBe(seed.privateKeyPem);
+    expect(reissued.publicKeyPem).toBe(seed.publicKeyPem);
+
+    const seedParsed = await parseCertificate(seed.certDer);
+    const reissuedParsed = await parseCertificate(reissued.certDer);
+    expect(Array.from(reissuedParsed.subjectPublicKeyInfoDer)).toEqual(
+      Array.from(seedParsed.subjectPublicKeyInfoDer)
+    );
+    const seedSki = parseSubjectKeyIdentifier(getExtension(seed.certDer, OID.subjectKeyIdentifier).value);
+    const reissuedSki = parseSubjectKeyIdentifier(getExtension(reissued.certDer, OID.subjectKeyIdentifier).value);
+    expect(Array.from(reissuedSki)).toEqual(Array.from(seedSki));
+  });
+
+  it("issues an intermediate CA with a caller-provided private key", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const seed = await createRootCA({ subject: intermediateSubject, days: 365 });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365,
+      privateKeyPem: seed.privateKeyPem
+    });
+
+    expect(intermediate.privateKeyPem).toBe(seed.privateKeyPem);
+
+    const parsedRoot = await parseCertificate(root.certDer);
+    const parsedIntermediate = await parseCertificate(intermediate.certDer);
+    await expect(expectSignatureValid(parsedRoot, parsedIntermediate)).resolves.toBe(true);
+  });
+
+  it("rejects a non-PRIVATE-KEY PEM passed as privateKeyPem", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        privateKeyPem: root.certPem
+      })
+    ).rejects.toThrow("expected PRIVATE KEY");
+  });
+
   it("rejects importing a CA certificate with a mismatched private key", async () => {
     const root = await createRootCA({ subject: rootSubject, days: 3650 });
     const otherRoot = await createRootCA({

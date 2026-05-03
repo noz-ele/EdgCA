@@ -110,6 +110,7 @@ function createRootCA(options: {
   notBefore?: Date;
   serialNumber?: SerialNumber;
   pathLenConstraint?: number;
+  privateKeyPem?: string;
 }): Promise<CertificateAuthority>;
 ```
 
@@ -124,6 +125,8 @@ root certificate は self-signed です。返却値の `issuerChainPem` は `""`
 
 `pathLenConstraint` 省略時は `1` です。指定できる値は `0` または `1` です。`0` の root CA は client certificate だけを発行でき、intermediate CA は発行できません。
 
+`privateKeyPem` を渡すと、その秘密鍵で root CA を発行します。鍵管理を呼び出し側に寄せるため、長期保管されている鍵を渡す利用形態が推奨です。省略時は内部で鍵を生成します (テスト・PoC 用途)。形式は PKCS#8 PEM (P-256 ECDSA、非暗号化)。
+
 ### `issueIntermediateCA(options)`
 
 root CA から intermediate CA を発行します。intermediate CA からさらに intermediate CA を発行することはできません。
@@ -136,6 +139,7 @@ function issueIntermediateCA(options: {
   notBefore?: Date;
   serialNumber?: SerialNumber;
   pathLenConstraint?: number;
+  privateKeyPem?: string;
 }): Promise<CertificateAuthority>;
 ```
 
@@ -151,6 +155,8 @@ function issueIntermediateCA(options: {
 issuer root CA が `pathLenConstraint=0` の場合、この関数は例外を投げます。これは、leaf certificate だけを発行できる CA の下に intermediate CA を作らないためです。
 
 返却される CA の `issuerChainPem` には parent chain が保存されます。
+
+`privateKeyPem` を渡すと、その秘密鍵で intermediate CA を発行します。`createRootCA` と同じく、保管済みの鍵を渡す形が推奨です。省略時は内部で鍵を生成します。形式は PKCS#8 PEM (P-256 ECDSA、非暗号化)。
 
 ### `issueClientCert(options)`
 

@@ -123,6 +123,27 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 
 EdgCA は鍵の生成と import/export だけを扱います。鍵をどこに保存するか、保存時にどう暗号化するか、ローテーション状態をどう永続化するか、Cloudflare storage products とどう連携するかは application 側の責務です。
 
+### CA 鍵の持ち込み (推奨)
+
+root CA と intermediate CA は長期保管が前提です。鍵管理を呼び出し側に寄せるため、`createRootCA` と `issueIntermediateCA` は既に保管されている秘密鍵を `privateKeyPem` で受け取れます。鍵のライフサイクル (生成・保管・ローテーション) を呼び出し側の鍵管理基盤で一貫して扱えるため、こちらが推奨ルートです。
+
+```ts
+const root = await createRootCA({
+  subject: [{ type: "CN", value: "dev-root" }],
+  days: 3650,
+  privateKeyPem: loadFromVault("root")    // 既に保管されている PKCS#8 PEM
+});
+
+const intermediate = await issueIntermediateCA({
+  ca: root,
+  subject: [{ type: "CN", value: "dev-intermediate" }],
+  days: 365,
+  privateKeyPem: loadFromVault("intermediate")
+});
+```
+
+`privateKeyPem` を省略した場合は内部で鍵を生成します。テストや PoC 用途の簡便動作です。client certificate の鍵は ephemeral 想定のため `issueClientCert` では常に内部生成です。
+
 ## Development
 
 ```sh
