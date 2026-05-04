@@ -1,9 +1,20 @@
-import { sequence, set, oid, printableString, utf8String } from "./der.js";
+import { sequence, set, oid, ia5String, printableString, utf8String } from "./der.js";
 import { MAX_SUBJECT_VALUE_LENGTH, SUBJECT_ATTRIBUTE_OIDS, SUBJECT_VALUE_LENGTH_LIMITS } from "./oids.js";
 import type { ShortSubjectAttributeType, Subject, SubjectAttributeType } from "./types.js";
 
 const SHORT_TYPES = new Set<string>(Object.keys(SUBJECT_ATTRIBUTE_OIDS));
 const DOTTED_OID_PATTERN = /^(?:0|1|2)\.(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))+$/;
+
+// RFC 5280 §A.1: AttributeValue string type per attribute OID.
+// C → PrintableString, emailAddress (E) → IA5String, others → UTF8String.
+const PRINTABLE_STRING_OIDS = new Set<string>([SUBJECT_ATTRIBUTE_OIDS.C]);
+const IA5_STRING_OIDS = new Set<string>([SUBJECT_ATTRIBUTE_OIDS.E]);
+
+function encodeAttributeValue(attributeOid: string, value: string): Uint8Array {
+  if (PRINTABLE_STRING_OIDS.has(attributeOid)) return printableString(value);
+  if (IA5_STRING_OIDS.has(attributeOid)) return ia5String(value);
+  return utf8String(value);
+}
 
 export function encodeName(subject: Subject): Uint8Array {
   if (!Array.isArray(subject) || subject.length === 0) {
@@ -35,7 +46,7 @@ export function encodeName(subject: Subject): Uint8Array {
         );
       }
       const attributeOid = resolveAttributeOid(attribute.type);
-      const value = attribute.type === "C" ? printableString(attribute.value) : utf8String(attribute.value);
+      const value = encodeAttributeValue(attributeOid, attribute.value);
       return set(sequence(oid(attributeOid), value));
     })
   );

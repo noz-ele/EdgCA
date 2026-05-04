@@ -116,11 +116,17 @@ export function subjectAltNameExtension(dnsNames?: readonly string[], ipAddresse
   assertOptionalStringArray("ipAddresses", ipAddresses);
 
   const names: Uint8Array[] = [];
+  const seenDnsNames = new Set<string>();
+  const seenIpAddresses = new Set<string>();
 
   for (const dnsName of dnsNames ?? []) {
     if (typeof dnsName !== "string" || dnsName.length > 253 || !DNS_NAME_PATTERN.test(dnsName)) {
       throw new Error(`Invalid SAN dNSName: ${dnsName}`);
     }
+    if (seenDnsNames.has(dnsName)) {
+      throw new Error(`Duplicate SAN dNSName: ${dnsName}`);
+    }
+    seenDnsNames.add(dnsName);
     names.push(der(0x82, asciiBytes(dnsName)));
   }
 
@@ -128,7 +134,15 @@ export function subjectAltNameExtension(dnsNames?: readonly string[], ipAddresse
     if (typeof ipAddress !== "string") {
       throw new Error(`Invalid SAN iPAddress: ${ipAddress}`);
     }
-    names.push(der(0x87, encodeIpAddress(ipAddress)));
+    const encoded = encodeIpAddress(ipAddress);
+    // Compare by encoded bytes so that textually different forms of the same IP
+    // (e.g. "::1" vs "0:0:0:0:0:0:0:1") are correctly recognized as duplicates.
+    const key = encoded.join(",");
+    if (seenIpAddresses.has(key)) {
+      throw new Error(`Duplicate SAN iPAddress: ${ipAddress}`);
+    }
+    seenIpAddresses.add(key);
+    names.push(der(0x87, encoded));
   }
 
   return names.length > 0 ? extension(OID.subjectAltName, false, sequence(...names)) : undefined;
@@ -214,15 +228,27 @@ function encodeSerialNumberDer(serialNumber?: SerialNumber): Uint8Array {
   return integer(serialNumber);
 }
 
-const SERIAL_NUMBER_MAX_DECIMAL_DIGITS = 50;
-const SERIAL_NUMBER_MAX_HEX_CHARS = 40;
+// Maximum string-input lengths chosen so that any string passing this check
+// also passes the post-encode 20-octet limit:
+//   - 47-digit decimal: max value 10^47 - 1 < 2^159, fits in 20 octets without leading 0x00.
+//     (48-digit values up to 10^48 - 1 ≈ 9.99e47 exceed 2^159 ≈ 7.27e47, so the leading 0x00
+//      sign byte would push the encoded length to 21 octets.)
+//   - 39-char hex: pads to 40 chars with a leading "0", giving 20 octets whose top byte
+//     0x0X has the high bit clear, so no extra sign byte is added.
+//     (40-char hex with leading nibble 0x8-0xf would add a leading 0x00 → 21 octets.)
+const SERIAL_NUMBER_MAX_DECIMAL_DIGITS = 47;
+const SERIAL_NUMBER_MAX_HEX_CHARS = 39;
 
 function resolveValidity(notBeforeInput: Date | undefined, days: number): { notBefore: Date; notAfter: Date } {
-  if (!Number.isFinite(days) || days <= 0) {
-    throw new Error("days must be a positive number");
+  if (typeof days !== "number" || !Number.isInteger(days) || days <= 0) {
+    throw new Error("days must be a positive integer");
   }
 
-  const notBefore = notBeforeInput === undefined ? new Date() : new Date(notBeforeInput);
+  if (notBeforeInput !== undefined && !(notBeforeInput instanceof Date)) {
+    throw new Error("notBefore must be a Date");
+  }
+
+  const notBefore = notBeforeInput === undefined ? new Date() : new Date(notBeforeInput.getTime());
   const notBeforeMs = notBefore.getTime();
   if (!Number.isFinite(notBeforeMs)) {
     throw new Error("notBefore must be a valid Date");

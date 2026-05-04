@@ -32,12 +32,6 @@ import {
   subjectKeyIdentifierExtension
 } from "./x509.js";
 
-interface CaMetadata extends ParsedCertificate {
-  issuerChainPem: string;
-}
-
-const caMetadata = new WeakMap<CertificateAuthority, CaMetadata>();
-
 export async function createRootCA(options: CreateRootCAOptions): Promise<CertificateAuthority> {
   const keyPair = await resolveKeyPair(options.privateKeyPem);
   const subjectNameDer = encodeName(options.subject);
@@ -61,20 +55,14 @@ export async function createRootCA(options: CreateRootCAOptions): Promise<Certif
   });
   const signatureDer = await signDer(keyPair.privateKey, tbsCertificateDer);
   const certDer = buildCertificate(tbsCertificateDer, signatureDer);
-  const ca = await assembleCertificateAuthority(certDer, keyPair, "");
-
-  caMetadata.set(ca, {
-    ...(await parseCertificateDer(certDer)),
-    issuerChainPem: ""
-  });
-
-  return ca;
+  return assembleCertificateAuthority(certDer, keyPair, "");
 }
 
 export async function issueIntermediateCA(options: IssueIntermediateCAOptions): Promise<CertificateAuthority> {
-  const issuer = await ensureCaMetadata(options.ca);
+  const issuer = await parseIssuer(options.ca);
+  const issuerChainPem = options.ca.issuerChainPem ?? "";
   assertCanIssueCertificate(issuer);
-  assertCanIssueIntermediate(issuer, options.pathLenConstraint);
+  assertCanIssueIntermediate(issuer, issuerChainPem, options.pathLenConstraint);
 
   const keyPair = await resolveKeyPair(options.privateKeyPem);
   const subjectNameDer = encodeName(options.subject);
@@ -98,19 +86,13 @@ export async function issueIntermediateCA(options: IssueIntermediateCAOptions): 
   });
   const signatureDer = await signDer(options.ca.privateKey, tbsCertificateDer);
   const certDer = buildCertificate(tbsCertificateDer, signatureDer);
-  const issuerChainPem = joinPemChain([options.ca.certPem, issuer.issuerChainPem]);
-  const ca = await assembleCertificateAuthority(certDer, keyPair, issuerChainPem);
-
-  caMetadata.set(ca, {
-    ...(await parseCertificateDer(certDer)),
-    issuerChainPem
-  });
-
-  return ca;
+  const childChainPem = joinPemChain([options.ca.certPem, issuerChainPem]);
+  return assembleCertificateAuthority(certDer, keyPair, childChainPem);
 }
 
 export async function issueClientCert(options: IssueClientCertOptions): Promise<IssuedClientCertificate> {
-  const issuer = await ensureCaMetadata(options.ca);
+  const issuer = await parseIssuer(options.ca);
+  const issuerChainPem = options.ca.issuerChainPem ?? "";
   assertCanIssueCertificate(issuer);
 
   const keyPair = await generateKeyPair();
@@ -147,7 +129,7 @@ export async function issueClientCert(options: IssueClientCertOptions): Promise<
     certDer: cloneBytes(certDer),
     privateKey: keyPair.privateKey,
     publicKey: keyPair.publicKey,
-    certChainPem: joinPemChain([certPem, options.ca.certPem, issuer.issuerChainPem])
+    certChainPem: joinPemChain([certPem, options.ca.certPem, issuerChainPem])
   };
 }
 
@@ -160,7 +142,7 @@ export async function importCertificateAuthority(options: ImportCertificateAutho
   const privateKey = await importPrivateKeyPem(options.privateKeyPem);
   await assertKeyPairMatches(privateKey, parsed.publicKey);
 
-  const ca: CertificateAuthority = {
+  return {
     certPem: options.certPem,
     privateKeyPem: options.privateKeyPem,
     publicKeyPem: await publicKeyToPem(parsed.publicKey),
@@ -169,13 +151,6 @@ export async function importCertificateAuthority(options: ImportCertificateAutho
     publicKey: parsed.publicKey,
     issuerChainPem
   };
-
-  caMetadata.set(ca, {
-    ...parsed,
-    issuerChainPem: ca.issuerChainPem
-  });
-
-  return ca;
 }
 
 function assertIssuerChainPem(chainPem: string): void {
@@ -214,23 +189,11 @@ async function assembleCertificateAuthority(
   };
 }
 
-async function ensureCaMetadata(ca: CertificateAuthority): Promise<CaMetadata> {
-  const existing = caMetadata.get(ca);
-  if (existing) {
-    return existing;
-  }
-
-  const parsed = await parseCertificateDer(ca.certDer?.length ? ca.certDer : pemToDer(ca.certPem));
-  const metadata = {
-    ...parsed,
-    issuerChainPem: ca.issuerChainPem ?? ""
-  };
-
-  caMetadata.set(ca, metadata);
-  return metadata;
+async function parseIssuer(ca: CertificateAuthority): Promise<ParsedCertificate> {
+  return await parseCertificateDer(ca.certDer?.length ? ca.certDer : pemToDer(ca.certPem));
 }
 
-function assertCanIssueCertificate(issuer: CaMetadata): void {
+function assertCanIssueCertificate(issuer: ParsedCertificate): void {
   if (!issuer.isCA) {
     throw new Error("Issuer certificate is not a CA");
   }
@@ -240,17 +203,23 @@ function assertCanIssueCertificate(issuer: CaMetadata): void {
   }
 }
 
-function assertCanIssueIntermediate(issuer: CaMetadata, requestedPathLenConstraint: number | undefined): void {
+function assertCanIssueIntermediate(
+  issuer: ParsedCertificate,
+  issuerChainPem: string,
+  requestedPathLenConstraint: number | undefined
+): void {
   if (issuer.pathLenConstraint === 0) {
     throw new Error("Issuer pathLenConstraint=0 does not allow issuing another intermediate CA");
   }
 
-  if (!isRootCa(issuer)) {
+  if (!isRootCa(issuer, issuerChainPem)) {
     throw new Error("Only root CAs may issue intermediate CAs");
   }
 
-  const requested = requestedPathLenConstraint ?? 0;
-  if (requested !== 0) {
+  if (requestedPathLenConstraint === undefined) {
+    return;
+  }
+  if (typeof requestedPathLenConstraint !== "number" || !Object.is(requestedPathLenConstraint, 0)) {
     throw new Error("Intermediate pathLenConstraint must be 0");
   }
 }
@@ -260,15 +229,19 @@ function resolveRootPathLenConstraint(pathLenConstraint: number | undefined): nu
     return 1;
   }
 
-  if (pathLenConstraint !== 0 && pathLenConstraint !== 1) {
+  if (typeof pathLenConstraint !== "number" || !Number.isInteger(pathLenConstraint)) {
+    throw new Error("Root pathLenConstraint must be 0 or 1");
+  }
+
+  if (!Object.is(pathLenConstraint, 0) && pathLenConstraint !== 1) {
     throw new Error("Root pathLenConstraint must be 0 or 1");
   }
 
   return pathLenConstraint;
 }
 
-function isRootCa(issuer: CaMetadata): boolean {
-  return issuer.issuerChainPem.trim().length === 0 && bytesEqual(issuer.issuerNameDer, issuer.subjectNameDer);
+function isRootCa(issuer: ParsedCertificate, issuerChainPem: string): boolean {
+  return issuerChainPem.trim().length === 0 && bytesEqual(issuer.issuerNameDer, issuer.subjectNameDer);
 }
 
 function joinPemChain(parts: readonly string[]): string {

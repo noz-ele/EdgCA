@@ -49,7 +49,7 @@ type ShortSubjectAttributeType =
 
 `"1.2.3.4.5"` のような dotted OID 文字列も受け付けます。
 
-各 subject entry は single-valued RDN として encode されます。入力順序は保持されます。値は UTF8String として encode され、`C` のみ PrintableString になります。
+各 subject entry は single-valued RDN として encode されます。入力順序は保持されます。値の ASN.1 string type は属性 OID で決まります。`C` (`2.5.4.6`) は PrintableString、emailAddress (`1.2.840.113549.1.9.1`) は IA5String、それ以外は UTF8String です。短縮名 (`CN`, `O`, ...) と等価な dotted OID 入力でも同じ string type が選ばれます。
 
 DN 文字列入力と multi-valued RDN は対応しません。
 
@@ -358,7 +358,7 @@ CA を「秘密鍵 + 自 cert + 上位 chain」の 3 点で 1 つにまとめた
 | field | 型 | 必須 | 意味と制約 |
 |---|---|---|---|
 | `type` | `SubjectAttributeType` | ✅ | attribute の種別。短縮名 (`CN`, `O`, `OU`, `C`, `ST`, `L`, `E`, `DC`, `SERIALNUMBER`, `STREET`, `POSTALCODE`, `TITLE`, `GIVENNAME`, `SURNAME`, `UID`) または dotted OID 文字列 (`1.2.3.4.5`)。未対応の短縮名・不正な OID は例外。 |
-| `value` | `string` | ✅ | attribute の値。UTF8String として encode (`C` のみ PrintableString)。`C` の値が PrintableString として不正な場合は例外。 |
+| `value` | `string` | ✅ | attribute の値。OID に応じて string type を選択 (`C` → PrintableString、emailAddress → IA5String、他 → UTF8String)。短縮名と等価な dotted OID でも同じ規則。`C` の値が PrintableString として不正な場合は例外。emailAddress の値が IA5 (ASCII) として不正な場合も例外。 |
 
 ### `SerialNumber` 入力形式
 

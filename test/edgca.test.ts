@@ -284,7 +284,7 @@ describe("EdgCA issuing API", () => {
     ).rejects.toThrow("does not match");
   });
 
-  it("keeps CA metadata usable if returned certDer bytes are mutated", async () => {
+  it("rejects subsequent issuance when CertificateAuthority.certDer has been mutated", async () => {
     const root = await createRootCA({ subject: rootSubject, days: 3650 });
     const intermediate = await issueIntermediateCA({
       ca: root,
@@ -295,19 +295,25 @@ describe("EdgCA issuing API", () => {
     root.certDer.fill(0);
     intermediate.certDer.fill(0);
 
-    const nextIntermediate = await issueIntermediateCA({
-      ca: root,
-      subject: [{ type: "CN", value: "next-intermediate" }],
-      days: 365
-    });
-    const client = await issueClientCert({
-      ca: intermediate,
-      subject: clientSubject,
-      days: 30
-    });
+    let rootError: unknown;
+    try {
+      await issueIntermediateCA({
+        ca: root,
+        subject: [{ type: "CN", value: "next-intermediate" }],
+        days: 365
+      });
+    } catch (e) {
+      rootError = e;
+    }
+    expect((rootError as Error | undefined)?.message).toBe("Invalid certificate DER");
 
-    expect(nextIntermediate.certPem.startsWith("-----BEGIN CERTIFICATE-----")).toBe(true);
-    expect(client.certPem.startsWith("-----BEGIN CERTIFICATE-----")).toBe(true);
+    let intermediateError: unknown;
+    try {
+      await issueClientCert({ ca: intermediate, subject: clientSubject, days: 30 });
+    } catch (e) {
+      intermediateError = e;
+    }
+    expect((intermediateError as Error | undefined)?.message).toBe("Invalid certificate DER");
   });
 
   it("does not include SAN when no SAN inputs are provided", async () => {
@@ -487,7 +493,7 @@ describe("input validation", () => {
           subject: rootSubject,
           days
         })
-      ).rejects.toThrow("days must be a positive number");
+      ).rejects.toThrow("days must be a positive integer");
     }
   });
 

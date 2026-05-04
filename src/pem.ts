@@ -36,6 +36,9 @@ export function pemToDerWithLabel(pem: string, label: string): Uint8Array {
   }
 
   const base64 = match[1].replace(/\s+/g, "");
+  if (base64.length === 0) {
+    throw new Error(`Invalid PEM block: empty ${label} body`);
+  }
   return binaryToBytes(atob(base64));
 }
 
