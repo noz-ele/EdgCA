@@ -466,6 +466,18 @@ describe("EdgCA issuing API", () => {
       })
     ).rejects.toThrow("Intermediate pathLenConstraint must be 0");
   });
+
+  it("accepts an explicit pathLenConstraint=0 on issueIntermediateCA", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365,
+      pathLenConstraint: 0
+    });
+    const parsed = await parseCertificate(intermediate.certDer);
+    expect(parsed.pathLenConstraint).toBe(0);
+  });
 });
 
 describe("subject encoding", () => {
@@ -833,6 +845,64 @@ describe("input validation", () => {
       })
     ).rejects.toThrow("CERTIFICATE blocks");
   });
+
+  it("rejects subject values containing each forbidden character class", async () => {
+    for (const code of [0x01, 0x1f, 0x7f, 0x200e, 0x200f, 0x202a, 0x202d, 0x2066, 0x2069]) {
+      const value = `safe${String.fromCharCode(code)}text`;
+      await expect(
+        createRootCA({
+          subject: [{ type: "CN", value }],
+          days: 365
+        })
+      ).rejects.toThrow("forbidden");
+    }
+  });
+
+  it("rejects non-string dnsName entries", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    await expect(
+      issueClientCert({
+        ca: root,
+        subject: clientSubject,
+        days: 30,
+        dnsNames: [123 as never]
+      })
+    ).rejects.toThrow("dNSName");
+  });
+
+  it("rejects malformed dNSName wildcard forms", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    for (const dnsName of ["*", "*.*.example.test", "foo.*.example.test", "*-foo.example.test"]) {
+      await expect(
+        issueClientCert({
+          ca: root,
+          subject: clientSubject,
+          days: 30,
+          dnsNames: [dnsName]
+        })
+      ).rejects.toThrow("dNSName");
+    }
+  });
+
+  it("rejects subject attribute types that are neither short names nor dotted OIDs", async () => {
+    await expect(
+      createRootCA({
+        subject: [{ type: "FOO" as never, value: "bar" }],
+        days: 365
+      })
+    ).rejects.toThrow("Unsupported subject attribute type");
+  });
+
+  it("rejects importCertificateAuthority when certPem holds truncated DER", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const truncatedPem = certificateToPem(root.certDer.slice(0, root.certDer.length - 16));
+    await expect(
+      importCertificateAuthority({
+        certPem: truncatedPem,
+        privateKeyPem: root.privateKeyPem
+      })
+    ).rejects.toThrow();
+  });
 });
 
 describe("serial numbers and validity", () => {
@@ -1088,6 +1158,18 @@ describe("IP address encoding", () => {
       expect(() => encodeIpAddress(value)).toThrow("Invalid");
     }
   });
+
+  it("encodes IPv4 boundary octets and the all-zero IPv6 address", () => {
+    expect(Array.from(encodeIpAddress("0.0.0.0"))).toEqual([0, 0, 0, 0]);
+    expect(Array.from(encodeIpAddress("255.255.255.255"))).toEqual([255, 255, 255, 255]);
+    expect(Array.from(encodeIpAddress("::"))).toEqual(new Array(16).fill(0));
+  });
+
+  it("rejects IPv6 groups longer than four hex digits", () => {
+    for (const value of ["12345::", "::12345", "1:2:3:4:5:6:7:12345"]) {
+      expect(() => encodeIpAddress(value)).toThrow("Invalid");
+    }
+  });
 });
 
 describe("low-level encoders", () => {
@@ -1242,6 +1324,62 @@ describe("RFC 5280 conformance regressions", () => {
     await expect(
       digestSha1(subjectPublicKeyBits(parsed.subjectPublicKeyInfoDer))
     ).resolves.toEqual(ski);
+  });
+
+  it("accepts the maximum allowed decimal and hex serialNumber strings", async () => {
+    const decimal47 = "9".repeat(47);
+    const fromDecimal = await createRootCA({
+      subject: rootSubject,
+      days: 365,
+      serialNumber: decimal47
+    });
+    expect(parseCertificateSerialNumber(fromDecimal.certDer).value).toBe(BigInt(decimal47));
+
+    const hex39 = "f".repeat(39);
+    const fromHex = await createRootCA({
+      subject: rootSubject,
+      days: 365,
+      serialNumber: hex39
+    });
+    expect(parseCertificateSerialNumber(fromHex.certDer).value).toBe(BigInt(`0x${hex39}`));
+  });
+
+  it("rejects decimal and hex serialNumber strings just past the per-form length cap", async () => {
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        serialNumber: "9".repeat(48)
+      })
+    ).rejects.toThrow("decimal string");
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        serialNumber: "f".repeat(40)
+      })
+    ).rejects.toThrow("hex string");
+  });
+
+  it("rejects serialNumber strings that are neither decimal nor hex", async () => {
+    for (const serialNumber of ["0xff", "abc xyz", " 12345 ", "1.5", "-1"]) {
+      await expect(
+        createRootCA({ subject: rootSubject, days: 365, serialNumber })
+      ).rejects.toThrow("decimal digits or hex");
+    }
+  });
+
+  it("rejects a 20-byte serialNumber whose post-encode form would need 21 octets", async () => {
+    const bytes = new Uint8Array(20);
+    bytes[0] = 0x80;
+    bytes[19] = 0x01;
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        serialNumber: bytes
+      })
+    ).rejects.toThrow("20 octets");
   });
 });
 
