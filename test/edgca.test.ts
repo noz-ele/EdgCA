@@ -620,30 +620,122 @@ describe("serial numbers and validity", () => {
     }
   });
 
-  it("generates a non-zero random serial number within the 20-octet limit", async () => {
-    const root = await createRootCA({ subject: rootSubject, days: 365 });
-    const serialNumber = parseCertificateSerialNumber(root.certDer);
+  it("generates default random serial numbers for every issuing API", async () => {
+    const cases: Array<{ name: string; issue: () => Promise<{ certDer: Uint8Array }> }> = [
+      {
+        name: "root CA",
+        issue: () => createRootCA({ subject: rootSubject, days: 365 })
+      },
+      {
+        name: "intermediate CA",
+        issue: async () => {
+          const root = await createRootCA({
+            subject: rootSubject,
+            days: 3650,
+            serialNumber: 1
+          });
+          return issueIntermediateCA({
+            ca: root,
+            subject: intermediateSubject,
+            days: 365
+          });
+        }
+      },
+      {
+        name: "client certificate",
+        issue: async () => {
+          const root = await createRootCA({
+            subject: rootSubject,
+            days: 3650,
+            serialNumber: 1
+          });
+          return issueClientCert({
+            ca: root,
+            subject: clientSubject,
+            days: 30
+          });
+        }
+      }
+    ];
 
-    expect(serialNumber.bytes.length).toBeGreaterThan(0);
-    expect(serialNumber.bytes.length).toBeLessThanOrEqual(20);
-    expect(serialNumber.value > 0n).toBe(true);
-    expect((serialNumber.bytes[0]! & 0x80) === 0).toBe(true);
+    for (const { name, issue } of cases) {
+      const first = parseCertificateSerialNumber((await issue()).certDer);
+      const second = parseCertificateSerialNumber((await issue()).certDer);
+
+      for (const serialNumber of [first, second]) {
+        expect(serialNumber.bytes.length, name).toBeGreaterThan(0);
+        expect(serialNumber.bytes.length, name).toBeLessThanOrEqual(20);
+        expect(serialNumber.value > 0n, name).toBe(true);
+        expect((serialNumber.bytes[0]! & 0x80) === 0, name).toBe(true);
+      }
+      expect(Array.from(second.bytes), name).not.toEqual(Array.from(first.bytes));
+    }
   });
 
-  it("encodes explicit validity bounds from notBefore and days", async () => {
+  it("encodes explicit validity bounds from notBefore and days for every issuing API", async () => {
     const notBefore = new Date(Date.UTC(2026, 0, 2, 3, 4, 5));
-    const root = await createRootCA({
-      subject: rootSubject,
-      days: 30,
-      notBefore,
-      serialNumber: 1
-    });
-    const validity = parseCertificateValidity(root.certDer);
+    const days = 30;
+    const issuerNotBefore = new Date(Date.UTC(2025, 0, 1, 0, 0, 0));
+    const cases: Array<{
+      name: string;
+      issue: (options: { notBefore: Date; days: number }) => Promise<{ certDer: Uint8Array }>;
+    }> = [
+      {
+        name: "root CA",
+        issue: ({ notBefore, days }) => createRootCA({
+          subject: rootSubject,
+          days,
+          notBefore,
+          serialNumber: 1
+        })
+      },
+      {
+        name: "intermediate CA",
+        issue: async ({ notBefore, days }) => {
+          const root = await createRootCA({
+            subject: rootSubject,
+            days: 3650,
+            notBefore: issuerNotBefore,
+            serialNumber: 1
+          });
+          return issueIntermediateCA({
+            ca: root,
+            subject: intermediateSubject,
+            days,
+            notBefore,
+            serialNumber: 2
+          });
+        }
+      },
+      {
+        name: "client certificate",
+        issue: async ({ notBefore, days }) => {
+          const root = await createRootCA({
+            subject: rootSubject,
+            days: 3650,
+            notBefore: issuerNotBefore,
+            serialNumber: 1
+          });
+          return issueClientCert({
+            ca: root,
+            subject: clientSubject,
+            days,
+            notBefore,
+            serialNumber: 2
+          });
+        }
+      }
+    ];
 
-    expect(validity.notBefore.date.getTime()).toBe(notBefore.getTime());
-    expect(validity.notAfter.date.getTime()).toBe(notBefore.getTime() + 30 * 86_400_000);
-    expect(validity.notBefore.tag).toBe(TAG.UTC_TIME);
-    expect(validity.notAfter.tag).toBe(TAG.UTC_TIME);
+    for (const { name, issue } of cases) {
+      const issued = await issue({ notBefore, days });
+      const validity = parseCertificateValidity(issued.certDer);
+
+      expect(validity.notBefore.date.getTime(), name).toBe(notBefore.getTime());
+      expect(validity.notAfter.date.getTime(), name).toBe(notBefore.getTime() + days * 86_400_000);
+      expect(validity.notBefore.tag, name).toBe(TAG.UTC_TIME);
+      expect(validity.notAfter.tag, name).toBe(TAG.UTC_TIME);
+    }
   });
 
   it("switches between UTCTime and GeneralizedTime at the X.509 year boundaries", async () => {
