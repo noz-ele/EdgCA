@@ -334,6 +334,29 @@ describe("EdgCA issuing API", () => {
     ).rejects.toThrow("Issuer certificate is not a CA");
   });
 
+  it("falls back to certPem when CertificateAuthority.certDer is absent or empty", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+
+    const withEmptyCertDer = { ...root, certDer: new Uint8Array(0) };
+    const fromEmpty = await issueClientCert({
+      ca: withEmptyCertDer,
+      subject: clientSubject,
+      days: 30
+    });
+    const parsedFromEmpty = await parseCertificate(fromEmpty.certDer);
+    const parsedRoot = await parseCertificate(root.certDer);
+    expect(namesEqual(parsedFromEmpty.issuerNameDer, parsedRoot.subjectNameDer)).toBe(true);
+
+    const withMissingCertDer = { ...root, certDer: undefined as unknown as Uint8Array };
+    const fromMissing = await issueClientCert({
+      ca: withMissingCertDer,
+      subject: clientSubject,
+      days: 30
+    });
+    const parsedFromMissing = await parseCertificate(fromMissing.certDer);
+    expect(namesEqual(parsedFromMissing.issuerNameDer, parsedRoot.subjectNameDer)).toBe(true);
+  });
+
   it("rejects subsequent issuance when CertificateAuthority.certDer has been mutated", async () => {
     const root = await createRootCA({ subject: rootSubject, days: 3650 });
     const intermediate = await issueIntermediateCA({
@@ -565,7 +588,7 @@ describe("input validation", () => {
   });
 
   it("rejects invalid dotted OID subject attribute types", async () => {
-    for (const type of ["abc", "3.2.1", "1", "1..2", "1.40.0"]) {
+    for (const type of ["abc", "3.2.1", "1", "1..2", "1.40.0", "1.2", "1.02.3"]) {
       await expect(
         createRootCA({
           subject: [{ type: type as never, value: "custom" }],
@@ -575,8 +598,19 @@ describe("input validation", () => {
     }
   });
 
+  it("rejects non-object subject entries", async () => {
+    for (const entry of [null, "CN=root", 42] as never[]) {
+      await expect(
+        createRootCA({
+          subject: [entry],
+          days: 365
+        })
+      ).rejects.toThrow("must be an object");
+    }
+  });
+
   it("rejects invalid days values", async () => {
-    for (const days of [0, -1, Number.NaN]) {
+    for (const days of [0, -1, Number.NaN, 1.5, Number.POSITIVE_INFINITY]) {
       await expect(
         createRootCA({
           subject: rootSubject,
@@ -1026,6 +1060,34 @@ describe("IP address encoding", () => {
       expect(() => encodeIpAddress(value)).toThrow("Invalid");
     }
   });
+
+  it("rejects IPv6 '::' compressing fewer than two zero groups (RFC 5952 §4.2.2)", () => {
+    for (const value of [
+      "1:2:3:4:5:6:7::",
+      "::1:2:3:4:5:6:7",
+      "1:2:3:4:5:6::8"
+    ]) {
+      expect(() => encodeIpAddress(value)).toThrow("Invalid");
+    }
+  });
+
+  it("rejects IPv6 addresses with too few groups when '::' is absent", () => {
+    for (const value of ["1:2:3:4:5:6:7", "1:2:3"]) {
+      expect(() => encodeIpAddress(value)).toThrow("Invalid");
+    }
+  });
+
+  it("rejects IPv4 octets with leading zeros", () => {
+    for (const value of ["01.0.0.1", "127.00.0.1", "127.0.0.001"]) {
+      expect(() => encodeIpAddress(value)).toThrow("Invalid");
+    }
+  });
+
+  it("rejects IPv4 addresses with wrong number of octets", () => {
+    for (const value of ["127.0.0", "127.0.0.1.5", "127..0.1"]) {
+      expect(() => encodeIpAddress(value)).toThrow("Invalid");
+    }
+  });
 });
 
 describe("low-level encoders", () => {
@@ -1145,6 +1207,15 @@ describe("RFC 5280 conformance regressions", () => {
     const root = await createRootCA({ subject: rootSubject, days: 365 });
     const malformed = root.certPem.replace("-----END CERTIFICATE-----", "-----END PRIVATE KEY-----");
     expect(() => pemToDer(malformed)).toThrow("Invalid PEM block");
+  });
+
+  it("rejects pemToDer input with no PEM block at all", () => {
+    expect(() => pemToDer("")).toThrow("Invalid PEM block");
+    expect(() => pemToDer("not a pem block")).toThrow("Invalid PEM block");
+  });
+
+  it("rejects decodeOid input whose final byte still has the continuation bit set", () => {
+    expect(() => decodeOid(new Uint8Array([0x2a, 0x86]))).toThrow("Truncated OID");
   });
 
   it("rejects empty PEM bodies and decodes the first PEM block", async () => {
