@@ -169,6 +169,34 @@ describe("EdgCA issuing API", () => {
     );
   });
 
+  it("issues a client certificate directly from a root CA", async () => {
+    const root = await createRootCA({
+      subject: rootSubject,
+      days: 3650,
+      serialNumber: 1
+    });
+    const client = await issueClientCert({
+      ca: root,
+      subject: clientSubject,
+      days: 30,
+      serialNumber: 2
+    });
+
+    expect(splitPemBlocks(client.certChainPem)).toEqual([
+      client.certPem.trim(),
+      root.certPem.trim()
+    ]);
+
+    const parsedRoot = await parseCertificate(root.certDer);
+    const parsedClient = await parseCertificate(client.certDer);
+    expect(namesEqual(parsedClient.issuerNameDer, parsedRoot.subjectNameDer)).toBe(true);
+    await expect(expectSignatureValid(parsedRoot, parsedClient)).resolves.toBe(true);
+
+    const rootSki = parseSubjectKeyIdentifier(getExtension(root.certDer, OID.subjectKeyIdentifier).value);
+    const clientAki = parseAuthorityKeyIdentifier(getExtension(client.certDer, OID.authorityKeyIdentifier).value);
+    expect(clientAki.keyIdentifier).toEqual(rootSki);
+  });
+
   it("round-trips PEM blocks and imported CA issuerChainPem", async () => {
     const root = await createRootCA({ subject: rootSubject, days: 3650 });
     const intermediate = await issueIntermediateCA({
@@ -282,6 +310,28 @@ describe("EdgCA issuing API", () => {
         privateKeyPem: otherRoot.privateKeyPem
       })
     ).rejects.toThrow("does not match");
+  });
+
+  it("rejects issuing from an imported non-CA leaf certificate", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const client = await issueClientCert({
+      ca: root,
+      subject: clientSubject,
+      days: 30
+    });
+    const importedLeaf = await importCertificateAuthority({
+      certPem: client.certPem,
+      privateKeyPem: client.privateKeyPem,
+      issuerChainPem: root.certPem
+    });
+
+    await expect(
+      issueClientCert({
+        ca: importedLeaf,
+        subject: [{ type: "CN", value: "blocked-client" }],
+        days: 30
+      })
+    ).rejects.toThrow("Issuer certificate is not a CA");
   });
 
   it("rejects subsequent issuance when CertificateAuthority.certDer has been mutated", async () => {
@@ -422,6 +472,27 @@ describe("subject encoding", () => {
     ]);
   });
 
+  it("encodes emailAddress subjects as IA5String for short and dotted-OID input", async () => {
+    const root = await createRootCA({
+      subject: [
+        { type: "E", value: "ops@example.test" },
+        { type: "1.2.840.113549.1.9.1", value: "alias@example.test" }
+      ],
+      days: 365
+    });
+    const parsed = await parseCertificate(root.certDer);
+    const attributes = parseName(parsed.subjectNameDer);
+
+    expect(attributes.map((attribute) => attribute.oid)).toEqual([
+      "1.2.840.113549.1.9.1",
+      "1.2.840.113549.1.9.1"
+    ]);
+    expect(attributes.map((attribute) => attribute.tag)).toEqual([
+      TAG.IA5_STRING,
+      TAG.IA5_STRING
+    ]);
+  });
+
   it("does not accept DN string input", async () => {
     await expect(
       createRootCA({
@@ -473,6 +544,24 @@ describe("input validation", () => {
         days: 365
       })
     ).rejects.toThrow("PrintableString");
+  });
+
+  it("rejects non-ASCII emailAddress subject values", async () => {
+    await expect(
+      createRootCA({
+        subject: [{ type: "E", value: "ops@\u4f8b.test" }],
+        days: 365
+      })
+    ).rejects.toThrow("ASCII");
+  });
+
+  it("rejects subject values containing control or bidi characters", async () => {
+    await expect(
+      createRootCA({
+        subject: [{ type: "CN", value: "safe\u202etext" }],
+        days: 365
+      })
+    ).rejects.toThrow("forbidden");
   });
 
   it("rejects invalid dotted OID subject attribute types", async () => {
@@ -569,6 +658,60 @@ describe("input validation", () => {
         dnsNames: [""]
       })
     ).rejects.toThrow("dNSName");
+  });
+
+  it("accepts valid SAN dNSName boundary values", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const maxLabel = "a".repeat(63);
+    const maxTotalLengthName = `${"a".repeat(63)}.${"b".repeat(63)}.${"c".repeat(63)}.${"d".repeat(61)}`;
+    const client = await issueClientCert({
+      ca: root,
+      subject: clientSubject,
+      days: 30,
+      dnsNames: [`${maxLabel}.example.test`, "*.example.test", maxTotalLengthName]
+    });
+    const san = parseSubjectAltName(getExtension(client.certDer, OID.subjectAltName).value);
+
+    expect(san.dnsNames).toEqual([`${maxLabel}.example.test`, "*.example.test", maxTotalLengthName]);
+  });
+
+  it("rejects invalid SAN dNSName boundary values", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const tooLongLabel = `${"a".repeat(64)}.example.test`;
+    const tooLongName = `${"a".repeat(63)}.${"b".repeat(63)}.${"c".repeat(63)}.${"d".repeat(62)}`;
+
+    for (const dnsName of [tooLongLabel, tooLongName, "example.test."]) {
+      await expect(
+        issueClientCert({
+          ca: root,
+          subject: clientSubject,
+          days: 30,
+          dnsNames: [dnsName]
+        })
+      ).rejects.toThrow("dNSName");
+    }
+  });
+
+  it("rejects duplicate SAN inputs without normalizing them away", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+
+    await expect(
+      issueClientCert({
+        ca: root,
+        subject: clientSubject,
+        days: 30,
+        dnsNames: ["worker.example.test", "worker.example.test"]
+      })
+    ).rejects.toThrow("Duplicate SAN dNSName");
+
+    await expect(
+      issueClientCert({
+        ca: root,
+        subject: clientSubject,
+        days: 30,
+        ipAddresses: ["::1", "0:0:0:0:0:0:0:1"]
+      })
+    ).rejects.toThrow("Duplicate SAN iPAddress");
   });
 
   it("rejects non-array SAN inputs", async () => {
@@ -811,6 +954,40 @@ describe("serial numbers and validity", () => {
     ).rejects.toThrow("notAfter must be a valid Date");
   });
 
+  it("rejects invalid notBefore values and out-of-range validity years", async () => {
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        notBefore: "2026-01-01" as never
+      })
+    ).rejects.toThrow("notBefore must be a Date");
+
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        notBefore: new Date(Number.NaN)
+      })
+    ).rejects.toThrow("notBefore must be a valid Date");
+
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 1,
+        notBefore: new Date(Date.UTC(10000, 0, 1))
+      })
+    ).rejects.toThrow("notBefore year");
+
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 2,
+        notBefore: new Date(Date.UTC(9999, 11, 31))
+      })
+    ).rejects.toThrow("notAfter year");
+  });
+
   it("switches between UTCTime and GeneralizedTime at the X.509 year boundaries", async () => {
     const cases = [
       { notBefore: new Date(Date.UTC(1949, 11, 31, 0, 0, 0)), tag: TAG.GENERALIZED_TIME },
@@ -968,6 +1145,21 @@ describe("RFC 5280 conformance regressions", () => {
     const root = await createRootCA({ subject: rootSubject, days: 365 });
     const malformed = root.certPem.replace("-----END CERTIFICATE-----", "-----END PRIVATE KEY-----");
     expect(() => pemToDer(malformed)).toThrow("Invalid PEM block");
+  });
+
+  it("rejects empty PEM bodies and decodes the first PEM block", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const otherRoot = await createRootCA({
+      subject: [{ type: "CN", value: "other-root" }],
+      days: 365
+    });
+
+    expect(certificateToPem(pemToDer(`${root.certPem}${otherRoot.certPem}`))).toBe(root.certPem);
+    expect(() => pemToDer("-----BEGIN CERTIFICATE-----\n\n-----END CERTIFICATE-----")).toThrow("empty body");
+    expect(() => pemToDerWithLabel(
+      "-----BEGIN CERTIFICATE-----\n\n-----END CERTIFICATE-----",
+      "CERTIFICATE"
+    )).toThrow("empty CERTIFICATE body");
   });
 
   it("computes subjectKeyIdentifier as RFC 5280 method (1) (SHA-1 of subjectPublicKey bits)", async () => {
