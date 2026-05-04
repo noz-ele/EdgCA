@@ -277,7 +277,7 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 | `subject` | `Subject` | ✅ | — | root CA の subject DN。配列順序は保持。self-signed のため issuer DN にも同値が入る。詳細は § `Subject` 参照。空配列は不可。 |
 | `days` | `number` | ✅ | — | `notBefore` からの有効日数。正の有限数のみ。1 日 = `86_400_000ms` の単純加算 (閏秒なし)。上限の check なし。 |
 | `notBefore` | `Date` | — | 呼び出し時刻 (`new Date()`) | validity の開始時刻。1950–2049 は `UTCTime`、それ以外は `GeneralizedTime` で encode。 |
-| `serialNumber` | `SerialNumber` | — | 16-byte random (正値、MSB cleared) | 詳細は § `SerialNumber` 参照。DER encode 後 20 octet を超えると例外。 |
+| `serialNumber` | `SerialNumber` | — | CSPRNG 由来 16-byte random (正値、MSB cleared、CAB BR 7.1 の ≥64 bit entropy 要件を満たす) | 発行 cert を issuer 内で識別する integer の**呼び出し側明示指定**。通常は省略して default の random に任せ (Workers の stateless 性と業界標準準拠を両立)、監査・テスト再現性・外部システムからの採番引き継ぎ等で決定的な値が要る時だけ渡す。入力型は § `SerialNumber` 参照。DER encode 後 20 octet を超えると例外。 |
 | `pathLenConstraint` | `number` | — | `1` | root CA の下に作れる intermediate の段数。`0` または `1` のみ許容。`0` の root は intermediate を発行できず client cert 専用になる。 |
 | `privateKeyPem` | `string` | — | 内部生成 (P-256 ECDSA) | 持ち込み秘密鍵。形式は PKCS#8 PEM、非暗号化。長期保管されている鍵を渡すのが推奨ルート。省略時は WebCrypto で生成 (テスト・PoC 用途の簡便動作)。 |
 
@@ -289,11 +289,11 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 |---|---|---|---|---|
 | `ca` | `CertificateAuthority` | ✅ | — | 親となる root CA。intermediate を親にすると例外。`pathLenConstraint=0` の root を親にしても例外。`isCA=false` または `keyCertSign` なしの cert を渡しても例外。 |
 | `subject` | `Subject` | ✅ | — | 発行する intermediate CA の subject DN。 |
-| `days` | `number` | ✅ | — | 有効日数。`CreateRootCAOptions.days` と同じ意味。issuer の `notAfter` を超える指定をしても library は止めない (verifier 側で reject される cert ができる)。 |
-| `notBefore` | `Date` | — | 呼び出し時刻 | 同上。 |
-| `serialNumber` | `SerialNumber` | — | 16-byte random | 同上。 |
+| `days` | `number` | ✅ | — | `CreateRootCAOptions.days` と同じ。加えて、issuer の `notAfter` を超える指定をしても library は止めない (verifier 側で reject される cert ができる)。 |
+| `notBefore` | `Date` | — | 呼び出し時刻 | `CreateRootCAOptions.notBefore` と同じ。 |
+| `serialNumber` | `SerialNumber` | — | CSPRNG 由来 16-byte random | `CreateRootCAOptions.serialNumber` と同じ。 |
 | `pathLenConstraint` | `number` | — | `0` | 発行される intermediate の `pathLenConstraint` は常に `0`。明示する場合は `0` のみ許容、`1` 以上は例外。 |
-| `privateKeyPem` | `string` | — | 内部生成 | 持ち込み秘密鍵。形式・推奨ルートとも root と同じ。 |
+| `privateKeyPem` | `string` | — | 内部生成 | `CreateRootCAOptions.privateKeyPem` と同じ (intermediate CA の鍵を渡す)。 |
 
 #### `IssueClientCertOptions`
 
@@ -303,9 +303,9 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 |---|---|---|---|---|
 | `ca` | `CertificateAuthority` | ✅ | — | 発行 issuer。root または intermediate どちらでも可。`isCA=false` または `keyCertSign` なしの cert を渡すと例外。 |
 | `subject` | `Subject` | ✅ | — | 発行する client cert の subject DN。 |
-| `days` | `number` | ✅ | — | 有効日数。 |
-| `notBefore` | `Date` | — | 呼び出し時刻 | 同上。 |
-| `serialNumber` | `SerialNumber` | — | 16-byte random | 同上。 |
+| `days` | `number` | ✅ | — | `CreateRootCAOptions.days` と同じ。 |
+| `notBefore` | `Date` | — | 呼び出し時刻 | `CreateRootCAOptions.notBefore` と同じ。 |
+| `serialNumber` | `SerialNumber` | — | CSPRNG 由来 16-byte random | `CreateRootCAOptions.serialNumber` と同じ。 |
 | `dnsNames` | `string[]` | — | `undefined` | SAN dNSName。指定時のみ SAN extension が出力される。各値 ≤253 chars、`A-Za-z0-9_-` とドット、先頭の `*.` ワイルドカード可。違反は例外。 |
 | `ipAddresses` | `string[]` | — | `undefined` | SAN iPAddress。IPv4 / IPv6 文字列。`dnsNames` と併用可。両者未指定なら SAN extension 自体が省略される。 |
 
