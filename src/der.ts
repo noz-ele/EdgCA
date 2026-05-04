@@ -139,7 +139,11 @@ export function utcTime(date: Date): Uint8Array {
 }
 
 export function generalizedTime(date: Date): Uint8Array {
-  return der(TAG.GENERALIZED_TIME, asciiBytes(`${date.getUTCFullYear()}${timeTail(date)}`));
+  const year = date.getUTCFullYear();
+  if (year < 1 || year > 9999) {
+    throw new Error("GeneralizedTime year must be between 0001 and 9999");
+  }
+  return der(TAG.GENERALIZED_TIME, asciiBytes(`${year.toString().padStart(4, "0")}${timeTail(date)}`));
 }
 
 export function readElement(input: Uint8Array, offset = 0): DerElement {

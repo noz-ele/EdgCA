@@ -197,7 +197,7 @@ function importCertificateAuthority(options: {
 }): Promise<CertificateAuthority>;
 ```
 
-private key は certificate の public key と対応している必要があります。返却値は `createRootCA()` や `issueIntermediateCA()` と同じ `CertificateAuthority` 形状です。
+private key は certificate の public key と対応している必要があります。正しくない `certPem` (期限切れ・壊れた署名・想定外の extension など) を渡しても error にはならず、入力に従ってそのまま誤った証明書が発行される仕様です。返却値は `createRootCA()` や `issueIntermediateCA()` と同じ `CertificateAuthority` 形状です。
 
 intermediate CA を再 import する場合は、`issuerChainPem` に parent chain を渡します。この chain は client certificate 発行時の `certChainPem` 構築に使われます。
 

@@ -48,4 +48,6 @@ export const SUBJECT_VALUE_LENGTH_LIMITS: Record<ShortSubjectAttributeType, numb
   UID: 256
 };
 
-export const MAX_SUBJECT_VALUE_LENGTH = 32768;
+// Default cap for unknown (dotted-OID) attributes. Matches the largest known
+// ub-* limit (UID = 256). Callers needing more must use a known short type.
+export const MAX_SUBJECT_VALUE_LENGTH = 256;

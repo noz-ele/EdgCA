@@ -15,18 +15,15 @@ export function publicKeyDerToPem(der: Uint8Array): string {
 }
 
 export function pemToDer(pem: string): Uint8Array {
-  const match = /-----BEGIN ([^-]+)-----([\s\S]*?)-----END ([^-]+)-----/.exec(pem);
-  if (!match) {
-    throw new Error("Invalid PEM block");
-  }
-  if (match[1] !== match[3]) {
-    throw new Error(`PEM BEGIN/END labels do not match: BEGIN ${match[1]} / END ${match[3]}`);
-  }
-  if (!match[2]) {
+  const match = /-----BEGIN (.+?)-----([\s\S]*?)-----END \1-----/.exec(pem);
+  if (!match || !match[2]) {
     throw new Error("Invalid PEM block");
   }
 
   const base64 = match[2].replace(/\s+/g, "");
+  if (base64.length === 0) {
+    throw new Error("Invalid PEM block: empty body");
+  }
   return binaryToBytes(atob(base64));
 }
 
@@ -44,7 +41,7 @@ export function pemToDerWithLabel(pem: string, label: string): Uint8Array {
 
 export function splitPemBlocks(pem: string): string[] {
   const blocks: string[] = [];
-  const pattern = /-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/g;
+  const pattern = /-----BEGIN (.+?)-----[\s\S]*?-----END \1-----/g;
   let match: RegExpExecArray | null;
 
   while ((match = pattern.exec(pem)) !== null) {

@@ -134,7 +134,10 @@ export function subjectAltNameExtension(dnsNames?: readonly string[], ipAddresse
   return names.length > 0 ? extension(OID.subjectAltName, false, sequence(...names)) : undefined;
 }
 
-const DNS_NAME_PATTERN = /^(\*\.)?[A-Za-z0-9_\-]+(\.[A-Za-z0-9_\-]+)*$/;
+// RFC 1035 §2.3.1 preferred name syntax: each label starts and ends with [A-Za-z0-9],
+// may contain hyphens internally, and is at most 63 characters. Optional leading "*." wildcard.
+const DNS_LABEL = /[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?/;
+const DNS_NAME_PATTERN = new RegExp(`^(\\*\\.)?${DNS_LABEL.source}(?:\\.${DNS_LABEL.source})*$`);
 
 function assertOptionalStringArray(name: string, values: readonly string[] | undefined): void {
   if (values !== undefined && !Array.isArray(values)) {
@@ -224,6 +227,7 @@ function resolveValidity(notBeforeInput: Date | undefined, days: number): { notB
   if (!Number.isFinite(notBeforeMs)) {
     throw new Error("notBefore must be a valid Date");
   }
+  assertYearInRange(notBefore.getUTCFullYear(), "notBefore");
 
   const notAfterMs = notBeforeMs + days * 86_400_000;
   if (!Number.isFinite(notAfterMs)) {
@@ -233,6 +237,7 @@ function resolveValidity(notBeforeInput: Date | undefined, days: number): { notB
   if (!Number.isFinite(notAfter.getTime())) {
     throw new Error("notAfter must be a valid Date");
   }
+  assertYearInRange(notAfter.getUTCFullYear(), "notAfter");
 
   return {
     notBefore,
@@ -243,6 +248,12 @@ function resolveValidity(notBeforeInput: Date | undefined, days: number): { notB
 function encodeTime(date: Date): Uint8Array {
   const year = date.getUTCFullYear();
   return year >= 1950 && year <= 2049 ? utcTime(date) : generalizedTime(date);
+}
+
+function assertYearInRange(year: number, fieldName: string): void {
+  if (year < 1 || year > 9999) {
+    throw new Error(`${fieldName} year must be between 0001 and 9999`);
+  }
 }
 
 const KEY_USAGE_BITS = {

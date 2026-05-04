@@ -945,14 +945,14 @@ describe("RFC 5280 conformance regressions", () => {
 
   it("caps dotted-OID subject values at the global upper bound", async () => {
     const root = await createRootCA({
-      subject: [{ type: "1.2.3.4.5", value: "a".repeat(1024) }],
+      subject: [{ type: "1.2.3.4.5", value: "a".repeat(256) }],
       days: 365
     });
     expect(root.certPem.startsWith("-----BEGIN CERTIFICATE-----")).toBe(true);
 
     await expect(
       createRootCA({
-        subject: [{ type: "1.2.3.4.5", value: "a".repeat(32769) }],
+        subject: [{ type: "1.2.3.4.5", value: "a".repeat(257) }],
         days: 365
       })
     ).rejects.toThrow("character limit");
@@ -961,7 +961,7 @@ describe("RFC 5280 conformance regressions", () => {
   it("rejects pemToDer when BEGIN and END labels do not match", async () => {
     const root = await createRootCA({ subject: rootSubject, days: 365 });
     const malformed = root.certPem.replace("-----END CERTIFICATE-----", "-----END PRIVATE KEY-----");
-    expect(() => pemToDer(malformed)).toThrow("BEGIN/END labels do not match");
+    expect(() => pemToDer(malformed)).toThrow("Invalid PEM block");
   });
 
   it("computes subjectKeyIdentifier as RFC 5280 method (1) (SHA-1 of subjectPublicKey bits)", async () => {

@@ -33,7 +33,8 @@ function encodeIpv6(value: string): Uint8Array {
   const missing = 8 - left.length - right.length;
 
   if (value.includes("::")) {
-    if (missing < 1) {
+    // RFC 5952 §4.2.2: "::" must compress at least two zero groups.
+    if (missing < 2) {
       throw new Error(`Invalid IPv6 address: ${value}`);
     }
   } else if (missing !== 0) {

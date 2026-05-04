@@ -24,8 +24,12 @@ export function encodeName(subject: Subject): Uint8Array {
       if (attribute.value.length === 0) {
         throw new Error(`subject[${index}].value must not be empty`);
       }
+      if (containsForbiddenChar(attribute.value)) {
+        throw new Error(`subject[${index}].value contains forbidden control or bidi character`);
+      }
       const limit = SUBJECT_VALUE_LENGTH_LIMITS[attribute.type as ShortSubjectAttributeType] ?? MAX_SUBJECT_VALUE_LENGTH;
-      if (attribute.value.length > limit) {
+      const codepointLength = [...attribute.value].length;
+      if (codepointLength > limit) {
         throw new Error(
           `subject[${index}].value exceeds ${limit} character limit for type "${attribute.type}"`
         );
@@ -47,4 +51,18 @@ export function resolveAttributeOid(type: SubjectAttributeType): string {
   }
 
   throw new Error(`Unsupported subject attribute type: ${type}`);
+}
+
+// Reject C0 controls (U+0000-U+001F), DEL (U+007F), LTR/RTL marks (U+200E, U+200F),
+// bidi embedding/override (U+202A-U+202E), and bidi isolates (U+2066-U+2069).
+// Avoids embedding raw control characters in source for review safety.
+function containsForbiddenChar(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f) return true;
+    if (code === 0x200e || code === 0x200f) return true;
+    if (code >= 0x202a && code <= 0x202e) return true;
+    if (code >= 0x2066 && code <= 0x2069) return true;
+  }
+  return false;
 }
