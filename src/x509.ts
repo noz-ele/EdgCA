@@ -156,6 +156,9 @@ function encodeSerialNumber(serialNumber?: SerialNumber): Uint8Array {
   if (element.length > 20) {
     throw new Error("serialNumber encoded value must not exceed 20 octets");
   }
+  if (element.value.every((byte) => byte === 0)) {
+    throw new Error("serialNumber must be a positive integer");
+  }
   return encoded;
 }
 
@@ -182,9 +185,19 @@ function encodeSerialNumberDer(serialNumber?: SerialNumber): Uint8Array {
 
   if (typeof serialNumber === "string") {
     if (/^\d+$/.test(serialNumber)) {
+      if (serialNumber.length > SERIAL_NUMBER_MAX_DECIMAL_DIGITS) {
+        throw new Error(
+          `serialNumber decimal string must not exceed ${SERIAL_NUMBER_MAX_DECIMAL_DIGITS} digits`
+        );
+      }
       return integer(BigInt(serialNumber));
     }
     if (/^[0-9a-fA-F]+$/.test(serialNumber)) {
+      if (serialNumber.length > SERIAL_NUMBER_MAX_HEX_CHARS) {
+        throw new Error(
+          `serialNumber hex string must not exceed ${SERIAL_NUMBER_MAX_HEX_CHARS} characters (20 octets)`
+        );
+      }
       const normalized = serialNumber.length % 2 === 0 ? serialNumber : `0${serialNumber}`;
       const bytes = new Uint8Array(normalized.length / 2);
       for (let i = 0; i < normalized.length; i += 2) {
@@ -197,6 +210,9 @@ function encodeSerialNumberDer(serialNumber?: SerialNumber): Uint8Array {
 
   return integer(serialNumber);
 }
+
+const SERIAL_NUMBER_MAX_DECIMAL_DIGITS = 50;
+const SERIAL_NUMBER_MAX_HEX_CHARS = 40;
 
 function resolveValidity(notBeforeInput: Date | undefined, days: number): { notBefore: Date; notAfter: Date } {
   if (!Number.isFinite(days) || days <= 0) {

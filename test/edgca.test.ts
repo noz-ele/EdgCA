@@ -29,7 +29,8 @@ import {
   parseKeyUsage,
   parseName,
   parseSubjectAltName,
-  parseSubjectKeyIdentifier
+  parseSubjectKeyIdentifier,
+  subjectPublicKeyBits
 } from "./helpers/x509.js";
 
 const rootSubject: Subject = [
@@ -116,9 +117,12 @@ describe("EdgCA issuing API", () => {
     expect(rootAki.keyIdentifier).toEqual(rootSki);
     expect(intermediateAki.keyIdentifier).toEqual(rootSki);
     expect(clientAki.keyIdentifier).toEqual(intermediateSki);
-    await expect(digestSha256(parsedRoot.subjectPublicKeyInfoDer)).resolves.toEqual(rootSki);
-    await expect(digestSha256(parsedIntermediate.subjectPublicKeyInfoDer)).resolves.toEqual(intermediateSki);
-    await expect(digestSha256(parsedClient.subjectPublicKeyInfoDer)).resolves.toEqual(clientSki);
+    expect(rootSki.length).toBe(20);
+    expect(intermediateSki.length).toBe(20);
+    expect(clientSki.length).toBe(20);
+    await expect(digestSha1(subjectPublicKeyBits(parsedRoot.subjectPublicKeyInfoDer))).resolves.toEqual(rootSki);
+    await expect(digestSha1(subjectPublicKeyBits(parsedIntermediate.subjectPublicKeyInfoDer))).resolves.toEqual(intermediateSki);
+    await expect(digestSha1(subjectPublicKeyBits(parsedClient.subjectPublicKeyInfoDer))).resolves.toEqual(clientSki);
 
     const rootKeyUsage = parseKeyUsage(getExtension(root.certDer, OID.keyUsage).value);
     const intermediateKeyUsage = parseKeyUsage(getExtension(intermediate.certDer, OID.keyUsage).value);
@@ -655,7 +659,6 @@ describe("serial numbers and validity", () => {
       { serialNumber: 12345, expectedValue: 12345n },
       { serialNumber: "12345", expectedValue: 12345n },
       { serialNumber: "0f", expectedValue: 15n, expectedBytes: [0x0f] },
-      { serialNumber: 0n, expectedValue: 0n, expectedBytes: [0] },
       { serialNumber: new Uint8Array([0x80]), expectedValue: 128n, expectedBytes: [0, 0x80] }
     ];
 
@@ -870,6 +873,109 @@ describe("low-level encoders", () => {
   });
 });
 
-async function digestSha256(bytes: Uint8Array): Promise<Uint8Array> {
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+describe("RFC 5280 conformance regressions", () => {
+  it("rejects zero-valued serialNumber in every input form", async () => {
+    const cases: SerialNumber[] = [
+      0n,
+      0,
+      "0",
+      "00",
+      "0000",
+      new Uint8Array([0]),
+      new Uint8Array([0, 0, 0])
+    ];
+    for (const serialNumber of cases) {
+      await expect(
+        createRootCA({ subject: rootSubject, days: 365, serialNumber })
+      ).rejects.toThrow("positive integer");
+    }
+  });
+
+  it("rejects oversized serialNumber strings before allocating large buffers", async () => {
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        serialNumber: "9".repeat(51)
+      })
+    ).rejects.toThrow("decimal string");
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        serialNumber: `f${"f".repeat(40)}`
+      })
+    ).rejects.toThrow("hex string");
+  });
+
+  it("rejects subject values exceeding RFC 5280 ub-* character limits", async () => {
+    const cases: Array<{ type: "CN" | "O" | "OU" | "C" | "ST" | "L" | "DC" | "POSTALCODE" | "GIVENNAME" | "SURNAME"; length: number }> = [
+      { type: "CN", length: 65 },
+      { type: "O", length: 65 },
+      { type: "OU", length: 65 },
+      { type: "C", length: 5 },
+      { type: "ST", length: 129 },
+      { type: "L", length: 129 },
+      { type: "DC", length: 64 },
+      { type: "POSTALCODE", length: 17 },
+      { type: "GIVENNAME", length: 17 },
+      { type: "SURNAME", length: 41 }
+    ];
+    for (const { type, length } of cases) {
+      await expect(
+        createRootCA({
+          subject: [{ type, value: "a".repeat(length) }],
+          days: 365
+        })
+      ).rejects.toThrow("character limit");
+    }
+  });
+
+  it("accepts subject values at the RFC 5280 ub-* limits", async () => {
+    const root = await createRootCA({
+      subject: [
+        { type: "CN", value: "a".repeat(64) },
+        { type: "O", value: "b".repeat(64) },
+        { type: "DC", value: "c".repeat(63) }
+      ],
+      days: 365
+    });
+    expect(root.certPem.startsWith("-----BEGIN CERTIFICATE-----")).toBe(true);
+  });
+
+  it("caps dotted-OID subject values at the global upper bound", async () => {
+    const root = await createRootCA({
+      subject: [{ type: "1.2.3.4.5", value: "a".repeat(1024) }],
+      days: 365
+    });
+    expect(root.certPem.startsWith("-----BEGIN CERTIFICATE-----")).toBe(true);
+
+    await expect(
+      createRootCA({
+        subject: [{ type: "1.2.3.4.5", value: "a".repeat(32769) }],
+        days: 365
+      })
+    ).rejects.toThrow("character limit");
+  });
+
+  it("rejects pemToDer when BEGIN and END labels do not match", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const malformed = root.certPem.replace("-----END CERTIFICATE-----", "-----END PRIVATE KEY-----");
+    expect(() => pemToDer(malformed)).toThrow("BEGIN/END labels do not match");
+  });
+
+  it("computes subjectKeyIdentifier as RFC 5280 method (1) (SHA-1 of subjectPublicKey bits)", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const parsed = await parseCertificate(root.certDer);
+    const ski = parseSubjectKeyIdentifier(getExtension(root.certDer, OID.subjectKeyIdentifier).value);
+
+    expect(ski.length).toBe(20);
+    await expect(
+      digestSha1(subjectPublicKeyBits(parsed.subjectPublicKeyInfoDer))
+    ).resolves.toEqual(ski);
+  });
+});
+
+async function digestSha1(bytes: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest("SHA-1", bytes));
 }

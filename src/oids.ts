@@ -28,3 +28,24 @@ export const SUBJECT_ATTRIBUTE_OIDS: Record<ShortSubjectAttributeType, string> =
   SURNAME: "2.5.4.4",
   UID: "0.9.2342.19200300.100.1.1"
 };
+
+// RFC 5280 Appendix A.1 ub-* upper bounds (character counts).
+export const SUBJECT_VALUE_LENGTH_LIMITS: Record<ShortSubjectAttributeType, number> = {
+  CN: 64,
+  O: 64,
+  OU: 64,
+  C: 4,
+  ST: 128,
+  L: 128,
+  E: 255,
+  DC: 63,
+  SERIALNUMBER: 64,
+  STREET: 128,
+  POSTALCODE: 16,
+  TITLE: 64,
+  GIVENNAME: 16,
+  SURNAME: 40,
+  UID: 256
+};
+
+export const MAX_SUBJECT_VALUE_LENGTH = 32768;

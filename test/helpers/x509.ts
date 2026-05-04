@@ -162,6 +162,18 @@ export function parseSubjectKeyIdentifier(value: Uint8Array): Uint8Array {
   return root.value;
 }
 
+export function subjectPublicKeyBits(spkiDer: Uint8Array): Uint8Array {
+  const root = readElement(spkiDer);
+  if (root.tag !== TAG.SEQUENCE) {
+    throw new Error("Invalid SPKI SEQUENCE");
+  }
+  const [, bitString] = readSequenceChildren(root);
+  if (!bitString || bitString.tag !== TAG.BIT_STRING) {
+    throw new Error("Invalid SPKI subjectPublicKey BIT STRING");
+  }
+  return bitString.value.subarray(1);
+}
+
 export function parseAuthorityKeyIdentifier(value: Uint8Array): { keyIdentifier: Uint8Array; tag: number } {
   const root = readElement(value);
   const [keyIdentifier] = readSequenceChildren(root);

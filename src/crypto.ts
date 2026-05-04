@@ -1,5 +1,5 @@
 import { arrayBufferFromBytes, concatBytes } from "./bytes.js";
-import { integer, readChildren, readElement, sequence, TAG } from "./der.js";
+import { integer, readChildren, readElement, readSequenceChildren, sequence, TAG } from "./der.js";
 import { pemToDerWithLabel, privateKeyDerToPem, publicKeyDerToPem } from "./pem.js";
 
 const EC_ALGORITHM: EcKeyGenParams = {
@@ -34,8 +34,23 @@ export async function digestSha256(data: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", arrayBufferFromBytes(data)));
 }
 
+export async function digestSha1(data: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest("SHA-1", arrayBufferFromBytes(data)));
+}
+
+// RFC 5280 §4.2.1.2 method (1): SHA-1 of the BIT STRING subjectPublicKey value,
+// excluding the tag, length, and number of unused bits.
 export async function keyIdentifierFromSpki(spki: Uint8Array): Promise<Uint8Array> {
-  return digestSha256(spki);
+  const root = readElement(spki);
+  if (root.tag !== TAG.SEQUENCE) {
+    throw new Error("Invalid SubjectPublicKeyInfo");
+  }
+  const children = readSequenceChildren(root);
+  const subjectPublicKey = children[1];
+  if (!subjectPublicKey || subjectPublicKey.tag !== TAG.BIT_STRING || subjectPublicKey.value.length < 1) {
+    throw new Error("Invalid SubjectPublicKeyInfo subjectPublicKey");
+  }
+  return digestSha1(subjectPublicKey.value.subarray(1));
 }
 
 export async function privateKeyToPem(key: CryptoKey): Promise<string> {

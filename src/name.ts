@@ -1,5 +1,5 @@
 import { sequence, set, oid, printableString, utf8String } from "./der.js";
-import { SUBJECT_ATTRIBUTE_OIDS } from "./oids.js";
+import { MAX_SUBJECT_VALUE_LENGTH, SUBJECT_ATTRIBUTE_OIDS, SUBJECT_VALUE_LENGTH_LIMITS } from "./oids.js";
 import type { ShortSubjectAttributeType, Subject, SubjectAttributeType } from "./types.js";
 
 const SHORT_TYPES = new Set<string>(Object.keys(SUBJECT_ATTRIBUTE_OIDS));
@@ -23,6 +23,12 @@ export function encodeName(subject: Subject): Uint8Array {
       }
       if (attribute.value.length === 0) {
         throw new Error(`subject[${index}].value must not be empty`);
+      }
+      const limit = SUBJECT_VALUE_LENGTH_LIMITS[attribute.type as ShortSubjectAttributeType] ?? MAX_SUBJECT_VALUE_LENGTH;
+      if (attribute.value.length > limit) {
+        throw new Error(
+          `subject[${index}].value exceeds ${limit} character limit for type "${attribute.type}"`
+        );
       }
       const attributeOid = resolveAttributeOid(attribute.type);
       const value = attribute.type === "C" ? printableString(attribute.value) : utf8String(attribute.value);

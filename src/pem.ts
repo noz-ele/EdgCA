@@ -15,12 +15,18 @@ export function publicKeyDerToPem(der: Uint8Array): string {
 }
 
 export function pemToDer(pem: string): Uint8Array {
-  const match = /-----BEGIN [^-]+-----([\s\S]*?)-----END [^-]+-----/.exec(pem);
-  if (!match?.[1]) {
+  const match = /-----BEGIN ([^-]+)-----([\s\S]*?)-----END ([^-]+)-----/.exec(pem);
+  if (!match) {
+    throw new Error("Invalid PEM block");
+  }
+  if (match[1] !== match[3]) {
+    throw new Error(`PEM BEGIN/END labels do not match: BEGIN ${match[1]} / END ${match[3]}`);
+  }
+  if (!match[2]) {
     throw new Error("Invalid PEM block");
   }
 
-  const base64 = match[1].replace(/\s+/g, "");
+  const base64 = match[2].replace(/\s+/g, "");
   return binaryToBytes(atob(base64));
 }
 
