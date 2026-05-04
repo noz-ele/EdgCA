@@ -9,11 +9,23 @@ import {
   privateKeyToPem,
   publicKeyToPem
 } from "../src/index.js";
-import { ecdsaDerToRaw, ecdsaRawToDer } from "../src/crypto.js";
-import { decodeOid, readElement, readSequenceChildren, TAG } from "../src/der.js";
+import { ecdsaDerToRaw, ecdsaRawToDer, keyIdentifierFromSpki } from "../src/crypto.js";
+import {
+  bitString,
+  decodeInteger,
+  decodeOid,
+  oid,
+  readChildren,
+  readElement,
+  readSequenceChildren,
+  sequence,
+  TAG
+} from "../src/der.js";
 import { encodeIpAddress } from "../src/ip.js";
 import { OID } from "../src/oids.js";
 import { pemToDerWithLabel, splitPemBlocks } from "../src/pem.js";
+import { assertIssuerSubjectMatches } from "../src/parser.js";
+import { keyUsageExtension, subjectAltNameExtension } from "../src/x509.js";
 import type { SerialNumber, Subject } from "../src/types.js";
 import {
   assertSingleValuedRdns,
@@ -1386,3 +1398,343 @@ describe("RFC 5280 conformance regressions", () => {
 async function digestSha1(bytes: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.digest("SHA-1", bytes));
 }
+
+describe("DER decoder error paths", () => {
+  it("rejects indefinite-length form (0x80)", () => {
+    expect(() => readElement(new Uint8Array([0x30, 0x80, 0x00, 0x00]))).toThrow("Indefinite DER length");
+  });
+
+  it("rejects truncated long-form length", () => {
+    expect(() => readElement(new Uint8Array([0x30, 0x82, 0x00]))).toThrow("Truncated DER length");
+  });
+
+  it("decodes long-form length encoding round-trip", () => {
+    const big = new Uint8Array(300);
+    big.fill(0x41);
+    const seq = sequence(new Uint8Array([TAG.OCTET_STRING, 0x82, 0x01, 0x2c]), big);
+    const root = readElement(seq);
+    expect(root.tag).toBe(TAG.SEQUENCE);
+    expect(root.length).toBeGreaterThan(0x7f);
+    const inner = readElement(root.value);
+    expect(inner.length).toBe(300);
+  });
+
+  it("rejects readElement when offset is past input", () => {
+    expect(() => readElement(new Uint8Array(0))).toThrow("Unexpected end of DER input");
+    expect(() => readElement(new Uint8Array([0x05, 0x00]), 2)).toThrow("Unexpected end of DER input");
+  });
+
+  it("rejects decodeOid empty input", () => {
+    expect(() => decodeOid(new Uint8Array(0))).toThrow("Invalid empty OID");
+  });
+
+  it("rejects decodeInteger empty input", () => {
+    expect(() => decodeInteger(new Uint8Array(0))).toThrow("Invalid empty INTEGER");
+  });
+
+  it("rejects decodeInteger with negative high bit", () => {
+    expect(() => decodeInteger(new Uint8Array([0x80]))).toThrow("Negative INTEGER is unsupported");
+    expect(() => decodeInteger(new Uint8Array([0xff, 0xff]))).toThrow("Negative INTEGER is unsupported");
+  });
+
+  it("rejects bitString with unusedBits outside [0,7]", () => {
+    expect(() => bitString(new Uint8Array([0x00]), -1)).toThrow("BIT STRING unused bits");
+    expect(() => bitString(new Uint8Array([0x00]), 8)).toThrow("BIT STRING unused bits");
+  });
+
+  it("rejects DER length that exceeds input size", () => {
+    expect(() => readElement(new Uint8Array([0x04, 0x05, 0x00]))).toThrow("DER length exceeds input size");
+  });
+});
+
+describe("OID encoder boundaries", () => {
+  it("encodes lowest joint-arc and itu/iso boundaries", () => {
+    expect(decodeOid(readElement(oid("0.0")).value)).toBe("0.0");
+    expect(decodeOid(readElement(oid("0.39")).value)).toBe("0.39");
+    expect(decodeOid(readElement(oid("1.0")).value)).toBe("1.0");
+    expect(decodeOid(readElement(oid("1.39")).value)).toBe("1.39");
+    expect(decodeOid(readElement(oid("2.0")).value)).toBe("2.0");
+  });
+
+  it("encodes joint-iso-itu-t arc with second component > 39", () => {
+    expect(decodeOid(readElement(oid("2.100.3")).value)).toBe("2.100.3");
+    expect(decodeOid(readElement(oid("2.999.1")).value)).toBe("2.999.1");
+  });
+
+  it("round-trips OID components requiring multi-byte base128 encoding", () => {
+    const value = "1.2.840.113549.1.1.11";
+    expect(decodeOid(readElement(oid(value)).value)).toBe(value);
+    expect(decodeOid(readElement(oid("2.16.840.1.113894")).value)).toBe("2.16.840.1.113894");
+  });
+});
+
+describe("ECDSA signature converter error paths", () => {
+  it("rejects ecdsaRawToDer with wrong-length raw input", () => {
+    expect(() => ecdsaRawToDer(new Uint8Array(0))).toThrow("64 bytes");
+    expect(() => ecdsaRawToDer(new Uint8Array(63))).toThrow("64 bytes");
+    expect(() => ecdsaRawToDer(new Uint8Array(65))).toThrow("64 bytes");
+  });
+
+  it("rejects ecdsaDerToRaw when root is not a SEQUENCE", () => {
+    expect(() => ecdsaDerToRaw(new Uint8Array([0x04, 0x00]))).toThrow("Invalid DER ECDSA signature");
+  });
+
+  it("rejects ecdsaDerToRaw with trailing bytes after the SEQUENCE", () => {
+    const valid = ecdsaRawToDer(new Uint8Array(64).fill(0x01));
+    const trailing = new Uint8Array(valid.length + 1);
+    trailing.set(valid);
+    trailing[valid.length] = 0x00;
+    expect(() => ecdsaDerToRaw(trailing)).toThrow("Invalid DER ECDSA signature");
+  });
+
+  it("rejects ecdsaDerToRaw whose r or s is not an INTEGER", () => {
+    const notInt = new Uint8Array([0x04, 0x01, 0x00]);
+    const innerBytes = new Uint8Array(notInt.length * 2);
+    innerBytes.set(notInt, 0);
+    innerBytes.set(notInt, notInt.length);
+    const malformed = sequence(notInt, notInt);
+    expect(() => ecdsaDerToRaw(malformed)).toThrow("Invalid DER ECDSA signature integers");
+  });
+
+  it("rejects ecdsa integers wider than 32 bytes (P-256)", () => {
+    const oversized = new Uint8Array(33).fill(0x01);
+    const malformed = sequence(
+      new Uint8Array([TAG.INTEGER, oversized.length, ...oversized]),
+      new Uint8Array([TAG.INTEGER, 0x01, 0x01])
+    );
+    expect(() => ecdsaDerToRaw(malformed)).toThrow("wider than P-256");
+  });
+});
+
+describe("keyIdentifierFromSpki error paths", () => {
+  it("rejects non-SEQUENCE SubjectPublicKeyInfo", async () => {
+    await expect(keyIdentifierFromSpki(new Uint8Array([0x04, 0x00]))).rejects.toThrow("Invalid SubjectPublicKeyInfo");
+  });
+
+  it("rejects SubjectPublicKeyInfo whose subjectPublicKey is not BIT STRING", async () => {
+    const bad = sequence(sequence(oid(OID.ecdsaWithSha256)), new Uint8Array([TAG.OCTET_STRING, 0x01, 0x00]));
+    await expect(keyIdentifierFromSpki(bad)).rejects.toThrow("Invalid SubjectPublicKeyInfo subjectPublicKey");
+  });
+
+  it("rejects SubjectPublicKeyInfo with empty BIT STRING value", async () => {
+    const bad = sequence(sequence(oid(OID.ecdsaWithSha256)), new Uint8Array([TAG.BIT_STRING, 0x00]));
+    await expect(keyIdentifierFromSpki(bad)).rejects.toThrow("Invalid SubjectPublicKeyInfo subjectPublicKey");
+  });
+});
+
+describe("subject value ub-* limits (untested attribute types)", () => {
+  it("rejects values exceeding ub-* limits for E, SERIALNUMBER, STREET, TITLE, UID", async () => {
+    const cases: Array<{ type: "E" | "SERIALNUMBER" | "STREET" | "TITLE" | "UID"; length: number; value?: string }> = [
+      { type: "E", length: 256, value: `${"a".repeat(248)}@ex.test` },
+      { type: "SERIALNUMBER", length: 65 },
+      { type: "STREET", length: 129 },
+      { type: "TITLE", length: 65 },
+      { type: "UID", length: 257 }
+    ];
+    for (const { type, length, value } of cases) {
+      const v = value ?? "a".repeat(length);
+      expect([...v].length).toBe(length);
+      await expect(
+        createRootCA({ subject: [{ type, value: v }], days: 365 })
+      ).rejects.toThrow("character limit");
+    }
+  });
+
+  it("accepts values exactly at ub-* limits for E, SERIALNUMBER, STREET, TITLE, UID", async () => {
+    const root = await createRootCA({
+      subject: [
+        { type: "E", value: `${"a".repeat(247)}@ex.test` },
+        { type: "SERIALNUMBER", value: "s".repeat(64) },
+        { type: "STREET", value: "t".repeat(128) },
+        { type: "TITLE", value: "u".repeat(64) },
+        { type: "UID", value: "v".repeat(256) }
+      ],
+      days: 365
+    });
+    expect(root.certPem.startsWith("-----BEGIN CERTIFICATE-----")).toBe(true);
+  });
+});
+
+describe("forbidden character boundary classes", () => {
+  it("rejects NUL (0x00) and the bidi-block upper edge (0x202e)", async () => {
+    for (const code of [0x00, 0x202e]) {
+      await expect(
+        createRootCA({
+          subject: [{ type: "CN", value: `safe${String.fromCharCode(code)}text` }],
+          days: 365
+        })
+      ).rejects.toThrow("forbidden");
+    }
+  });
+
+  it("accepts adjacent code points just outside each forbidden range", async () => {
+    const safeCases = [
+      "safe text",
+      `safe${String.fromCharCode(0x20)}text`,
+      `safe${String.fromCharCode(0x7e)}text`,
+      `safe${String.fromCharCode(0x80)}text`,
+      `safe${String.fromCharCode(0x200d)}text`,
+      `safe${String.fromCharCode(0x2010)}text`,
+      `safe${String.fromCharCode(0x2029)}text`,
+      `safe${String.fromCharCode(0x202f)}text`,
+      `safe${String.fromCharCode(0x2065)}text`,
+      `safe${String.fromCharCode(0x206a)}text`
+    ];
+    for (const value of safeCases) {
+      const root = await createRootCA({ subject: [{ type: "CN", value }], days: 365 });
+      expect(root.certPem.startsWith("-----BEGIN CERTIFICATE-----")).toBe(true);
+    }
+  });
+});
+
+describe("certificate parser malformed-input paths", () => {
+  it("rejects parse of certificate with non-zero unused bits in signatureValue", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const cert = readSequenceChildren(readElement(root.certDer));
+    const tbs = cert[0]!;
+    const algo = cert[1]!;
+    const sig = cert[2]!;
+    const bitStringWithUnusedBits = new Uint8Array(sig.value.length);
+    bitStringWithUnusedBits.set(sig.value);
+    bitStringWithUnusedBits[0] = 0x01;
+    const mutated = sequence(tbs.raw, algo.raw, new Uint8Array([TAG.BIT_STRING, sig.value.length, ...bitStringWithUnusedBits]));
+    const pem = certificateToPem(mutated);
+    await expect(
+      importCertificateAuthority({ certPem: pem, privateKeyPem: root.privateKeyPem })
+    ).rejects.toThrow("Invalid certificate signature value");
+  });
+
+  it("rejects parse of certificate whose root SEQUENCE has trailing bytes", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const padded = new Uint8Array(root.certDer.length + 1);
+    padded.set(root.certDer);
+    padded[root.certDer.length] = 0x00;
+    const pem = certificateToPem(padded);
+    await expect(
+      importCertificateAuthority({ certPem: pem, privateKeyPem: root.privateKeyPem })
+    ).rejects.toThrow();
+  });
+});
+
+describe("assertIssuerSubjectMatches", () => {
+  it("matches when issuer subject equals issued issuer", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 30
+    });
+    const parsedRoot = await parseCertificate(root.certDer);
+    const parsedIntermediate = await parseCertificate(intermediate.certDer);
+    expect(() => assertIssuerSubjectMatches(parsedRoot, parsedIntermediate)).not.toThrow();
+  });
+
+  it("throws when issuer subject does not match issued issuer", async () => {
+    const a = await createRootCA({ subject: rootSubject, days: 365 });
+    const b = await createRootCA({
+      subject: [{ type: "CN", value: "other-root" }],
+      days: 365
+    });
+    const parsedA = await parseCertificate(a.certDer);
+    const parsedB = await parseCertificate(b.certDer);
+    expect(() => assertIssuerSubjectMatches(parsedA, parsedB)).toThrow("does not match CA subject");
+  });
+});
+
+describe("keyUsageExtension bit layout", () => {
+  it("places digitalSignature at bit 0 and cRLSign at bit 6 in a single byte", () => {
+    const ext = keyUsageExtension(["digitalSignature", "cRLSign"]);
+    const root = readElement(ext);
+    const children = readSequenceChildren(root);
+    const octetEl = children[children.length - 1]!;
+    const bits = readElement(octetEl.value);
+    expect(bits.tag).toBe(TAG.BIT_STRING);
+    expect(bits.value.length).toBe(2);
+    expect(bits.value[0]).toBe(1);
+    expect(bits.value[1]).toBe(0x80 | 0x02);
+  });
+
+  it("places keyCertSign at bit 5 and cRLSign at bit 6 with unused-bits=1", () => {
+    const ext = keyUsageExtension(["keyCertSign", "cRLSign"]);
+    const root = readElement(ext);
+    const children = readSequenceChildren(root);
+    const octetEl = children[children.length - 1]!;
+    const bits = readElement(octetEl.value);
+    expect(bits.tag).toBe(TAG.BIT_STRING);
+    expect(bits.value.length).toBe(2);
+    expect(bits.value[0]).toBe(1);
+    expect(bits.value[1]).toBe(0x04 | 0x02);
+  });
+
+  it("encodes digitalSignature alone with unused-bits=7", () => {
+    const ext = keyUsageExtension(["digitalSignature"]);
+    const root = readElement(ext);
+    const children = readSequenceChildren(root);
+    const octetEl = children[children.length - 1]!;
+    const bits = readElement(octetEl.value);
+    expect(bits.value.length).toBe(2);
+    expect(bits.value[0]).toBe(7);
+    expect(bits.value[1]).toBe(0x80);
+  });
+});
+
+describe("subjectAltNameExtension", () => {
+  it("returns undefined when called with both arrays empty", () => {
+    expect(subjectAltNameExtension([], [])).toBeUndefined();
+    expect(subjectAltNameExtension(undefined, undefined)).toBeUndefined();
+  });
+
+  it("rejects single-character TLD-only names per the preferred-name pattern", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const client = await issueClientCert({
+      ca: root,
+      subject: clientSubject,
+      days: 30,
+      dnsNames: ["a.example", "localhost"]
+    });
+    const san = parseSubjectAltName(getExtension(client.certDer, OID.subjectAltName).value);
+    expect(san.dnsNames).toEqual(["a.example", "localhost"]);
+  });
+
+  it("rejects DNS labels starting with a hyphen", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    await expect(
+      issueClientCert({
+        ca: root,
+        subject: clientSubject,
+        days: 30,
+        dnsNames: ["-foo.example.test"]
+      })
+    ).rejects.toThrow("dNSName");
+  });
+});
+
+describe("IP encoding additional boundaries", () => {
+  it("rejects IPv4-embedded IPv6 forms", () => {
+    for (const value of ["::ffff:192.0.2.1", "::1.2.3.4"]) {
+      expect(() => encodeIpAddress(value)).toThrow("Invalid");
+    }
+  });
+
+  it("rejects IPv6 with trailing single colon", () => {
+    expect(() => encodeIpAddress("1:2:3:4:5:6:7:8:")).toThrow("Invalid");
+  });
+
+  it("rejects IPv6 over-specified with '::' compressing zero groups", () => {
+    expect(() => encodeIpAddress("1:2:3:4::5:6:7:8")).toThrow("Invalid");
+  });
+});
+
+describe("PEM parser additional cases", () => {
+  it("tolerates CRLF line endings", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const crlf = root.certPem.replace(/\n/g, "\r\n");
+    const der = pemToDer(crlf);
+    expect(der).toEqual(root.certDer);
+  });
+
+  it("rejects PEM body containing only non-base64 characters", () => {
+    const malformed = "-----BEGIN CERTIFICATE-----\n!@#$%^\n-----END CERTIFICATE-----\n";
+    expect(() => pemToDer(malformed)).toThrow();
+  });
+});

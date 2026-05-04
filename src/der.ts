@@ -201,11 +201,32 @@ export function decodeOid(input: Uint8Array): string {
     throw new Error("Invalid empty OID");
   }
 
-  const first = input[0]!;
-  const parts = first >= 80 ? [2, first - 80] : [Math.floor(first / 40), first % 40];
-  let value = 0;
+  // Decode the first base-128 sub-identifier (which may be multi-byte for
+  // joint-iso-itu-t OIDs whose joint value 2*40+second exceeds 127).
+  let firstSubId = 0;
+  let i = 0;
+  let firstComplete = false;
+  while (i < input.length) {
+    const byte = input[i]!;
+    firstSubId = firstSubId * 128 + (byte & 0x7f);
+    i += 1;
+    if ((byte & 0x80) === 0) {
+      firstComplete = true;
+      break;
+    }
+  }
 
-  for (let i = 1; i < input.length; i += 1) {
+  if (!firstComplete) {
+    throw new Error("Truncated OID");
+  }
+
+  const parts: number[] =
+    firstSubId < 40 ? [0, firstSubId]
+    : firstSubId < 80 ? [1, firstSubId - 40]
+    : [2, firstSubId - 80];
+
+  let value = 0;
+  for (; i < input.length; i += 1) {
     const byte = input[i]!;
     value = value * 128 + (byte & 0x7f);
     if ((byte & 0x80) === 0) {
