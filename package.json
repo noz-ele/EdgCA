@@ -18,7 +18,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "npm run build",
     "test": "vitest run",
+    "pretest:workers": "npm run build",
+    "prepack": "npm run build",
     "test:workers": "vitest run --config vitest.config.ts"
   },
   "devDependencies": {

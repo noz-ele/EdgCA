@@ -192,7 +192,7 @@ function assertIssuerChainPem(chainPem: string): void {
 }
 
 async function resolveKeyPair(privateKeyPem: string | undefined): Promise<CryptoKeyPair> {
-  if (privateKeyPem) {
+  if (privateKeyPem !== undefined) {
     return keyPairFromPrivateKeyPem(privateKeyPem);
   }
   return generateKeyPair();

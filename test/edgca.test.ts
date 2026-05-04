@@ -245,6 +245,26 @@ describe("EdgCA issuing API", () => {
     ).rejects.toThrow("expected PRIVATE KEY");
   });
 
+  it("rejects an explicitly empty privateKeyPem", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        privateKeyPem: ""
+      })
+    ).rejects.toThrow("expected PRIVATE KEY");
+    await expect(
+      issueIntermediateCA({
+        ca: root,
+        subject: intermediateSubject,
+        days: 365,
+        privateKeyPem: ""
+      })
+    ).rejects.toThrow("expected PRIVATE KEY");
+  });
+
   it("rejects importing a CA certificate with a mismatched private key", async () => {
     const root = await createRootCA({ subject: rootSubject, days: 3650 });
     const otherRoot = await createRootCA({
@@ -541,6 +561,40 @@ describe("input validation", () => {
     ).rejects.toThrow("dNSName");
   });
 
+  it("rejects non-array SAN inputs", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+
+    await expect(
+      issueClientCert({
+        ca: root,
+        subject: clientSubject,
+        days: 30,
+        dnsNames: "worker-client.example.test" as never
+      })
+    ).rejects.toThrow("dnsNames must be an array");
+    await expect(
+      issueClientCert({
+        ca: root,
+        subject: clientSubject,
+        days: 30,
+        ipAddresses: "127.0.0.1" as never
+      })
+    ).rejects.toThrow("ipAddresses must be an array");
+  });
+
+  it("rejects non-string ipAddress entries", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+
+    await expect(
+      issueClientCert({
+        ca: root,
+        subject: clientSubject,
+        days: 30,
+        ipAddresses: [123 as never]
+      })
+    ).rejects.toThrow("iPAddress");
+  });
+
   it("rejects importCertificateAuthority when certPem has wrong label", async () => {
     const root = await createRootCA({ subject: rootSubject, days: 365 });
     await expect(
@@ -736,6 +790,16 @@ describe("serial numbers and validity", () => {
       expect(validity.notBefore.tag, name).toBe(TAG.UTC_TIME);
       expect(validity.notAfter.tag, name).toBe(TAG.UTC_TIME);
     }
+  });
+
+  it("rejects validity periods whose notAfter cannot be represented", async () => {
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: Number.MAX_VALUE,
+        notBefore: new Date(0)
+      })
+    ).rejects.toThrow("notAfter must be a valid Date");
   });
 
   it("switches between UTCTime and GeneralizedTime at the X.509 year boundaries", async () => {

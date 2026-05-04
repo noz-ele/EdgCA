@@ -112,6 +112,9 @@ export function authorityKeyIdentifierExtension(keyIdentifier: Uint8Array): Uint
 }
 
 export function subjectAltNameExtension(dnsNames?: readonly string[], ipAddresses?: readonly string[]): Uint8Array | undefined {
+  assertOptionalStringArray("dnsNames", dnsNames);
+  assertOptionalStringArray("ipAddresses", ipAddresses);
+
   const names: Uint8Array[] = [];
 
   for (const dnsName of dnsNames ?? []) {
@@ -122,6 +125,9 @@ export function subjectAltNameExtension(dnsNames?: readonly string[], ipAddresse
   }
 
   for (const ipAddress of ipAddresses ?? []) {
+    if (typeof ipAddress !== "string") {
+      throw new Error(`Invalid SAN iPAddress: ${ipAddress}`);
+    }
     names.push(der(0x87, encodeIpAddress(ipAddress)));
   }
 
@@ -129,6 +135,12 @@ export function subjectAltNameExtension(dnsNames?: readonly string[], ipAddresse
 }
 
 const DNS_NAME_PATTERN = /^(\*\.)?[A-Za-z0-9_\-]+(\.[A-Za-z0-9_\-]+)*$/;
+
+function assertOptionalStringArray(name: string, values: readonly string[] | undefined): void {
+  if (values !== undefined && !Array.isArray(values)) {
+    throw new Error(`${name} must be an array`);
+  }
+}
 
 function extension(extensionOid: string, critical: boolean, valueDer: Uint8Array): Uint8Array {
   return sequence(
@@ -191,14 +203,24 @@ function resolveValidity(notBeforeInput: Date | undefined, days: number): { notB
     throw new Error("days must be a positive number");
   }
 
-  const notBefore = notBeforeInput ? new Date(notBeforeInput) : new Date();
-  if (Number.isNaN(notBefore.getTime())) {
+  const notBefore = notBeforeInput === undefined ? new Date() : new Date(notBeforeInput);
+  const notBeforeMs = notBefore.getTime();
+  if (!Number.isFinite(notBeforeMs)) {
     throw new Error("notBefore must be a valid Date");
+  }
+
+  const notAfterMs = notBeforeMs + days * 86_400_000;
+  if (!Number.isFinite(notAfterMs)) {
+    throw new Error("notAfter must be a valid Date");
+  }
+  const notAfter = new Date(notAfterMs);
+  if (!Number.isFinite(notAfter.getTime())) {
+    throw new Error("notAfter must be a valid Date");
   }
 
   return {
     notBefore,
-    notAfter: new Date(notBefore.getTime() + days * 86_400_000)
+    notAfter
   };
 }
 
