@@ -39,6 +39,16 @@ describe("ip IPv6", () => {
     );
   });
 
+  it("accepts uppercase hex digits identically to lowercase", () => {
+    fc.assert(
+      fc.property(fc.array(groupArb, { minLength: 8, maxLength: 8 }), (groups) => {
+        const lower = groups.map((g) => g.toString(16)).join(":");
+        const upper = lower.toUpperCase();
+        expect(encodeIpAddress(upper)).toEqual(encodeIpAddress(lower));
+      })
+    );
+  });
+
   it("encodes :: compression to the same bytes as the expanded form", () => {
     const compressedArb = fc
       .tuple(
