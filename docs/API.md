@@ -306,7 +306,7 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 | `days` | `number` | ✅ | — | `CreateRootCAOptions.days` と同じ。 |
 | `notBefore` | `Date` | — | 呼び出し時刻 | `CreateRootCAOptions.notBefore` と同じ。 |
 | `serialNumber` | `SerialNumber` | — | CSPRNG 由来 16-byte random | `CreateRootCAOptions.serialNumber` と同じ。 |
-| `dnsNames` | `string[]` | — | `undefined` | SAN dNSName。指定時のみ SAN extension が出力される。各値 ≤253 chars、`A-Za-z0-9_-` とドット、先頭の `*.` ワイルドカード可。違反は例外。 |
+| `dnsNames` | `string[]` | — | `undefined` | SAN dNSName。指定時のみ SAN extension が出力される。RFC 1035 §2.3.1 preferred name syntax: 各 label は `[A-Za-z0-9]` で始終端し内部に `-` 可、label 長 ≤63 chars、全長 ≤253 chars、先頭の `*.` ワイルドカード可。違反は例外。 |
 | `ipAddresses` | `string[]` | — | `undefined` | SAN iPAddress。IPv4 / IPv6 文字列。`dnsNames` と併用可。両者未指定なら SAN extension 自体が省略される。 |
 
 `issueClientCert` は client cert の秘密鍵を**常に内部生成**するため、`privateKeyPem` option はない。client cert の鍵は ephemeral 想定。
