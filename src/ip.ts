@@ -23,16 +23,16 @@ function encodeIpv4(value: string): Uint8Array {
 }
 
 function encodeIpv6(value: string): Uint8Array {
-  if (value.split("::").length > 2) {
+  const segments = value.split("::");
+  if (segments.length > 2) {
     throw new Error(`Invalid IPv6 address: ${value}`);
   }
 
-  const [leftPart = "", rightPart = ""] = value.split("::");
-  const left = parseIpv6Groups(leftPart, value);
-  const right = parseIpv6Groups(rightPart, value);
+  const left = parseIpv6Groups(segments[0]!, value);
+  const right = parseIpv6Groups(segments[1] ?? "", value);
   const missing = 8 - left.length - right.length;
 
-  if (value.includes("::")) {
+  if (segments.length === 2) {
     // RFC 5952 §4.2.2: "::" must compress at least two zero groups.
     if (missing < 2) {
       throw new Error(`Invalid IPv6 address: ${value}`);

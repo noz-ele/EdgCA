@@ -189,10 +189,6 @@ export function readChildren(input: Uint8Array): DerElement[] {
     offset = element.end;
   }
 
-  if (offset !== input.length) {
-    throw new Error("Invalid DER children");
-  }
-
   return out;
 }
 

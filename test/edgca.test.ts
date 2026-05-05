@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   certificateToPem,
   createRootCA,
@@ -37,6 +37,7 @@ import {
   decodeOid,
   der,
   explicit,
+  generalizedTime,
   ia5String,
   integer,
   octetString,
@@ -48,6 +49,7 @@ import {
   sequence,
   set,
   TAG,
+  utcTime,
   utf8String
 } from "../src/der.js";
 import { encodeName } from "../src/name.js";
@@ -3062,5 +3064,226 @@ describe("printableString direct character set", () => {
     for (const ch of ["*", "_", "@", "#", "!", "~", "$", "%", "^", "&"]) {
       expect(() => printableString(ch)).toThrow("PrintableString");
     }
+  });
+});
+
+describe("oid() direct format errors", () => {
+  it("rejects a component that is not a non-negative decimal integer", () => {
+    expect(() => oid("1.2.abc")).toThrow("Invalid OID");
+    expect(() => oid("1.2.-3")).toThrow("Invalid OID");
+    expect(() => oid("1.2.03")).toThrow("Invalid OID");
+  });
+
+  it("rejects an OID with fewer than two components", () => {
+    expect(() => oid("1")).toThrow("Invalid OID");
+    expect(() => oid("")).toThrow("Invalid OID");
+  });
+});
+
+describe("utcTime / generalizedTime direct boundaries", () => {
+  it("utcTime falls back to GeneralizedTime when year is outside [1950, 2049]", () => {
+    const before = new Date(Date.UTC(1949, 11, 31, 23, 59, 59));
+    const after = new Date(Date.UTC(2050, 0, 1, 0, 0, 0));
+    expect(readElement(utcTime(before)).tag).toBe(TAG.GENERALIZED_TIME);
+    expect(readElement(utcTime(after)).tag).toBe(TAG.GENERALIZED_TIME);
+  });
+
+  it("generalizedTime rejects years outside [1, 9999]", () => {
+    const yearZero = new Date(Date.UTC(2000, 0, 1));
+    yearZero.setUTCFullYear(0);
+    const yearTenThousand = new Date(Date.UTC(2000, 0, 1));
+    yearTenThousand.setUTCFullYear(10000);
+    expect(() => generalizedTime(yearZero)).toThrow("GeneralizedTime year must be between 0001 and 9999");
+    expect(() => generalizedTime(yearTenThousand)).toThrow("GeneralizedTime year must be between 0001 and 9999");
+  });
+});
+
+describe("readSequenceChildren rejects non-SEQUENCE input", () => {
+  it("throws when called on an INTEGER element", () => {
+    const element = readElement(integer(1));
+    expect(() => readSequenceChildren(element)).toThrow("Expected SEQUENCE");
+  });
+
+  it("throws when called on a SET element", () => {
+    const element = readElement(set(integer(1)));
+    expect(() => readSequenceChildren(element)).toThrow("Expected SEQUENCE");
+  });
+});
+
+describe("integer() handles empty Uint8Array input", () => {
+  it("encodes an empty Uint8Array as the single-octet zero INTEGER", () => {
+    const element = readElement(integer(new Uint8Array(0)));
+    expect(element.tag).toBe(TAG.INTEGER);
+    expect(Array.from(element.value)).toEqual([0]);
+    expect(decodeInteger(element.value)).toBe(0n);
+  });
+});
+
+describe("auto-generated serial number when crypto.getRandomValues yields all zeros", () => {
+  it("forces the last byte to 1 so the resulting serial is a positive INTEGER", async () => {
+    const original = crypto.getRandomValues.bind(crypto);
+    const spy = vi.spyOn(crypto, "getRandomValues").mockImplementation(((array: ArrayBufferView) => {
+      if (array instanceof Uint8Array) {
+        array.fill(0);
+      } else {
+        // Fall back to the real implementation for non-Uint8Array views (none expected here).
+        return original(array as Parameters<typeof original>[0]);
+      }
+      return array;
+    }) as typeof crypto.getRandomValues);
+    try {
+      const root = await createRootCA({ subject: rootSubject, days: 365 });
+      expect(parseCertificateSerialNumber(root.certDer).value).toBe(1n);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("notAfter rejection when computed Date overflows JS Date range", () => {
+  it("rejects notBefore=year 9999 + days large enough that notAfterMs is finite but exceeds the Date range", async () => {
+    const notBefore = new Date(Date.UTC(9999, 11, 31, 0, 0, 0));
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 100_000_000,
+        notBefore,
+        serialNumber: 1
+      })
+    ).rejects.toThrow("notAfter must be a valid Date");
+  });
+});
+
+describe("certificate parser truncated-structure paths", () => {
+  it("rejects an outer Certificate SEQUENCE with too few children", async () => {
+    const cert = sequence(integer(1));
+    await expect(parseCertificateDer(cert)).rejects.toThrow("Invalid certificate structure");
+  });
+
+  it("rejects a TBSCertificate SEQUENCE missing subject/SPKI", async () => {
+    const issuerName = encodeName([{ type: "CN", value: "x" }]);
+    const tbs = sequence(
+      explicit(0, integer(2)),
+      integer(1),
+      sequence(oid(OID.ecdsaWithSha256)),
+      issuerName
+    );
+    const cert = sequence(
+      tbs,
+      sequence(oid(OID.ecdsaWithSha256)),
+      bitString(new Uint8Array(0), 0)
+    );
+    await expect(parseCertificateDer(cert)).rejects.toThrow(
+      "Invalid certificate TBSCertificate structure"
+    );
+  });
+
+  it("parses a v3 certificate that omits the [3] EXPLICIT extensions field entirely", async () => {
+    const pair = await generateKeyPair();
+    const subjectNameDer = encodeName([{ type: "CN", value: "no-ext-tag" }]);
+    const spki = await exportSpki(pair.publicKey);
+    const { tbsCertificateDer } = buildTbsCertificate({
+      days: 1,
+      issuerNameDer: subjectNameDer,
+      subjectNameDer,
+      subjectPublicKeyInfoDer: spki,
+      extensions: [],
+      serialNumber: 1
+    });
+    const tbsChildren = readSequenceChildren(readElement(tbsCertificateDer));
+    expect(tbsChildren[tbsChildren.length - 1]!.tag).toBe(0xa3);
+    const tbsWithoutExtTag = sequence(...tbsChildren.slice(0, -1).map((child) => child.raw));
+    const signature = await signDer(pair.privateKey, tbsWithoutExtTag);
+    const certDer = buildCertificate(tbsWithoutExtTag, signature);
+
+    const parsed = await parseCertificateDer(certDer);
+    expect(parsed.isCA).toBe(false);
+    expect(parsed.keyCertSign).toBe(false);
+    expect(parsed.subjectKeyIdentifier).toBeUndefined();
+    expect(parsed.authorityKeyIdentifier).toBeUndefined();
+    expect(parsed.pathLenConstraint).toBeUndefined();
+  });
+});
+
+describe("DER decoder remaining boundary paths", () => {
+  it("rejects decodeOid whose first sub-identifier never closes its continuation", () => {
+    expect(() => decodeOid(new Uint8Array([0x80]))).toThrow("Truncated OID");
+  });
+
+  it("rejects readElement on a single-byte input where the length octet is missing", () => {
+    expect(() => readElement(new Uint8Array([0x05]))).toThrow("Missing DER length");
+  });
+});
+
+describe("OID encoder rejects components beyond Number.MAX_SAFE_INTEGER", () => {
+  it("rejects oid() directly with a non-safe-integer component", () => {
+    expect(() => oid("1.2.99999999999999999999")).toThrow("non-negative safe integer");
+  });
+
+  it("rejects a subject dotted-OID type whose component exceeds Number.MAX_SAFE_INTEGER", async () => {
+    await expect(
+      createRootCA({
+        subject: [{ type: "1.2.99999999999999999999" as never, value: "x" }],
+        days: 365
+      })
+    ).rejects.toThrow("non-negative safe integer");
+  });
+});
+
+describe("subject attribute validation: non-string type", () => {
+  it("rejects a subject entry whose type field is a number", async () => {
+    await expect(
+      createRootCA({
+        subject: [{ type: 42 as never, value: "x" }],
+        days: 365
+      })
+    ).rejects.toThrow("subject[0].type must be a string");
+  });
+
+  it("rejects a subject entry whose type field is null", async () => {
+    await expect(
+      createRootCA({
+        subject: [{ type: null as never, value: "x" }],
+        days: 365
+      })
+    ).rejects.toThrow("subject[0].type must be a string");
+  });
+});
+
+describe("PEM tolerates surrounding text and whitespace", () => {
+  it("ignores descriptive header and trailer text outside the PEM block", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const wrapped = `Subject: CN=dev-root\nIssuer: CN=dev-root\n\n${root.certPem}\nIssued for testing.\n`;
+    expect(pemToDer(wrapped)).toEqual(root.certDer);
+    expect(pemToDerWithLabel(wrapped, "CERTIFICATE")).toEqual(root.certDer);
+  });
+});
+
+describe("integer() Uint8Array direct boundaries", () => {
+  it("trims leading zero octets when the high bit is clear", () => {
+    const element = readElement(integer(new Uint8Array([0, 0, 0x05])));
+    expect(element.tag).toBe(TAG.INTEGER);
+    expect(Array.from(element.value)).toEqual([0x05]);
+    expect(decodeInteger(element.value)).toBe(5n);
+  });
+
+  it("collapses an all-zero input to a single zero octet", () => {
+    const element = readElement(integer(new Uint8Array([0, 0, 0])));
+    expect(element.tag).toBe(TAG.INTEGER);
+    expect(Array.from(element.value)).toEqual([0]);
+    expect(decodeInteger(element.value)).toBe(0n);
+  });
+
+  it("prepends a 0x00 sign octet when the high bit of the first byte is set", () => {
+    const element = readElement(integer(new Uint8Array([0x80])));
+    expect(element.tag).toBe(TAG.INTEGER);
+    expect(Array.from(element.value)).toEqual([0x00, 0x80]);
+    expect(decodeInteger(element.value)).toBe(128n);
+  });
+});
+
+describe("readChildren empty input", () => {
+  it("returns an empty array for empty SEQUENCE contents", () => {
+    expect(readChildren(new Uint8Array(0))).toEqual([]);
   });
 });

@@ -23,7 +23,8 @@ import type {
 } from "./types.js";
 import {
   authorityKeyIdentifierExtension,
-  basicConstraintsExtension,
+  basicConstraintsCaExtension,
+  basicConstraintsLeafExtension,
   buildCertificate,
   buildTbsCertificate,
   extendedKeyUsageClientAuthExtension,
@@ -39,7 +40,7 @@ export async function createRootCA(options: CreateRootCAOptions): Promise<Certif
   const keyIdentifier = await keyIdentifierFromSpki(spki);
   const pathLenConstraint = resolveRootPathLenConstraint(options.pathLenConstraint);
   const extensions = [
-    basicConstraintsExtension(true, pathLenConstraint),
+    basicConstraintsCaExtension(pathLenConstraint),
     keyUsageExtension(["keyCertSign", "cRLSign"]),
     subjectKeyIdentifierExtension(keyIdentifier),
     authorityKeyIdentifierExtension(keyIdentifier)
@@ -60,7 +61,7 @@ export async function createRootCA(options: CreateRootCAOptions): Promise<Certif
 
 export async function issueIntermediateCA(options: IssueIntermediateCAOptions): Promise<CertificateAuthority> {
   const issuer = await parseIssuer(options.ca);
-  const issuerChainPem = options.ca.issuerChainPem ?? "";
+  const issuerChainPem = options.ca.issuerChainPem;
   assertCanIssueCertificate(issuer);
   assertCanIssueIntermediate(issuer, issuerChainPem, options.pathLenConstraint);
 
@@ -70,7 +71,7 @@ export async function issueIntermediateCA(options: IssueIntermediateCAOptions): 
   const subjectKeyIdentifier = await keyIdentifierFromSpki(spki);
   const authorityKeyIdentifier = issuer.subjectKeyIdentifier ?? await keyIdentifierFromSpki(issuer.subjectPublicKeyInfoDer);
   const extensions = [
-    basicConstraintsExtension(true, 0),
+    basicConstraintsCaExtension(0),
     keyUsageExtension(["keyCertSign", "cRLSign"]),
     subjectKeyIdentifierExtension(subjectKeyIdentifier),
     authorityKeyIdentifierExtension(authorityKeyIdentifier)
@@ -92,7 +93,7 @@ export async function issueIntermediateCA(options: IssueIntermediateCAOptions): 
 
 export async function issueClientCert(options: IssueClientCertOptions): Promise<IssuedClientCertificate> {
   const issuer = await parseIssuer(options.ca);
-  const issuerChainPem = options.ca.issuerChainPem ?? "";
+  const issuerChainPem = options.ca.issuerChainPem;
   assertCanIssueCertificate(issuer);
 
   const keyPair = await generateKeyPair();
@@ -102,7 +103,7 @@ export async function issueClientCert(options: IssueClientCertOptions): Promise<
   const authorityKeyIdentifier = issuer.subjectKeyIdentifier ?? await keyIdentifierFromSpki(issuer.subjectPublicKeyInfoDer);
   const san = subjectAltNameExtension(options.dnsNames, options.ipAddresses);
   const extensions = [
-    basicConstraintsExtension(false),
+    basicConstraintsLeafExtension(),
     keyUsageExtension(["digitalSignature"]),
     extendedKeyUsageClientAuthExtension(),
     subjectKeyIdentifierExtension(subjectKeyIdentifier),

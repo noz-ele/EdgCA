@@ -65,20 +65,16 @@ export function ecdsaWithSha256AlgorithmIdentifier(): Uint8Array {
   return sequence(oid(OID.ecdsaWithSha256));
 }
 
-export function basicConstraintsExtension(ca: boolean, pathLenConstraint?: number): Uint8Array {
-  if (pathLenConstraint !== undefined) {
-    if (typeof pathLenConstraint !== "number" || !Number.isInteger(pathLenConstraint) || pathLenConstraint < 0) {
-      throw new Error("pathLenConstraint must be a non-negative integer");
-    }
-  }
+export function basicConstraintsCaExtension(pathLenConstraint: number): Uint8Array {
+  return extension(
+    OID.basicConstraints,
+    true,
+    sequence(boolean(true), integer(pathLenConstraint))
+  );
+}
 
-  const children = ca
-    ? pathLenConstraint === undefined
-      ? [boolean(true)]
-      : [boolean(true), integer(pathLenConstraint)]
-    : [];
-
-  return extension(OID.basicConstraints, true, sequence(...children));
+export function basicConstraintsLeafExtension(): Uint8Array {
+  return extension(OID.basicConstraints, true, sequence());
 }
 
 export function keyUsageExtension(usages: readonly KeyUsageBit[]): Uint8Array {
@@ -183,7 +179,7 @@ function encodeSerialNumberDer(serialNumber?: SerialNumber): Uint8Array {
   if (serialNumber === undefined) {
     const bytes = new Uint8Array(16);
     crypto.getRandomValues(bytes);
-    bytes[0] = (bytes[0] ?? 0) & 0x7f;
+    bytes[0] = bytes[0]! & 0x7f;
     if (bytes.every((byte) => byte === 0)) {
       bytes[15] = 1;
     }
