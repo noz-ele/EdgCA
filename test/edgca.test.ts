@@ -9,9 +9,18 @@ import {
   privateKeyToPem,
   publicKeyToPem
 } from "../src/index.js";
-import { asciiBytes, bytesEqual, bytesToBinary, binaryToBytes, cloneBytes, concatBytes } from "../src/bytes.js";
+import {
+  arrayBufferFromBytes,
+  asciiBytes,
+  bytesEqual,
+  bytesToBinary,
+  binaryToBytes,
+  cloneBytes,
+  concatBytes
+} from "../src/bytes.js";
 import {
   assertKeyPairMatches,
+  digestSha256,
   ecdsaDerToRaw,
   ecdsaRawToDer,
   exportSpki,
@@ -23,6 +32,7 @@ import {
 import {
   bitString,
   boolean,
+  contextPrimitive,
   decodeInteger,
   decodeOid,
   der,
@@ -31,10 +41,12 @@ import {
   integer,
   octetString,
   oid,
+  printableString,
   readChildren,
   readElement,
   readSequenceChildren,
   sequence,
+  set,
   TAG,
   utf8String
 } from "../src/der.js";
@@ -2813,5 +2825,242 @@ describe("AKI fallback to SHA-1(SPKI) when issuer has no SKI extension", () => {
     });
     const intermediateAki = parseAuthorityKeyIdentifier(getExtension(intermediate.certDer, OID.authorityKeyIdentifier).value);
     expect(intermediateAki.keyIdentifier).toEqual(expectedAki);
+  });
+});
+
+function rebuildExtensions(baseCertDer: Uint8Array, extensionsValue: Uint8Array): Uint8Array {
+  const cert = readElement(baseCertDer);
+  const [tbs, algo, sig] = readSequenceChildren(cert);
+  const tbsChildren = readSequenceChildren(tbs!);
+  const newTbsChildren = tbsChildren.map((child) =>
+    child.tag === 0xa3 ? explicit(3, extensionsValue) : child.raw
+  );
+  const newTbs = sequence(...newTbsChildren);
+  return sequence(newTbs, algo!.raw, sig!.raw);
+}
+
+describe("import-time CA validation rejections", () => {
+  it("rejects issuance from imported CA whose KU lacks keyCertSign even when BC says isCA=true", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const bcExt = sequence(oid(OID.basicConstraints), boolean(true), octetString(sequence(boolean(true))));
+    const kuValue = bitString(new Uint8Array([0x80]), 7);
+    const kuExt = sequence(oid(OID.keyUsage), boolean(true), octetString(kuValue));
+    const malformedDer = rebuildExtensions(root.certDer, sequence(bcExt, kuExt));
+    const malformedPem = certificateToPem(malformedDer);
+    const importedCA = await importCertificateAuthority({
+      certPem: malformedPem,
+      privateKeyPem: root.privateKeyPem
+    });
+    await expect(
+      issueClientCert({ ca: importedCA, subject: clientSubject, days: 30 })
+    ).rejects.toThrow("keyUsage does not allow certificate signing");
+  });
+
+  it("rejects issuance from imported cert that has no basicConstraints extension", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const kuValue = bitString(new Uint8Array([0x06]), 1);
+    const kuExt = sequence(oid(OID.keyUsage), boolean(true), octetString(kuValue));
+    const malformedDer = rebuildExtensions(root.certDer, sequence(kuExt));
+    const malformedPem = certificateToPem(malformedDer);
+    const importedCA = await importCertificateAuthority({
+      certPem: malformedPem,
+      privateKeyPem: root.privateKeyPem
+    });
+    await expect(
+      issueClientCert({ ca: importedCA, subject: clientSubject, days: 30 })
+    ).rejects.toThrow("Issuer certificate is not a CA");
+  });
+
+  it("rejects issuance from imported cert that has BC isCA=true but no keyUsage extension", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const bcExt = sequence(oid(OID.basicConstraints), boolean(true), octetString(sequence(boolean(true))));
+    const malformedDer = rebuildExtensions(root.certDer, sequence(bcExt));
+    const malformedPem = certificateToPem(malformedDer);
+    const importedCA = await importCertificateAuthority({
+      certPem: malformedPem,
+      privateKeyPem: root.privateKeyPem
+    });
+    await expect(
+      issueClientCert({ ca: importedCA, subject: clientSubject, days: 30 })
+    ).rejects.toThrow("keyUsage does not allow certificate signing");
+  });
+});
+
+describe("importCertificateAuthority does not validate signature (non-goal documenting)", () => {
+  it("imports a cert whose signatureValue has been tampered", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const cert = readElement(root.certDer);
+    const [tbs, algo, sig] = readSequenceChildren(cert);
+    const tamperedSigValue = new Uint8Array(sig!.value.length);
+    tamperedSigValue.set(sig!.value);
+    tamperedSigValue[tamperedSigValue.length - 1] ^= 0xff;
+    const tamperedSig = der(TAG.BIT_STRING, tamperedSigValue);
+    const tamperedDer = sequence(tbs!.raw, algo!.raw, tamperedSig);
+    const tamperedPem = certificateToPem(tamperedDer);
+    const ca = await importCertificateAuthority({
+      certPem: tamperedPem,
+      privateKeyPem: root.privateKeyPem
+    });
+    expect(ca.certPem).toBe(tamperedPem);
+    const client = await issueClientCert({ ca, subject: clientSubject, days: 30 });
+    expect(client.certPem.startsWith("-----BEGIN CERTIFICATE-----")).toBe(true);
+  });
+});
+
+describe("parser tolerates unknown extension OIDs", () => {
+  it("imports a CA cert with an unknown extension OID and continues to issue", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const cert = readElement(root.certDer);
+    const [, , ] = readSequenceChildren(cert);
+    const tbsChildren = readSequenceChildren(readSequenceChildren(cert)[0]!);
+    const extIndex = tbsChildren.findIndex((c) => c.tag === 0xa3);
+    const existingExts = readSequenceChildren(readElement(tbsChildren[extIndex]!.value));
+    const unknownExt = sequence(oid("1.2.3.4.5.99"), octetString(new Uint8Array([0x01, 0x02, 0x03])));
+    const augmentedExtensions = sequence(...existingExts.map((e) => e.raw), unknownExt);
+    const newCertDer = rebuildExtensions(root.certDer, augmentedExtensions);
+    const newCertPem = certificateToPem(newCertDer);
+    const ca = await importCertificateAuthority({
+      certPem: newCertPem,
+      privateKeyPem: root.privateKeyPem
+    });
+    const client = await issueClientCert({ ca, subject: clientSubject, days: 30 });
+    expect(client.certPem.startsWith("-----BEGIN CERTIFICATE-----")).toBe(true);
+  });
+});
+
+describe("default notBefore is approximately current time", () => {
+  it("encodes notBefore within ±60 seconds of the test's wall clock", async () => {
+    const before = Date.now();
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const after = Date.now();
+    const validity = parseCertificateValidity(root.certDer);
+    const nb = validity.notBefore.date.getTime();
+    expect(nb).toBeGreaterThanOrEqual(before - 60_000);
+    expect(nb).toBeLessThanOrEqual(after + 60_000);
+  });
+
+  it("encodes notAfter as default-notBefore + days * 86_400_000", async () => {
+    const before = Date.now();
+    const root = await createRootCA({ subject: rootSubject, days: 30 });
+    const after = Date.now();
+    const validity = parseCertificateValidity(root.certDer);
+    const na = validity.notAfter.date.getTime();
+    expect(na).toBeGreaterThanOrEqual(before + 30 * 86_400_000 - 60_000);
+    expect(na).toBeLessThanOrEqual(after + 30 * 86_400_000 + 60_000);
+  });
+});
+
+describe("DER encoder primitives — set/octetString/contextPrimitive direct", () => {
+  it("set(...) wraps children in [0x31, len, ...]", () => {
+    const result = set(oid("1.2.3"));
+    const parsed = readElement(result);
+    expect(parsed.tag).toBe(TAG.SET);
+    const inner = readChildren(parsed.value);
+    expect(decodeOid(inner[0]!.value)).toBe("1.2.3");
+  });
+
+  it("octetString wraps bytes in [0x04, len, ...]", () => {
+    expect(Array.from(octetString(new Uint8Array([1, 2, 3])))).toEqual([0x04, 0x03, 0x01, 0x02, 0x03]);
+    expect(Array.from(octetString(new Uint8Array(0)))).toEqual([0x04, 0x00]);
+  });
+
+  it("contextPrimitive(n, value) emits [0x80+n, len, ...]", () => {
+    expect(Array.from(contextPrimitive(0, new Uint8Array([0xab])))).toEqual([0x80, 0x01, 0xab]);
+    expect(Array.from(contextPrimitive(5, new Uint8Array([0x01, 0x02])))).toEqual([0x85, 0x02, 0x01, 0x02]);
+  });
+});
+
+describe("digestSha256 direct", () => {
+  it("matches the known SHA-256 vector for empty input", async () => {
+    const result = await digestSha256(new Uint8Array(0));
+    expect(Array.from(result)).toEqual([
+      0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+      0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+      0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+      0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55
+    ]);
+  });
+
+  it("matches the known SHA-256 vector for 'abc'", async () => {
+    const result = await digestSha256(new TextEncoder().encode("abc"));
+    expect(Array.from(result)).toEqual([
+      0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+      0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+      0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+      0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
+    ]);
+  });
+});
+
+describe("assertCanIssueIntermediate check ordering", () => {
+  it("rejects with pathLenConstraint=0 message before requestedPathLenConstraint validation", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365
+    });
+    await expect(
+      issueIntermediateCA({
+        ca: intermediate,
+        subject: [{ type: "CN", value: "deeper" }],
+        days: 30,
+        pathLenConstraint: 99
+      })
+    ).rejects.toThrow("Issuer pathLenConstraint=0 does not allow issuing another intermediate CA");
+  });
+});
+
+describe("integer(bigint) byte-width boundaries", () => {
+  it("encodes 1n as a single octet without sign byte", () => {
+    expect(Array.from(readElement(integer(1n)).value)).toEqual([0x01]);
+  });
+
+  it("encodes 255n as two octets with a leading sign byte", () => {
+    expect(Array.from(readElement(integer(255n)).value)).toEqual([0x00, 0xff]);
+  });
+
+  it("encodes 256n as two octets without sign byte (multi-byte transition)", () => {
+    expect(Array.from(readElement(integer(256n)).value)).toEqual([0x01, 0x00]);
+  });
+
+  it("encodes 127n as a single octet without sign byte (high-bit boundary)", () => {
+    expect(Array.from(readElement(integer(127n)).value)).toEqual([0x7f]);
+  });
+
+  it("encodes 128n as two octets with a leading sign byte", () => {
+    expect(Array.from(readElement(integer(128n)).value)).toEqual([0x00, 0x80]);
+  });
+});
+
+describe("arrayBufferFromBytes non-shared buffer", () => {
+  it("returns an ArrayBuffer not aliased to the input TypedArray's buffer", () => {
+    const input = new Uint8Array([1, 2, 3, 4, 5]);
+    const buffer = arrayBufferFromBytes(input);
+    const view = new Uint8Array(buffer);
+    expect(Array.from(view)).toEqual([1, 2, 3, 4, 5]);
+    input.fill(0);
+    expect(Array.from(view)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("returns an empty ArrayBuffer for empty input", () => {
+    const buffer = arrayBufferFromBytes(new Uint8Array(0));
+    expect(buffer.byteLength).toBe(0);
+  });
+});
+
+describe("printableString direct character set", () => {
+  it("emits each allowed punctuation byte verbatim", () => {
+    for (const ch of " '()+,-./:=?") {
+      const parsed = readElement(printableString(ch));
+      expect(parsed.tag).toBe(TAG.PRINTABLE_STRING);
+      expect(Array.from(parsed.value)).toEqual([ch.charCodeAt(0)]);
+    }
+  });
+
+  it("rejects each disallowed printable character", () => {
+    for (const ch of ["*", "_", "@", "#", "!", "~", "$", "%", "^", "&"]) {
+      expect(() => printableString(ch)).toThrow("PrintableString");
+    }
   });
 });
