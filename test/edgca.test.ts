@@ -9,11 +9,12 @@ import {
   privateKeyToPem,
   publicKeyToPem
 } from "../src/index.js";
-import { asciiBytes, bytesEqual, bytesToBinary, binaryToBytes, concatBytes } from "../src/bytes.js";
+import { asciiBytes, bytesEqual, bytesToBinary, binaryToBytes, cloneBytes, concatBytes } from "../src/bytes.js";
 import {
   assertKeyPairMatches,
   ecdsaDerToRaw,
   ecdsaRawToDer,
+  exportSpki,
   generateKeyPair,
   keyIdentifierFromSpki,
   signDer,
@@ -26,6 +27,7 @@ import {
   decodeOid,
   der,
   explicit,
+  ia5String,
   integer,
   octetString,
   oid,
@@ -33,8 +35,11 @@ import {
   readElement,
   readSequenceChildren,
   sequence,
-  TAG
+  TAG,
+  utf8String
 } from "../src/der.js";
+import { encodeName } from "../src/name.js";
+import { buildCertificate, buildTbsCertificate } from "../src/x509.js";
 import { encodeIpAddress } from "../src/ip.js";
 import { OID } from "../src/oids.js";
 import { pemToDerWithLabel, splitPemBlocks } from "../src/pem.js";
@@ -2524,5 +2529,289 @@ describe("SAN with explicit empty arrays via public API", () => {
     const san = parseSubjectAltName(getExtension(client.certDer, OID.subjectAltName).value);
     expect(san.dnsNames).toEqual(["only.example.test"]);
     expect(san.ipAddresses.length).toBe(0);
+  });
+});
+
+describe("DER encoder primitives direct", () => {
+  it("boolean(true) encodes as DER TRUE [0x01, 0x01, 0xff]", () => {
+    expect(Array.from(boolean(true))).toEqual([0x01, 0x01, 0xff]);
+  });
+
+  it("boolean(false) encodes as DER FALSE [0x01, 0x01, 0x00]", () => {
+    expect(Array.from(boolean(false))).toEqual([0x01, 0x01, 0x00]);
+  });
+
+  it("utf8String encodes 3-byte UTF-8 (kanji)", () => {
+    const parsed = readElement(utf8String("日"));
+    expect(parsed.tag).toBe(TAG.UTF8_STRING);
+    expect(Array.from(parsed.value)).toEqual([0xe6, 0x97, 0xa5]);
+  });
+
+  it("utf8String encodes 4-byte UTF-8 (emoji)", () => {
+    const parsed = readElement(utf8String("\u{1f600}"));
+    expect(parsed.tag).toBe(TAG.UTF8_STRING);
+    expect(Array.from(parsed.value)).toEqual([0xf0, 0x9f, 0x98, 0x80]);
+  });
+
+  it("ia5String encodes ASCII verbatim", () => {
+    const parsed = readElement(ia5String("hello@world.test"));
+    expect(parsed.tag).toBe(TAG.IA5_STRING);
+    expect(Array.from(parsed.value)).toEqual(Array.from(new TextEncoder().encode("hello@world.test")));
+  });
+
+  it("ia5String rejects non-ASCII characters", () => {
+    expect(() => ia5String("hoé")).toThrow("ASCII");
+  });
+});
+
+describe("cloneBytes direct", () => {
+  it("returns a different Uint8Array instance with identical content", () => {
+    const original = new Uint8Array([1, 2, 3, 4, 5]);
+    const copy = cloneBytes(original);
+    expect(copy).not.toBe(original);
+    expect(Array.from(copy)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("does not share buffer with original (mutating original leaves copy intact)", () => {
+    const original = new Uint8Array([1, 2, 3]);
+    const copy = cloneBytes(original);
+    original.fill(0);
+    expect(Array.from(copy)).toEqual([1, 2, 3]);
+  });
+
+  it("returns an empty Uint8Array for empty input", () => {
+    const copy = cloneBytes(new Uint8Array(0));
+    expect(copy.length).toBe(0);
+  });
+});
+
+describe("certDer/certPem round-trip consistency", () => {
+  it("createRootCA returns matching certPem and certDer", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    expect(certificateToPem(root.certDer)).toBe(root.certPem);
+    expect(pemToDer(root.certPem)).toEqual(root.certDer);
+  });
+
+  it("issueIntermediateCA returns matching certPem and certDer", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365
+    });
+    expect(certificateToPem(intermediate.certDer)).toBe(intermediate.certPem);
+    expect(pemToDer(intermediate.certPem)).toEqual(intermediate.certDer);
+  });
+
+  it("issueClientCert returns matching certPem and certDer", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const client = await issueClientCert({
+      ca: root,
+      subject: clientSubject,
+      days: 30
+    });
+    expect(certificateToPem(client.certDer)).toBe(client.certPem);
+    expect(pemToDer(client.certPem)).toEqual(client.certDer);
+  });
+
+  it("importCertificateAuthority returns matching certPem and certDer", async () => {
+    const original = await createRootCA({ subject: rootSubject, days: 365 });
+    const imported = await importCertificateAuthority({
+      certPem: original.certPem,
+      privateKeyPem: original.privateKeyPem
+    });
+    expect(certificateToPem(imported.certDer)).toBe(imported.certPem);
+    expect(pemToDer(imported.certPem)).toEqual(imported.certDer);
+  });
+});
+
+describe("algorithm identifier consistency", () => {
+  it("emits identical algorithm identifier in TBSCertificate.signature and Certificate.signatureAlgorithm", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const cert = readElement(root.certDer);
+    const [tbs, certAlgo] = readSequenceChildren(cert);
+    const tbsChildren = readSequenceChildren(tbs!);
+    let i = 0;
+    if (tbsChildren[i]?.tag === 0xa0) i++;
+    i++; // serialNumber
+    const tbsSignature = tbsChildren[i]!;
+    expect(Array.from(tbsSignature.raw)).toEqual(Array.from(certAlgo!.raw));
+    const innerOid = readSequenceChildren(tbsSignature)[0]!;
+    expect(decodeOid(innerOid.value)).toBe(OID.ecdsaWithSha256);
+  });
+});
+
+describe("parseKeyUsage normal extraction", () => {
+  it("returns keyCertSign=true and cRLSign=true for a CA cert", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const ku = parseKeyUsage(getExtension(root.certDer, OID.keyUsage).value);
+    expect(ku.keyCertSign).toBe(true);
+    expect(ku.cRLSign).toBe(true);
+    expect(ku.digitalSignature).toBe(false);
+  });
+
+  it("returns keyCertSign=false and digitalSignature=true for a leaf cert", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const client = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
+    const ku = parseKeyUsage(getExtension(client.certDer, OID.keyUsage).value);
+    expect(ku.keyCertSign).toBe(false);
+    expect(ku.cRLSign).toBe(false);
+    expect(ku.digitalSignature).toBe(true);
+  });
+});
+
+describe("PEM line wrapping at 64 characters", () => {
+  it("wraps body lines at exactly 64 characters in EdgCA-emitted PEMs", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const lines = root.certPem.split("\n");
+    const bodyLines = lines.filter((line, idx) => idx > 0 && idx < lines.length - 2 && line.length > 0);
+    expect(bodyLines.length).toBeGreaterThan(1);
+    for (const line of bodyLines.slice(0, -1)) {
+      expect(line.length).toBe(64);
+    }
+    expect(bodyLines[bodyLines.length - 1]!.length).toBeLessThanOrEqual(64);
+  });
+
+  it("round-trips a DER whose base64 is exactly 64 chars (single body line)", () => {
+    const der48 = new Uint8Array(48);
+    for (let i = 0; i < der48.length; i += 1) der48[i] = i;
+    const pem = certificateToPem(der48);
+    const lines = pem.split("\n");
+    expect(lines[0]).toBe("-----BEGIN CERTIFICATE-----");
+    expect(lines[1]!.length).toBe(64);
+    expect(lines[2]).toBe("-----END CERTIFICATE-----");
+    expect(pemToDer(pem)).toEqual(der48);
+  });
+
+  it("round-trips a DER whose base64 wraps to two body lines", () => {
+    const der49 = new Uint8Array(49);
+    for (let i = 0; i < der49.length; i += 1) der49[i] = i;
+    const pem = certificateToPem(der49);
+    const lines = pem.split("\n");
+    expect(lines[0]).toBe("-----BEGIN CERTIFICATE-----");
+    expect(lines[1]!.length).toBe(64);
+    expect(lines[2]!.length).toBeGreaterThan(0);
+    expect(lines[2]!.length).toBeLessThanOrEqual(64);
+    expect(lines[3]).toBe("-----END CERTIFICATE-----");
+    expect(pemToDer(pem)).toEqual(der49);
+  });
+});
+
+describe("isRootCa rejects self-signed-with-chain", () => {
+  it("rejects intermediate issuance from a CA whose subject==issuer but issuerChainPem is non-empty", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const otherRoot = await createRootCA({
+      subject: [{ type: "CN", value: "decoy-other" }],
+      days: 365
+    });
+    const fakeCA = await importCertificateAuthority({
+      certPem: root.certPem,
+      privateKeyPem: root.privateKeyPem,
+      issuerChainPem: otherRoot.certPem
+    });
+    await expect(
+      issueIntermediateCA({ ca: fakeCA, subject: intermediateSubject, days: 30 })
+    ).rejects.toThrow("Only root CAs may issue intermediate CAs");
+  });
+});
+
+describe("issueClientCert key uniqueness", () => {
+  it("generates a fresh private key on each call (does not reuse across invocations)", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const a = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
+    const b = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
+    expect(a.privateKeyPem).not.toBe(b.privateKeyPem);
+    expect(a.publicKeyPem).not.toBe(b.publicKeyPem);
+  });
+});
+
+describe("pemToDerWithLabel block selection", () => {
+  it("selects the first block of the requested label among multiple same-label blocks", async () => {
+    const a = await createRootCA({ subject: rootSubject, days: 365 });
+    const b = await createRootCA({
+      subject: [{ type: "CN", value: "second-root" }],
+      days: 365
+    });
+    const combined = a.certPem + b.certPem;
+    expect(pemToDerWithLabel(combined, "CERTIFICATE")).toEqual(a.certDer);
+  });
+
+  it("skips blocks of other labels and returns the requested one", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const combined = root.privateKeyPem + root.certPem;
+    expect(pemToDerWithLabel(combined, "CERTIFICATE")).toEqual(root.certDer);
+  });
+});
+
+describe("buildTbsCertificate empty extensions", () => {
+  it("accepts an empty extensions array and parses back as non-CA leaf", async () => {
+    const pair = await generateKeyPair();
+    const subjectNameDer = encodeName([{ type: "CN", value: "no-extensions-test" }]);
+    const spki = await exportSpki(pair.publicKey);
+    const { tbsCertificateDer } = buildTbsCertificate({
+      days: 1,
+      issuerNameDer: subjectNameDer,
+      subjectNameDer,
+      subjectPublicKeyInfoDer: spki,
+      extensions: [],
+      serialNumber: 1
+    });
+    const sig = await signDer(pair.privateKey, tbsCertificateDer);
+    const certDer = buildCertificate(tbsCertificateDer, sig);
+    const parsed = await parseCertificateDer(certDer);
+    expect(parsed.isCA).toBe(false);
+    expect(parsed.keyCertSign).toBe(false);
+    expect(parsed.subjectKeyIdentifier).toBeUndefined();
+    expect(parsed.authorityKeyIdentifier).toBeUndefined();
+  });
+});
+
+describe("AKI fallback to SHA-1(SPKI) when issuer has no SKI extension", () => {
+  function stripSkiExtension(certDer: Uint8Array): Uint8Array {
+    const cert = readElement(certDer);
+    const [tbs, algo, sig] = readSequenceChildren(cert);
+    const tbsChildren = readSequenceChildren(tbs!);
+    const extIndex = tbsChildren.findIndex((c) => c.tag === 0xa3);
+    const extElements = readSequenceChildren(readElement(tbsChildren[extIndex]!.value));
+    const filtered = extElements.filter((ext) => {
+      const children = readSequenceChildren(ext);
+      return decodeOid(children[0]!.value) !== OID.subjectKeyIdentifier;
+    });
+    const newExtensions = sequence(...filtered.map((e) => e.raw));
+    const newTbsChildren = tbsChildren.map((c, i) =>
+      i === extIndex ? explicit(3, newExtensions) : c.raw
+    );
+    const newTbs = sequence(...newTbsChildren);
+    return sequence(newTbs, algo!.raw, sig!.raw);
+  }
+
+  it("uses keyIdentifierFromSpki(issuer.SPKI) for AKI when issuer parsed cert has no SKI", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const noSkiDer = stripSkiExtension(root.certDer);
+    const noSkiPem = certificateToPem(noSkiDer);
+
+    const importedCA = await importCertificateAuthority({
+      certPem: noSkiPem,
+      privateKeyPem: root.privateKeyPem
+    });
+    const parsedNoSki = await parseCertificateDer(noSkiDer);
+    expect(parsedNoSki.subjectKeyIdentifier).toBeUndefined();
+    const expectedAki = await keyIdentifierFromSpki(parsedNoSki.subjectPublicKeyInfoDer);
+
+    const client = await issueClientCert({
+      ca: importedCA,
+      subject: clientSubject,
+      days: 30
+    });
+    const aki = parseAuthorityKeyIdentifier(getExtension(client.certDer, OID.authorityKeyIdentifier).value);
+    expect(aki.keyIdentifier).toEqual(expectedAki);
+
+    const intermediate = await issueIntermediateCA({
+      ca: importedCA,
+      subject: intermediateSubject,
+      days: 30
+    });
+    const intermediateAki = parseAuthorityKeyIdentifier(getExtension(intermediate.certDer, OID.authorityKeyIdentifier).value);
+    expect(intermediateAki.keyIdentifier).toEqual(expectedAki);
   });
 });
