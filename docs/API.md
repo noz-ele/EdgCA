@@ -8,6 +8,7 @@ import {
   issueIntermediateCA,
   issueClientCert,
   importCertificateAuthority,
+  verifyClientCertificateIssuedBy,
   certificateToPem,
   pemToDer,
   privateKeyToPem,
@@ -201,6 +202,34 @@ private key は certificate の public key と対応している必要があり�
 
 intermediate CA を再 import する場合は、`issuerChainPem` に parent chain を渡します。この chain は client certificate 発行時の `certChainPem` 構築に使われます。
 
+### `verifyClientCertificateIssuedBy(options)`
+
+`options.ca` が `options.certPem` を発行した issuer か判定します。Cloudflare Workers で `request.cf.tlsClientAuth.certRFC9440` を decode した PEM を受け取り、自分の自己 CA が発行した cert かを application 側で確認するための post-handshake な identity check です。
+
+```ts
+function verifyClientCertificateIssuedBy(options: {
+  ca: CertificateAuthority;
+  certPem: string;
+}): Promise<boolean>;
+```
+
+判定は次の 3 つすべて成立で `true`、いずれかが不成立で `false` を return します。
+
+- `certPem` の issuer DN が `ca` の subject DN と完全一致する。
+- `certPem` の Authority Key Identifier が `ca` の Subject Key Identifier と完全一致する。`certPem` が AKI を持たない場合は `false`。
+- `certPem` の signature を `ca.publicKey` で verify できる (ECDSA P-256 / SHA-256)。
+
+PEM や DER として parse 不能な入力は `Error` を投げます (CA 不一致 = `false`、入力破損 = throw、と扱いを分ける)。
+
+この関数は **発行 issuer 1 本に対する identity 確認** だけを行います。次は対象外です。
+
+- `notBefore` / `notAfter` の時刻 check。値は `cf.tlsClientAuth.certNotBefore` / `certNotAfter` で application に露出されているため、application 側で 2 行比較すれば足りる。
+- chain 遡及 (intermediate を介して root から発行された leaf を root に対して verify するなど)。`ca` には**直接の発行者** (root から直接発行なら root、intermediate 経由なら intermediate) を渡してください。
+- revocation check (CRL / OCSP)。
+- `cf.tlsClientAuth` 型からの自動抽出。RFC 9440 形式 (`:base64:`) からの decode は呼び出し側で行います。
+
+複数 CA を運用していて「どれが発行したか」を知りたい場合は、呼び出し側で CA 配列を回してください。
+
 ### `certificateToPem(der)`
 
 DER certificate bytes を PEM certificate block に encode します。
@@ -254,7 +283,7 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 - `pathLenConstraint=0` の root CA から intermediate CA を発行しようとした。
 - 最大 2 段の CA 階層を超える `pathLenConstraint` を指定した。
 
-公開 verification result type はありません。証明書検証は public API の責務ではありません。
+`verifyClientCertificateIssuedBy` は CA 局判定の `boolean` を返します。それ以外の検証 (時刻、chain、revocation) を表す result type は提供しません。
 
 ## Field Reference
 
@@ -379,8 +408,7 @@ EdgCA は次を提供しません。
 
 - server certificate 発行。
 - 公開 certificate parsing API。
-- certificate chain validation。
-- runtime certificate verification。
+- certificate chain validation (chain 遡及・PKI path building)。`verifyClientCertificateIssuedBy` は直接の発行者 1 本に対する identity 確認に限定。
+- 証明書の時刻検証 (`notBefore` / `notAfter`)。`cf.tlsClientAuth.certNotBefore` / `certNotAfter` で application が直接比較可能。
 - CRL、OCSP、失効 DB、失効確認。
 - 鍵の保管、暗号化保存、Cloudflare storage 連携。
-- 汎用 PKI path building。

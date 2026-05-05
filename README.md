@@ -7,10 +7,11 @@ EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理�
 - 自己署名 root CA を作る。
 - root CA から intermediate CA を発行する。
 - intermediate CA から mTLS 用 client certificate と秘密鍵を発行する。
+- 受け取った client certificate が自分の CA から発行されたかを判定する。
 - 証明書と鍵を PEM/DER で入出力する。
 - 暗号演算は `globalThis.crypto.subtle` に委譲する。
 
-EdgCA は汎用 PKI ライブラリではありません。server certificate 発行、公開検証 API、証明書チェーン検証 API、失効情報管理、鍵の保管方法は提供しません。
+EdgCA は汎用 PKI ライブラリではありません。server certificate 発行、証明書チェーン検証 API、失効情報管理、鍵の保管方法は提供しません。
 
 ## Install
 
@@ -103,14 +104,15 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 - root CA 作成。
 - intermediate CA 発行。
 - mTLS client certificate 発行。
+- 自己 CA からの発行かを判定する identity 確認 API (`verifyClientCertificateIssuedBy`)。
 - PEM/DER helper。
 - Basic Constraints、Key Usage、Extended Key Usage、Subject Alternative Name、SKI、AKI。
 
 意図的に対象外:
 
 - server certificate 発行。
-- 公開 certificate verification API。
 - 公開 chain validation API。
+- 証明書の時刻検証 (`cf.tlsClientAuth.certNotBefore` / `certNotAfter` で application が直接比較可能)。
 - CRL、OCSP、失効 DB、失効確認。
 - 鍵の保管、暗号化保存、ローテーション永続化、KV/D1/R2/Secrets 連携。
 - RSA、EdDSA、別 elliptic curve。

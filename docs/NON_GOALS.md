@@ -4,10 +4,12 @@ EdgCA は「与えられた入力に従って cert を出力する」だけの s
 
 ## 1. 検証系
 
+EdgCA が**提供する**唯一の検証 API は `verifyClientCertificateIssuedBy` (発行 issuer 1 本に対する identity 確認: 発行 DN match + AKI/SKI match + signature verify) のみ。それ以外の検証は以下のとおり実装しない。
+
 - **certificate chain validation**。`importCertificateAuthority` の `issuerChainPem` が `certPem` を実際に発行したかの cryptographic 検証はしない。caller が嘘の chain を渡せば嘘の chain が出力される。「検証できるから検証すべき」は採用しない。
-- **runtime certificate verification**。public verification API は提供しない。検証は Cloudflare 側 (mTLS handshake) または別 layer の責務。
+- **chain 遡及・PKI path building**。`verifyClientCertificateIssuedBy` も**直接の発行者 1 本**に対する判定のみ。intermediate を介して root から発行された leaf を root に対して verify する用途は対象外。
+- **時刻検証 (`notBefore` / `notAfter`)**。値は `cf.tlsClientAuth.certNotBefore` / `certNotAfter` で application に露出されているため、application 側で 2 行比較すれば足りる。library 関数化はしない。
 - **CRL / OCSP / 失効 DB / 失効確認**。
-- **chain 検査・PKI path building**。
 - **`certificateToPem(der)` での DER 妥当性検査**。先頭 byte が `0x30` (SEQUENCE) かどうかの shallow check も実装しない。本物の cert との区別はつかず、誤った安心感を与えるだけ。本気でやるなら `parseCertificateDer` 全実行が必要で、encoder の責務を超える。低 level encoder のまま。
 - **import した cert の RFC 適合検査**。期限切れ・壊れた署名・想定外 extension・複数 basicConstraints 等を含む `certPem` を渡しても error にはせず、入力に従ってそのまま発行する。
 

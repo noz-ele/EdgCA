@@ -7,7 +7,8 @@ import {
   issueIntermediateCA,
   pemToDer,
   privateKeyToPem,
-  publicKeyToPem
+  publicKeyToPem,
+  verifyClientCertificateIssuedBy
 } from "../src/index.js";
 import {
   arrayBufferFromBytes,
@@ -53,12 +54,20 @@ import {
   utf8String
 } from "../src/der.js";
 import { encodeName } from "../src/name.js";
-import { buildCertificate, buildTbsCertificate } from "../src/x509.js";
+import {
+  authorityKeyIdentifierExtension,
+  basicConstraintsLeafExtension,
+  buildCertificate,
+  buildTbsCertificate,
+  extendedKeyUsageClientAuthExtension,
+  keyUsageExtension,
+  subjectAltNameExtension,
+  subjectKeyIdentifierExtension
+} from "../src/x509.js";
 import { encodeIpAddress } from "../src/ip.js";
 import { OID } from "../src/oids.js";
 import { pemToDerWithLabel, splitPemBlocks } from "../src/pem.js";
 import { assertIssuerSubjectMatches, parseCertificateDer } from "../src/parser.js";
-import { keyUsageExtension, subjectAltNameExtension } from "../src/x509.js";
 import type { SerialNumber, Subject } from "../src/types.js";
 import {
   assertSingleValuedRdns,
@@ -2828,6 +2837,24 @@ describe("AKI fallback to SHA-1(SPKI) when issuer has no SKI extension", () => {
     const intermediateAki = parseAuthorityKeyIdentifier(getExtension(intermediate.certDer, OID.authorityKeyIdentifier).value);
     expect(intermediateAki.keyIdentifier).toEqual(expectedAki);
   });
+
+  it("verifies a client cert against an imported CA whose cert has no SKI extension", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const noSkiPem = certificateToPem(stripSkiExtension(root.certDer));
+    const importedCA = await importCertificateAuthority({
+      certPem: noSkiPem,
+      privateKeyPem: root.privateKeyPem
+    });
+    const client = await issueClientCert({
+      ca: importedCA,
+      subject: clientSubject,
+      days: 30
+    });
+
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: importedCA, certPem: client.certPem })
+    ).toBe(true);
+  });
 });
 
 function rebuildExtensions(baseCertDer: Uint8Array, extensionsValue: Uint8Array): Uint8Array {
@@ -3285,5 +3312,352 @@ describe("integer() Uint8Array direct boundaries", () => {
 describe("readChildren empty input", () => {
   it("returns an empty array for empty SEQUENCE contents", () => {
     expect(readChildren(new Uint8Array(0))).toEqual([]);
+  });
+});
+
+describe("SAN with only ipAddresses (no dnsNames)", () => {
+  it("emits a SAN extension whose only entries are iPAddress GeneralNames", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const issued = await issueClientCert({
+      ca: root,
+      subject: clientSubject,
+      days: 30,
+      ipAddresses: ["192.0.2.1", "::1"]
+    });
+    const san = parseSubjectAltName(getExtension(issued.certDer, OID.subjectAltName).value);
+    expect(san.dnsNames).toEqual([]);
+    expect(san.ipAddresses).toHaveLength(2);
+    expect(Array.from(san.ipAddresses[0]!)).toEqual([192, 0, 2, 1]);
+    expect(Array.from(san.ipAddresses[1]!)).toEqual([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+  });
+});
+
+describe("IPv4 empty-octet variants", () => {
+  it("rejects IPv4 inputs whose split has 4 parts but contains an empty octet", () => {
+    for (const value of ["1.2.3.", ".1.2.3", "1..2.3", "1.2..3"]) {
+      expect(() => encodeIpAddress(value)).toThrow(`Invalid IPv4 address: ${value}`);
+    }
+  });
+
+  it("rejects an empty-string IPv4 address (no dots)", () => {
+    expect(() => encodeIpAddress("")).toThrow("Invalid IPv4 address: ");
+  });
+});
+
+describe("oid() encoder self-validation independent of name.ts filtering", () => {
+  it("rejects OIDs whose first component exceeds 2", () => {
+    expect(() => oid("3.1.2")).toThrow("Invalid OID");
+    expect(() => oid("99.0.0")).toThrow("Invalid OID");
+  });
+
+  it("rejects OIDs whose second component exceeds 39 when the first is 0 or 1", () => {
+    expect(() => oid("0.40.0")).toThrow("Invalid OID");
+    expect(() => oid("1.40.0")).toThrow("Invalid OID");
+  });
+
+  it("accepts OIDs whose second component exceeds 39 only when the first is 2 (joint-iso-itu-t)", () => {
+    const element = readElement(oid("2.40.0"));
+    expect(element.tag).toBe(TAG.OBJECT_IDENTIFIER);
+    expect(decodeOid(element.value)).toBe("2.40.0");
+  });
+});
+
+describe("keyUsageExtension with an empty usages array", () => {
+  it("emits a single zero byte with unusedBits=7 (degenerate but well-formed)", () => {
+    const ext = keyUsageExtension([]);
+    // ext = SEQUENCE { OID(keyUsage), BOOLEAN(true), OCTET STRING { BIT STRING { 0x07, 0x00 } } }
+    const children = readSequenceChildren(readElement(ext));
+    const octet = children[children.length - 1]!;
+    const inner = readElement(octet.value);
+    expect(inner.tag).toBe(TAG.BIT_STRING);
+    expect(Array.from(inner.value)).toEqual([0x07, 0x00]);
+  });
+});
+
+describe("verifyClientCertificateIssuedBy", () => {
+  it("returns true for a client cert issued by the given intermediate CA", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365
+    });
+    const client = await issueClientCert({
+      ca: intermediate,
+      subject: clientSubject,
+      days: 30
+    });
+
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: intermediate, certPem: client.certPem })
+    ).toBe(true);
+  });
+
+  it("returns true for a client cert issued directly by a root CA", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const client = await issueClientCert({
+      ca: root,
+      subject: clientSubject,
+      days: 30
+    });
+
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: root, certPem: client.certPem })
+    ).toBe(true);
+  });
+
+  it("returns true round-trip when both issuance and verification go through importCertificateAuthority", async () => {
+    const original = await createRootCA({ subject: rootSubject, days: 3650 });
+    const importedRoot = await importCertificateAuthority({
+      certPem: original.certPem,
+      privateKeyPem: original.privateKeyPem
+    });
+    const importedIntermediate = await issueIntermediateCA({
+      ca: importedRoot,
+      subject: intermediateSubject,
+      days: 365
+    });
+    const reimportedIntermediate = await importCertificateAuthority({
+      certPem: importedIntermediate.certPem,
+      privateKeyPem: importedIntermediate.privateKeyPem,
+      issuerChainPem: importedIntermediate.issuerChainPem
+    });
+    const client = await issueClientCert({
+      ca: reimportedIntermediate,
+      subject: clientSubject,
+      days: 30
+    });
+
+    expect(
+      await verifyClientCertificateIssuedBy({
+        ca: reimportedIntermediate,
+        certPem: client.certPem
+      })
+    ).toBe(true);
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: importedRoot, certPem: client.certPem })
+    ).toBe(false);
+  });
+
+  it("returns true for a client cert issued by a CA built from a brought-in privateKeyPem", async () => {
+    const seed = await createRootCA({ subject: rootSubject, days: 3650 });
+    const broughtIn = await createRootCA({
+      subject: rootSubject,
+      days: 3650,
+      privateKeyPem: seed.privateKeyPem
+    });
+    const client = await issueClientCert({
+      ca: broughtIn,
+      subject: clientSubject,
+      days: 30
+    });
+
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: broughtIn, certPem: client.certPem })
+    ).toBe(true);
+  });
+
+  it("returns false when the cert was issued by a different CA", async () => {
+    const realCa = await createRootCA({ subject: rootSubject, days: 3650 });
+    const otherCa = await createRootCA({
+      subject: [{ type: "CN", value: "other-root" }],
+      days: 3650
+    });
+    const client = await issueClientCert({
+      ca: realCa,
+      subject: clientSubject,
+      days: 30
+    });
+
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: otherCa, certPem: client.certPem })
+    ).toBe(false);
+  });
+
+  it("returns false when verifying a leaf against the root that issued only its intermediate", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365
+    });
+    const client = await issueClientCert({
+      ca: intermediate,
+      subject: clientSubject,
+      days: 30
+    });
+
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: root, certPem: client.certPem })
+    ).toBe(false);
+  });
+
+  it("returns false when the TBS was tampered with even though the signature is genuinely from the CA", async () => {
+    const realCa = await createRootCA({ subject: rootSubject, days: 3650 });
+    const clientA = await issueClientCert({
+      ca: realCa,
+      subject: [{ type: "CN", value: "client-a" }],
+      days: 30
+    });
+    const clientB = await issueClientCert({
+      ca: realCa,
+      subject: [{ type: "CN", value: "client-b" }],
+      days: 30
+    });
+    const parsedA = await parseCertificateDer(clientA.certDer);
+    const parsedB = await parseCertificateDer(clientB.certDer);
+
+    // Splice: B's TBS bytes paired with A's genuine CA signature.
+    // Both halves are individually authentic (issuer DN, AKI both match realCa),
+    // but the signature is over A's TBS hash, so verify against B's TBS must fail.
+    const splicedDer = buildCertificate(parsedB.tbsCertificateDer, parsedA.signatureDer);
+    const splicedPem = certificateToPem(splicedDer);
+
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: realCa, certPem: splicedPem })
+    ).toBe(false);
+  });
+
+  it("returns false when issuer DN/AKI match but signature was produced by a different key", async () => {
+    const realCa = await createRootCA({ subject: rootSubject, days: 3650 });
+    const realClient = await issueClientCert({
+      ca: realCa,
+      subject: clientSubject,
+      days: 30
+    });
+    const realParsed = await parseCertificateDer(realClient.certDer);
+
+    // Forge: same TBS (so issuer DN + AKI still match realCa's subject + SKI),
+    // but signed with an attacker key. Signature verify against realCa.publicKey must fail.
+    const attackerKeyPair = await generateKeyPair();
+    const forgedSignatureDer = await signDer(attackerKeyPair.privateKey, realParsed.tbsCertificateDer);
+    const forgedCertDer = buildCertificate(realParsed.tbsCertificateDer, forgedSignatureDer);
+    const forgedPem = certificateToPem(forgedCertDer);
+
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: realCa, certPem: forgedPem })
+    ).toBe(false);
+  });
+
+  it("returns false when issuer DN matches but the cert has no AKI extension", async () => {
+    const realCa = await createRootCA({ subject: rootSubject, days: 3650 });
+    const realCaParsed = await parseCertificateDer(realCa.certDer);
+
+    const leafKeyPair = await generateKeyPair();
+    const leafSpki = await exportSpki(leafKeyPair.publicKey);
+    const leafSki = await keyIdentifierFromSpki(leafSpki);
+    const leafSubjectDer = encodeName(clientSubject);
+
+    const { tbsCertificateDer } = buildTbsCertificate({
+      serialNumber: 1,
+      days: 30,
+      issuerNameDer: realCaParsed.subjectNameDer,
+      subjectNameDer: leafSubjectDer,
+      subjectPublicKeyInfoDer: leafSpki,
+      extensions: [
+        basicConstraintsLeafExtension(),
+        keyUsageExtension(["digitalSignature"]),
+        extendedKeyUsageClientAuthExtension(),
+        subjectKeyIdentifierExtension(leafSki)
+        // intentionally no authorityKeyIdentifierExtension
+      ]
+    });
+    const signature = await signDer(realCa.privateKey, tbsCertificateDer);
+    const certPem = certificateToPem(buildCertificate(tbsCertificateDer, signature));
+
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: realCa, certPem })
+    ).toBe(false);
+  });
+
+  it("returns false when issuer DN matches but AKI does not match the CA SKI", async () => {
+    const realCa = await createRootCA({ subject: rootSubject, days: 3650 });
+    const realCaParsed = await parseCertificateDer(realCa.certDer);
+
+    const leafKeyPair = await generateKeyPair();
+    const leafSpki = await exportSpki(leafKeyPair.publicKey);
+    const leafSki = await keyIdentifierFromSpki(leafSpki);
+    const leafSubjectDer = encodeName(clientSubject);
+    const wrongAki = new Uint8Array(20); // 20 zero bytes — won't match realCa SKI
+
+    const { tbsCertificateDer } = buildTbsCertificate({
+      serialNumber: 1,
+      days: 30,
+      issuerNameDer: realCaParsed.subjectNameDer,
+      subjectNameDer: leafSubjectDer,
+      subjectPublicKeyInfoDer: leafSpki,
+      extensions: [
+        basicConstraintsLeafExtension(),
+        keyUsageExtension(["digitalSignature"]),
+        extendedKeyUsageClientAuthExtension(),
+        subjectKeyIdentifierExtension(leafSki),
+        authorityKeyIdentifierExtension(wrongAki)
+      ]
+    });
+    const signature = await signDer(realCa.privateKey, tbsCertificateDer);
+    const certPem = certificateToPem(buildCertificate(tbsCertificateDer, signature));
+
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: realCa, certPem })
+    ).toBe(false);
+  });
+
+  it("returns false when an attacker CA shares the same subject DN as the real CA but uses a different key", async () => {
+    const realCa = await createRootCA({ subject: rootSubject, days: 3650 });
+    const attackerCa = await createRootCA({ subject: rootSubject, days: 3650 });
+    const victimClient = await issueClientCert({
+      ca: attackerCa,
+      subject: clientSubject,
+      days: 30
+    });
+
+    // Cert was issued by attackerCa but its issuer DN is identical to realCa's
+    // subject DN (DN check would naively pass). AKI carries attackerCa's SKI,
+    // which differs from realCa's SKI → AKI check rejects it.
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: realCa, certPem: victimClient.certPem })
+    ).toBe(false);
+  });
+
+  it("throws on invalid PEM input", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+
+    await expect(
+      verifyClientCertificateIssuedBy({ ca: root, certPem: "not a pem block" })
+    ).rejects.toThrow();
+  });
+
+  it("throws when the PEM block is labeled something other than CERTIFICATE", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+
+    await expect(
+      verifyClientCertificateIssuedBy({ ca: root, certPem: root.publicKeyPem })
+    ).rejects.toThrow();
+  });
+});
+
+describe("subject encodes repeated attribute types in order", () => {
+  it("emits two OU RDNs in input order without deduplication", async () => {
+    const root = await createRootCA({
+      subject: [
+        { type: "CN", value: "dev-multi-ou" },
+        { type: "OU", value: "team-alpha" },
+        { type: "OU", value: "team-beta" }
+      ],
+      days: 365,
+      serialNumber: 1
+    });
+    const parsed = await parseCertificate(root.certDer);
+    const attributes = parseName(parsed.subjectNameDer);
+    expect(attributes.map((a) => a.oid)).toEqual([
+      "2.5.4.3",   // CN
+      "2.5.4.11",  // OU
+      "2.5.4.11"   // OU (repeated)
+    ]);
+    expect(attributes.map((a) => new TextDecoder().decode(a.value))).toEqual([
+      "dev-multi-ou",
+      "team-alpha",
+      "team-beta"
+    ]);
   });
 });
