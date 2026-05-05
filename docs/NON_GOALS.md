@@ -36,6 +36,7 @@ EdgCA は「与えられた入力に従って cert を出力する」だけの s
 - **3 段以上の CA 階層なし**。最大 `root → intermediate → client`。intermediate のさらに下に intermediate は作れない。
 - **RSA / Ed25519 / P-384 など他鍵種なし**。P-256 ECDSA 固定。
 - **暗号化された PKCS#8 PEM (encrypted private key) なし**。
+- **X.509 v1 / v2 の受け入れなし**。`importCertificateAuthority` は v3 (`[0] EXPLICIT INTEGER 2`) のみ accept。version field 不在 (v1) や `INTEGER 1` (v2) の cert は throw。EdgCA 自身は常に v3 を emit する。外部由来の旧 version cert を import するユースケースはサポートしない。
 
 ## 5. これらの方針が変わる条件
 

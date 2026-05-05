@@ -40,10 +40,18 @@ export async function parseCertificateDer(der: Uint8Array): Promise<ParsedCertif
   }
 
   const tbsChildren = readSequenceChildren(tbsCertificate);
-  let index = 0;
-  if (tbsChildren[index]?.tag === 0xa0) {
-    index += 1;
+  // RFC 5280 §4.1.2.1: version is [0] EXPLICIT INTEGER. EdgCA only emits and
+  // accepts v3 (= INTEGER 2); v1 (field omitted) and v2 (INTEGER 1) are rejected.
+  // See docs/NON_GOALS.md §4.
+  const versionTag = tbsChildren[0];
+  if (!versionTag || versionTag.tag !== 0xa0) {
+    throw new Error("Unsupported X.509 version (only v3 is supported)");
   }
+  const versionInner = readElement(versionTag.value);
+  if (versionInner.tag !== TAG.INTEGER || decodeInteger(versionInner.value) !== 2n) {
+    throw new Error("Unsupported X.509 version (only v3 is supported)");
+  }
+  let index = 1;
 
   index += 1; // serialNumber
   index += 1; // signature
