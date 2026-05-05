@@ -155,6 +155,17 @@ npm audit
 
 テストは `@cloudflare/vitest-pool-workers` を使い、Workers 互換 runtime 上で WebCrypto の挙動を確認します。
 
+### Property-based tests
+
+低 layer の round-trip 不変条件は `fast-check` を使った property-based test として、対象モジュール 1 ファイルずつ分けて `test/<module>.property.test.ts` に置いています。
+
+- [test/der.property.test.ts](test/der.property.test.ts) — INTEGER / OID / OCTET STRING / BIT STRING / SEQUENCE の TLV round-trip
+- [test/bytes.property.test.ts](test/bytes.property.test.ts) — `concatBytes`、`binaryToBytes`/`bytesToBinary`、`bytesEqual`、`cloneBytes`
+- [test/ip.property.test.ts](test/ip.property.test.ts) — IPv4 dotted-quad と IPv6（full form / `::` compression）の encode
+- [test/pem.property.test.ts](test/pem.property.test.ts) — `certificateToPem` / `privateKeyDerToPem` / `publicKeyDerToPem` と `pemToDer` / `pemToDerWithLabel` / `splitPemBlocks` の round-trip
+
+`vitest.config.ts` の include は `test/**/*.test.ts` なので `npm run test` で同時に走ります。`cert` 組み立て層（`ca.ts` / `x509.ts`）は scope 上 PBT 対象外で、example-based のまま [test/edgca.test.ts](test/edgca.test.ts) に集約しています。
+
 ## API Documentation
 
 詳しくは [docs/API.md](docs/API.md) を参照してください。
