@@ -1,26 +1,27 @@
 # EdgCA
 
-EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理する自己 CA から mTLS 用 client certificate を発行するための小さな TypeScript ライブラリです。
+> [日本語](docs/jp/README.md) | English
 
-目的は明確に絞っています。
+EdgCA is a small TypeScript library that issues mTLS client certificates from a self-managed CA on Cloudflare Workers-compatible runtimes.
 
-- 自己署名 root CA を作る。
-- root CA から intermediate CA を発行する。
-- intermediate CA から mTLS 用 client certificate と秘密鍵を発行する。
-- 受け取った client certificate が自分の CA から発行されたかを判定する。
-- 証明書と鍵を PEM/DER で入出力する。
-- 暗号演算は `globalThis.crypto.subtle` に委譲する。
+The scope is intentionally narrow:
 
-EdgCA は汎用 PKI ライブラリではありません。server certificate 発行、証明書チェーン検証 API、失効情報管理、鍵の保管方法は提供しません。
+- Create a self-signed root CA.
+- Issue an intermediate CA from a root CA.
+- Issue an mTLS client certificate and private key from an intermediate CA.
+- Decide whether a received client certificate was issued by your own CA.
+- Encode/decode certificates and keys as PEM/DER.
+- Delegate all cryptographic operations to `globalThis.crypto.subtle`.
+
+EdgCA is not a general-purpose PKI library. Server certificate issuance, public chain-validation APIs, revocation data, and key storage are out of scope.
 
 ## Install
 
-この package は現時点ではこのリポジトリ内のローカル package です。
-
 ```sh
-npm install
-npm run build
+npm install edgca
 ```
+
+ESM-only (`"type": "module"`). Runs on any runtime where `globalThis.crypto.subtle` is available (Cloudflare Workers, Node.js 20+, modern browsers, etc.). CommonJS `require` is not supported.
 
 ## Quick Start
 
@@ -56,15 +57,15 @@ console.log(client.privateKeyPem);
 console.log(client.certChainPem);
 ```
 
-基本形は次の構造です。
+The basic shape is:
 
 ```text
 root CA -> intermediate CA -> mTLS client certificate
 ```
 
-EdgCA の CA 階層はこの形を最大とし、intermediate CA からさらに intermediate CA を発行する chain は対象外です。
+This is the deepest CA hierarchy EdgCA targets. Issuing further intermediate CAs from an intermediate is out of scope.
 
-`client.certChainPem` は次の順で出力されます。
+`client.certChainPem` is concatenated in this order:
 
 ```text
 client certificate
@@ -72,34 +73,34 @@ issuer certificate
 issuer chain
 ```
 
-EdgCA で作成した intermediate から client certificate を発行した場合は、`client + intermediate + root` の順になります。
+For a client certificate issued by an EdgCA-built intermediate, the result is `client + intermediate + root`.
 
 ## Verify (Cloudflare Worker)
 
-このセクションは、**Cloudflare 側で client certificate が抽出済み**で、その値が `request.cf.tlsClientAuth` 経由で application に渡される運用を前提にしています。EdgCA は TLS handshake にも cert の DER parse にも関与せず、Cloudflare が露出した値を入力として受け取って identity 判定を行います。
+This section assumes a deployment where **Cloudflare has already extracted the client certificate** and exposes it to your application via `request.cf.tlsClientAuth`. EdgCA participates in neither the TLS handshake nor DER parsing of the cert; it consumes the values Cloudflare hands you and performs the identity check.
 
-### Cloudflare が抽出した場合に渡される形式
+### Formats Cloudflare exposes after extraction
 
-| field | 形式 | 例 |
+| field | format | example |
 |---|---|---|
-| `certVerified` | mTLS 検証結果の文字列 | `"SUCCESS"` / `"FAILED:..."` / `"NONE"` |
-| `certRFC9440` | RFC 9440 Structured Field Item (Byte Sequence)。前後を `:` で囲んだ base64 | `":MIIB...:"` |
-| `certNotBefore` / `certNotAfter` | OpenSSL 風 textual 形式 (常に GMT)。単桁日は二重スペース | `"Dec 24 23:59:59 2025 GMT"` / `"Dec  4 23:59:59 2025 GMT"` |
-| `certSubjectDN`, `certIssuerDN`, `certSerial` 等 | 文字列 | identity 抽出用 |
+| `certVerified` | mTLS verification status string | `"SUCCESS"` / `"FAILED:..."` / `"NONE"` |
+| `certRFC9440` | RFC 9440 Structured Field Item (Byte Sequence). Base64 wrapped in `:` | `":MIIB...:"` |
+| `certNotBefore` / `certNotAfter` | OpenSSL-style textual format (always GMT). Single-digit day padded with two spaces | `"Dec 24 23:59:59 2025 GMT"` / `"Dec  4 23:59:59 2025 GMT"` |
+| `certSubjectDN`, `certIssuerDN`, `certSerial`, etc. | strings | identity extraction |
 
-EdgCA `verifyClientCertificateIssuedBy` が直接受け取れるのは PEM (`certPem: string`) と `Date` / epoch ms (`validity.notBefore` / `notAfter`) です。上記 Cloudflare 提供の形式とは**一致しないため、application 側で形式変換が必要**です。具体的には:
+`verifyClientCertificateIssuedBy` accepts PEM (`certPem: string`) and `Date` / epoch ms (`validity.notBefore` / `notAfter`). Those forms **do not match** what Cloudflare provides, so the application must convert:
 
-- `certRFC9440` の `":...:"` → 前後コロンを外して PEM marker で挟む。
-- `certNotBefore` / `certNotAfter` の textual 文字列 → `new Date(...)` で `Date` に変換 (V8/Workers runtime はこの形式を parse できる)。
+- `certRFC9440` (`":...:"`) → strip the surrounding colons, wrap with PEM markers.
+- `certNotBefore` / `certNotAfter` (textual) → `new Date(...)` (V8 / the Workers runtime parses this format).
 
-これらの parser を library 側に持たないのは、Cloudflare の出力形式変更に追従しないこと、runtime 依存の `Date.parse` 寛容性に巻き込まれないこと、caller が既に値を保持しているため二重実装する意味がないことが理由です (詳細は [docs/NON_GOALS.md](docs/NON_GOALS.md))。
+These parsers live in the caller, not in the library, because (a) we do not want to track Cloudflare's output-format changes, (b) we do not want to rely on runtime-dependent `Date.parse` leniency, and (c) the caller already holds the values, so reimplementing them here would be redundant. See [docs/en/NON_GOALS.md](docs/en/NON_GOALS.md) for the full rationale.
 
-### 例
+### Example
 
 ```ts
 import { importCertificateAuthority, verifyClientCertificateIssuedBy } from "edgca";
 
-// Worker 起動時 (vault 等から読み込んだ CA を一度 import しておく)
+// At Worker startup: import the CA loaded from your vault once.
 const ca = await importCertificateAuthority({
   certPem: env.CA_CERT_PEM,
   privateKeyPem: env.CA_PRIVATE_KEY_PEM
@@ -112,9 +113,9 @@ export default {
       return new Response("mTLS required", { status: 401 });
     }
 
-    // Cloudflare 形式 → library 形式への変換
-    //   certRFC9440 (":base64:")        → PEM 文字列
-    //   certNotBefore / certNotAfter    → Date
+    // Convert Cloudflare's formats to the library's formats.
+    //   certRFC9440 (":base64:")        -> PEM string
+    //   certNotBefore / certNotAfter    -> Date
     const b64 = tls.certRFC9440.replace(/^:|:$/g, "");
     const certPem = `-----BEGIN CERTIFICATE-----\n${b64}\n-----END CERTIFICATE-----`;
 
@@ -124,28 +125,28 @@ export default {
       validity: {
         notBefore: new Date(tls.certNotBefore),
         notAfter:  new Date(tls.certNotAfter)
-        // now を省略すると Date.now() が使われる
+        // omit `now` to use Date.now()
       }
     });
     if (!ok) {
       return new Response("not issued by us, or expired", { status: 403 });
     }
 
-    // 認可ロジック: cf.tlsClientAuth.certSubjectDN などから identity を抽出して使う
+    // Authorization logic: derive identity from cf.tlsClientAuth.certSubjectDN, etc.
     return new Response(`hello, ${tls.certSubjectDN}`);
   }
 };
 ```
 
-### 補足
+### Notes
 
-- `validity` を省略すると identity 判定 (発行者 DN + AKI/SKI + signature) のみ行います。時刻を library 関数では見ず application 側で 2 行比較する場合も、結果は等価です。
-- 「自 CA から発行されてない」「ウィンドウ外」は `false` 戻り値、入力 PEM/DER が壊れている等の不正入力は throw。エラー扱いを 2 段階に分けています。
-- `ca` には**直接の発行者 1 本**を渡してください。intermediate を介して発行した leaf を root に対して投げると `false` になります (chain 遡及はしません)。
+- Omitting `validity` performs only the identity check (issuer DN + AKI/SKI + signature). If you instead inline the time check as two comparisons in the application, the result is equivalent.
+- "Not issued by us" and "outside the validity window" return `false`; malformed PEM/DER throws. The two error categories are deliberately split.
+- Pass the **direct issuer (one cert)** as `ca`. Verifying a leaf issued via an intermediate against the root will return `false` — chain walking is not performed.
 
 ## Subject
 
-subject は構造化入力のみ受け付けます。`CN=dev-root,O=Example` のような DN 文字列は受け付けません。
+Subject only accepts a structured input. DN strings such as `CN=dev-root,O=Example` are not accepted.
 
 ```ts
 const subject = [
@@ -155,54 +156,54 @@ const subject = [
 ];
 ```
 
-対応する短縮名:
+Supported short names:
 
 ```text
 CN, O, OU, C, ST, L, E, DC, SERIALNUMBER, STREET,
 POSTALCODE, TITLE, GIVENNAME, SURNAME, UID
 ```
 
-dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8String 固定で、`C` のみ PrintableString です。multi-valued RDN は対象外です。
+Dotted OID strings are also accepted. The ASN.1 string type for values is fixed at UTF8String, with `C` as PrintableString. Multi-valued RDNs are out of scope.
 
 ## Scope
 
-実装対象:
+In scope:
 
-- ECDSA P-256 + SHA-256。
-- WebCrypto による鍵生成、署名、digest、key import/export。
-- root CA 作成。
-- intermediate CA 発行。
-- mTLS client certificate 発行。
-- 自己 CA からの発行かを判定する identity 確認 API (`verifyClientCertificateIssuedBy`、任意の時刻有効性 check 付き)。
-- PEM/DER helper。
-- Basic Constraints、Key Usage、Extended Key Usage、Subject Alternative Name、SKI、AKI。
+- ECDSA P-256 + SHA-256.
+- Key generation, signing, digest, and key import/export via WebCrypto.
+- Root CA creation.
+- Intermediate CA issuance.
+- mTLS client certificate issuance.
+- Identity check that a cert was issued by your own CA (`verifyClientCertificateIssuedBy`, with optional time-validity check).
+- PEM/DER helpers.
+- Basic Constraints, Key Usage, Extended Key Usage, Subject Alternative Name, SKI, AKI.
 
-意図的に対象外:
+Intentionally out of scope:
 
-- server certificate 発行。
-- 公開 chain validation API。
-- cert からの時刻 field の抽出。`verifyClientCertificateIssuedBy` の `validity` option は時刻 check 自体は提供するが、`notBefore` / `notAfter` 値は呼び出し側が `cf.tlsClientAuth` から渡す。
-- CRL、OCSP、失効 DB、失効確認。
-- 鍵の保管、暗号化保存、ローテーション永続化、KV/D1/R2/Secrets 連携。
-- RSA、EdDSA、別 elliptic curve。
-- DN 文字列 parsing。
-- multi-valued RDN。
+- Server certificate issuance.
+- Public chain-validation APIs.
+- Extracting time fields from a cert. `verifyClientCertificateIssuedBy`'s `validity` option performs the time check, but the `notBefore` / `notAfter` values are passed in by the caller from `cf.tlsClientAuth`.
+- CRL, OCSP, revocation databases, revocation checks.
+- Key storage, encryption-at-rest, rotation-state persistence, and integration with KV/D1/R2/Secrets.
+- RSA, EdDSA, other elliptic curves.
+- DN string parsing.
+- Multi-valued RDNs.
 
 ## Key Handling
 
-このライブラリは秘密鍵 PEM を返すため、生成鍵は extractable です。
+This library returns private keys as PEM, so generated keys are extractable.
 
-EdgCA は鍵の生成と import/export だけを扱います。鍵をどこに保存するか、保存時にどう暗号化するか、ローテーション状態をどう永続化するか、Cloudflare storage products とどう連携するかは application 側の責務です。
+EdgCA only handles key generation and import/export. Where keys are stored, how they are encrypted at rest, how rotation state is persisted, and how they integrate with Cloudflare storage products are all the application's responsibility.
 
-### CA 鍵の持ち込み (推奨)
+### Bringing your own CA key (recommended)
 
-root CA と intermediate CA は長期保管が前提です。鍵管理を呼び出し側に寄せるため、`createRootCA` と `issueIntermediateCA` は既に保管されている秘密鍵を `privateKeyPem` で受け取れます。鍵のライフサイクル (生成・保管・ローテーション) を呼び出し側の鍵管理基盤で一貫して扱えるため、こちらが推奨ルートです。
+Root and intermediate CAs are long-lived. To keep key management on the caller's side, `createRootCA` and `issueIntermediateCA` accept an existing `privateKeyPem`. This lets the caller's key-management infrastructure handle the full key lifecycle (generation, storage, rotation) consistently, which is the recommended path.
 
 ```ts
 const root = await createRootCA({
   subject: [{ type: "CN", value: "dev-root" }],
   days: 3650,
-  privateKeyPem: loadFromVault("root")    // 既に保管されている PKCS#8 PEM
+  privateKeyPem: loadFromVault("root")    // PKCS#8 PEM already in your vault
 });
 
 const intermediate = await issueIntermediateCA({
@@ -213,7 +214,7 @@ const intermediate = await issueIntermediateCA({
 });
 ```
 
-`privateKeyPem` を省略した場合は内部で鍵を生成します。テストや PoC 用途の簡便動作です。client certificate の鍵は ephemeral 想定のため `issueClientCert` では常に内部生成です。
+Omitting `privateKeyPem` causes the library to generate a key internally — convenient for tests and PoCs. Client-certificate keys are intended to be ephemeral, so `issueClientCert` always generates internally.
 
 ## Development
 
@@ -224,21 +225,21 @@ npm run test
 npm audit
 ```
 
-テストは `@cloudflare/vitest-pool-workers` を使い、Workers 互換 runtime 上で WebCrypto の挙動を確認します。
+Tests use `@cloudflare/vitest-pool-workers` to verify WebCrypto behavior on the Workers-compatible runtime.
 
 ### Property-based tests
 
-低 layer の round-trip 不変条件は `fast-check` を使った property-based test として、対象モジュール 1 ファイルずつ分けて `test/<module>.property.test.ts` に置いています。
+Round-trip invariants in the lower layers are expressed as `fast-check` property-based tests, kept one file per target module under `test/<module>.property.test.ts`.
 
-- [test/der.property.test.ts](test/der.property.test.ts) — INTEGER / OID / OCTET STRING / BIT STRING / SEQUENCE の TLV round-trip
-- [test/bytes.property.test.ts](test/bytes.property.test.ts) — `concatBytes`、`binaryToBytes`/`bytesToBinary`、`bytesEqual`、`cloneBytes`
-- [test/ip.property.test.ts](test/ip.property.test.ts) — IPv4 dotted-quad と IPv6（full form / `::` compression）の encode
-- [test/pem.property.test.ts](test/pem.property.test.ts) — `certificateToPem` / `privateKeyDerToPem` / `publicKeyDerToPem` と `pemToDer` / `pemToDerWithLabel` / `splitPemBlocks` の round-trip
+- [test/der.property.test.ts](test/der.property.test.ts) — TLV round-trip for INTEGER / OID / OCTET STRING / BIT STRING / SEQUENCE
+- [test/bytes.property.test.ts](test/bytes.property.test.ts) — `concatBytes`, `binaryToBytes`/`bytesToBinary`, `bytesEqual`, `cloneBytes`
+- [test/ip.property.test.ts](test/ip.property.test.ts) — IPv4 dotted-quad and IPv6 (full form / `::` compression) encoding
+- [test/pem.property.test.ts](test/pem.property.test.ts) — round-trip between `certificateToPem` / `privateKeyDerToPem` / `publicKeyDerToPem` and `pemToDer` / `pemToDerWithLabel` / `splitPemBlocks`
 
-`vitest.config.ts` の include は `test/**/*.test.ts` なので `npm run test` で同時に走ります。`cert` 組み立て層（`ca.ts` / `x509.ts`）は scope 上 PBT 対象外で、example-based のまま [test/edgca.test.ts](test/edgca.test.ts) に集約しています。
+`vitest.config.ts` includes `test/**/*.test.ts`, so `npm run test` runs them all together. The certificate-assembly layer (`ca.ts` / `x509.ts`) is intentionally outside the PBT scope and stays example-based in [test/edgca.test.ts](test/edgca.test.ts).
 
 ## API Documentation
 
-詳しくは [docs/API.md](docs/API.md) を参照してください。
+See [docs/en/API.md](docs/en/API.md) for the full API reference.
 
-実装開始時点の計画は [docs/PLAN_HISTORY.md](docs/PLAN_HISTORY.md) に履歴として残しています。
+The initial implementation plan is preserved as history in [docs/jp/PLAN_HISTORY.md](docs/jp/PLAN_HISTORY.md) (Japanese only — archival material, not maintained in English).

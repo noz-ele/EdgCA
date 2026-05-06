@@ -1,5 +1,7 @@
 # EdgCA — やらないことの仕様
 
+> 日本語 | [English](../en/NON_GOALS.md)
+
 EdgCA は「与えられた入力に従って cert を出力する」だけの stateless issuance library。以下は **意図的に実装しない**。バグ報告・改善提案を受け取った時はこの一覧を先に当てる。
 
 ## 1. 検証系

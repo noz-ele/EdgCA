@@ -1,5 +1,7 @@
 # EdgCA API
 
+> 日本語 | [English](../en/API.md)
+
 この文書は `edgca` から export される public API のドラフトです。
 
 ```ts

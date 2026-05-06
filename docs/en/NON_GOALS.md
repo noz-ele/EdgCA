@@ -1,0 +1,49 @@
+# EdgCA — Non-Goals
+
+> [日本語](../jp/NON_GOALS.md) | English
+
+EdgCA is a stateless issuance library that only "emits a cert based on the input it was given." The following are **intentionally not implemented**. When triaging a bug report or improvement suggestion, check this list first.
+
+## 1. Validation
+
+The **only** validation API EdgCA provides is `verifyClientCertificateIssuedBy` (an identity check against a single direct issuer: issuer DN match + AKI/SKI match + signature verify). Anything beyond that is intentionally not implemented:
+
+- **Certificate chain validation.** `importCertificateAuthority` does not cryptographically verify whether `issuerChainPem` actually issued `certPem`. If the caller supplies a bogus chain, a bogus chain is what gets emitted. We do not adopt "if we can validate, we should validate."
+- **Chain walking / PKI path building.** `verifyClientCertificateIssuedBy` is also limited to **a single direct issuer**. Verifying a leaf issued via an intermediate against the root is out of scope.
+- **Extracting time fields from the cert itself.** `verifyClientCertificateIssuedBy`'s `validity` option provides a time check, but the values for `notBefore` / `notAfter` **are passed in by the caller** (the cert is not parsed for them). Converting `cf.tlsClientAuth.certNotBefore` / `certNotAfter` strings to `Date` is the application's responsibility. The library does not contain a parser for X.509 textual formats (`"Dec  4 23:59:59 2025 GMT"`, etc.) or for DER `UTCTime` / `GeneralizedTime`.
+- **CRL / OCSP / revocation databases / revocation checks.**
+- **DER sanity checks in `certificateToPem(der)`.** Even a shallow check of "first byte is `0x30` (SEQUENCE)" is not implemented. It cannot distinguish a real cert from junk and would only provide false reassurance. Doing it properly would require a full `parseCertificateDer`, which exceeds the responsibility of an encoder. This stays a low-level encoder.
+- **RFC compliance checks for imported certs.** Passing a `certPem` that is expired, has a broken signature, has unexpected extensions, has multiple basicConstraints, etc., does not raise an error — issuance proceeds based on the input as given.
+
+## 2. State management
+
+- **Uniqueness management for `serialNumber`.** Specifying the same `serialNumber` twice for the same issuer does not stop the library. The RFC 5280 §4.1.2.2 uniqueness guarantee is the caller's responsibility. Issuance history is not retained either.
+- **Issuance history / audit log / counters.** Stateless.
+- **Key storage / encryption-at-rest / KV/D1/R2 integration.**
+- **Expiry monitoring / rotation.**
+
+## 3. Input "considerateness"
+
+Bad input should throw. Convenience features such as trim, dedup, and auto-completion are not provided. Silent normalization hides caller intent mistakes.
+
+- **No SAN dnsNames / ipAddresses dedup.** When the same value appears more than once, throw (we do not "collapse to one because callers often duplicate").
+- **No trimming of trailing-dot FQDNs.** `"example.com."` is invalid as a SAN dNSName, so throw (we do not "strip trailing `.` because callers often typo").
+- **No case normalization.** dnsName values are not lowercased. They are encoded as the caller passed them.
+- **No Unicode normalization (NFC/NFKC).** Subject attribute values are UTF-8 encoded as the given code points. `café` (composed) and `café` (decomposed) become different DNs.
+- **No DN string parser (`"CN=foo,O=Bar"`).** Subject must always be passed as a structured `{type, value}[]`.
+- **No multi-valued RDN.** One entry equals one RDN.
+
+## 4. Functional scope
+
+- **No server certificate issuance.** Focused on client certs (mTLS).
+- **No public certificate parsing API.** `parser.ts` is internal.
+- **No CA hierarchy beyond two levels.** At most `root → intermediate → client`. An intermediate cannot have an intermediate underneath it.
+- **No RSA / Ed25519 / P-384 or other key types.** P-256 ECDSA fixed.
+- **No encrypted PKCS#8 PEM (encrypted private key).**
+- **No acceptance of X.509 v1 / v2.** `importCertificateAuthority` accepts only v3 (`[0] EXPLICIT INTEGER 2`). A cert with a missing version field (v1) or `INTEGER 1` (v2) throws. EdgCA itself always emits v3. Importing externally produced legacy-version certs is not a supported use case.
+
+## 5. Conditions for changing these policies
+
+- The validation surface is reconsidered only if "identity verification that cannot be done on the Cloudflare side and can only be done on the application side" grows.
+- "Same input → different / unexpected DER" along the single "external input → output cert" path is a **bug** and is in scope for fixing.
+- "If the caller passes lying or duplicate input, the result is wrong" and "if the caller does not share state, things break" are **by design** and are not in scope for fixing.
