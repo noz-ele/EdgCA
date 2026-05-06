@@ -15,6 +15,10 @@ EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理�
 
 > ⚠ **PKI runtime ではありません。** EdgCA は発行 toolkit であり、汎用 PKI library や runtime ではありません。chain validation、失効確認 (CRL/OCSP)、鍵保管、ローテーションは**提供しません**。`verifyClientCertificateIssuedBy` は **mTLS 検証ではなく**、提示者の認証も**しません** — 詳細は下の [Verify](#verify-cloudflare-worker) 参照。CA を安全に運用するのは caller の責任です。完全な対象外 list は [NON_GOALS.md](NON_GOALS.md)。
 
+## Status
+
+EdgCA は **v0.1.x の初期安定化フェーズ**です。作者が実際の Cloudflare Workers 環境で検証している最中で、API が変わる可能性があります。検証に集中するため、**外部からの Issue と PR は一時的に制限**しており、API が落ち着いた後に再開します。read / clone / fork / `npm install` は通常通り可能です。
+
 ## Install
 
 ```sh
