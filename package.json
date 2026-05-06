@@ -52,6 +52,7 @@
     "test": "vitest run",
     "pretest:workers": "npm run build",
     "prepack": "npm run build",
+    "prepublishOnly": "npm run typecheck && npm test",
     "test:workers": "vitest run --config vitest.config.ts"
   },
   "devDependencies": {
