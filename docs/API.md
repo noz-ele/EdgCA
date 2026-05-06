@@ -239,6 +239,43 @@ PEM や DER として parse 不能な入力は `Error` を投げます (CA 不�
 
 時刻ウィンドウ外なら identity check を実行せず即 `false` を返します (cert parse・signature verify を skip して expensive な crypto を節約)。`validity` を省略した場合は時刻判定をしません。
 
+#### 使い方 (Cloudflare Worker)
+
+```ts
+import { verifyClientCertificateIssuedBy } from "edgca";
+
+const tls = request.cf!.tlsClientAuth!;
+
+// RFC 9440 Structured Field (":<base64>:") を PEM に整形
+const b64 = tls.certRFC9440.replace(/^:|:$/g, "");
+const certPem = `-----BEGIN CERTIFICATE-----\n${b64}\n-----END CERTIFICATE-----`;
+
+const ok = await verifyClientCertificateIssuedBy({
+  ca,                                          // 自前で import 済みの CertificateAuthority
+  certPem,
+  validity: {
+    notBefore: new Date(tls.certNotBefore),    // 文字列 → Date 変換は caller 責務
+    notAfter:  new Date(tls.certNotAfter)
+  }
+});
+```
+
+identity だけで時刻を見ない場合は `validity` を省略します。
+
+```ts
+const ok = await verifyClientCertificateIssuedBy({ ca, certPem });
+```
+
+時刻を library 関数では見ず application 側で 2 行比較する場合は次のようになります (動作は等価)。
+
+```ts
+const now = Date.now();
+const inWindow =
+  Date.parse(tls.certNotBefore) <= now && now <= Date.parse(tls.certNotAfter);
+const ok = inWindow && await verifyClientCertificateIssuedBy({ ca, certPem });
+```
+
+
 この関数は **発行 issuer 1 本に対する identity 確認 + (任意で) 時刻有効性** だけを行います。次は対象外です。
 
 - chain 遡及 (intermediate を介して root から発行された leaf を root に対して verify するなど)。`ca` には**直接の発行者** (root から直接発行なら root、intermediate 経由なら intermediate) を渡してください。

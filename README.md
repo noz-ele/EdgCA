@@ -74,6 +74,57 @@ issuer chain
 
 EdgCA で作成した intermediate から client certificate を発行した場合は、`client + intermediate + root` の順になります。
 
+## Verify (Cloudflare Worker)
+
+mTLS handshake 後の Cloudflare Worker で、受け取った client certificate が**自分の CA から発行されたか**を判定する例です。
+
+```ts
+import { importCertificateAuthority, verifyClientCertificateIssuedBy } from "edgca";
+
+// Worker 起動時 (vault 等から読み込んだ CA を一度 import しておく)
+const ca = await importCertificateAuthority({
+  certPem: env.CA_CERT_PEM,
+  privateKeyPem: env.CA_PRIVATE_KEY_PEM
+});
+
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const tls = request.cf?.tlsClientAuth;
+    if (!tls || tls.certVerified !== "SUCCESS") {
+      return new Response("mTLS required", { status: 401 });
+    }
+
+    // certRFC9440 は ":<base64>:" 形式 (RFC 9440 Structured Field)。
+    // 前後のコロンを外して PEM に整形してから library へ渡す。
+    const b64 = tls.certRFC9440.replace(/^:|:$/g, "");
+    const certPem = `-----BEGIN CERTIFICATE-----\n${b64}\n-----END CERTIFICATE-----`;
+
+    // 時刻有効性も同時に判定する (cf.tlsClientAuth が露出する文字列を Date へ変換)。
+    const ok = await verifyClientCertificateIssuedBy({
+      ca,
+      certPem,
+      validity: {
+        notBefore: new Date(tls.certNotBefore),
+        notAfter:  new Date(tls.certNotAfter)
+        // now を省略すると Date.now() が使われる
+      }
+    });
+    if (!ok) {
+      return new Response("not issued by us, or expired", { status: 403 });
+    }
+
+    // 認可ロジック: cf.tlsClientAuth.certSubjectDN などから identity を抽出して使う
+    return new Response(`hello, ${tls.certSubjectDN}`);
+  }
+};
+```
+
+ポイント:
+
+- `validity` を省略すると identity 判定 (発行者 DN + AKI/SKI + signature) のみ行います。時刻も見たい場合は `notBefore` / `notAfter` を `Date` または epoch ms で渡します。文字列 → `Date` 変換は呼び出し側責務です (理由: cert の時刻 field の textual / DER 形式を library 内に持ち込まないため)。
+- 「自 CA から発行されてない」「ウィンドウ外」は `false` 戻り値、入力 PEM/DER が壊れている等の不正入力は throw。エラー扱いを 2 段階に分けています。
+- `ca` には**直接の発行者 1 本**を渡してください。intermediate を介して発行した leaf を root に対して投げると `false` になります (chain 遡及はしません)。
+
 ## Subject
 
 subject は構造化入力のみ受け付けます。`CN=dev-root,O=Example` のような DN 文字列は受け付けません。
