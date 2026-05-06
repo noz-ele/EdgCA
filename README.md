@@ -76,7 +76,25 @@ EdgCA で作成した intermediate から client certificate を発行した場�
 
 ## Verify (Cloudflare Worker)
 
-mTLS handshake 後の Cloudflare Worker で、受け取った client certificate が**自分の CA から発行されたか**を判定する例です。
+このセクションは、**Cloudflare 側で client certificate が抽出済み**で、その値が `request.cf.tlsClientAuth` 経由で application に渡される運用を前提にしています。EdgCA は TLS handshake にも cert の DER parse にも関与せず、Cloudflare が露出した値を入力として受け取って identity 判定を行います。
+
+### Cloudflare が抽出した場合に渡される形式
+
+| field | 形式 | 例 |
+|---|---|---|
+| `certVerified` | mTLS 検証結果の文字列 | `"SUCCESS"` / `"FAILED:..."` / `"NONE"` |
+| `certRFC9440` | RFC 9440 Structured Field Item (Byte Sequence)。前後を `:` で囲んだ base64 | `":MIIB...:"` |
+| `certNotBefore` / `certNotAfter` | OpenSSL 風 textual 形式 (常に GMT)。単桁日は二重スペース | `"Dec 24 23:59:59 2025 GMT"` / `"Dec  4 23:59:59 2025 GMT"` |
+| `certSubjectDN`, `certIssuerDN`, `certSerial` 等 | 文字列 | identity 抽出用 |
+
+EdgCA `verifyClientCertificateIssuedBy` が直接受け取れるのは PEM (`certPem: string`) と `Date` / epoch ms (`validity.notBefore` / `notAfter`) です。上記 Cloudflare 提供の形式とは**一致しないため、application 側で形式変換が必要**です。具体的には:
+
+- `certRFC9440` の `":...:"` → 前後コロンを外して PEM marker で挟む。
+- `certNotBefore` / `certNotAfter` の textual 文字列 → `new Date(...)` で `Date` に変換 (V8/Workers runtime はこの形式を parse できる)。
+
+これらの parser を library 側に持たないのは、Cloudflare の出力形式変更に追従しないこと、runtime 依存の `Date.parse` 寛容性に巻き込まれないこと、caller が既に値を保持しているため二重実装する意味がないことが理由です (詳細は [docs/NON_GOALS.md](docs/NON_GOALS.md))。
+
+### 例
 
 ```ts
 import { importCertificateAuthority, verifyClientCertificateIssuedBy } from "edgca";
@@ -94,12 +112,12 @@ export default {
       return new Response("mTLS required", { status: 401 });
     }
 
-    // certRFC9440 は ":<base64>:" 形式 (RFC 9440 Structured Field)。
-    // 前後のコロンを外して PEM に整形してから library へ渡す。
+    // Cloudflare 形式 → library 形式への変換
+    //   certRFC9440 (":base64:")        → PEM 文字列
+    //   certNotBefore / certNotAfter    → Date
     const b64 = tls.certRFC9440.replace(/^:|:$/g, "");
     const certPem = `-----BEGIN CERTIFICATE-----\n${b64}\n-----END CERTIFICATE-----`;
 
-    // 時刻有効性も同時に判定する (cf.tlsClientAuth が露出する文字列を Date へ変換)。
     const ok = await verifyClientCertificateIssuedBy({
       ca,
       certPem,
@@ -119,9 +137,9 @@ export default {
 };
 ```
 
-ポイント:
+### 補足
 
-- `validity` を省略すると identity 判定 (発行者 DN + AKI/SKI + signature) のみ行います。時刻も見たい場合は `notBefore` / `notAfter` を `Date` または epoch ms で渡します。文字列 → `Date` 変換は呼び出し側責務です (理由: cert の時刻 field の textual / DER 形式を library 内に持ち込まないため)。
+- `validity` を省略すると identity 判定 (発行者 DN + AKI/SKI + signature) のみ行います。時刻を library 関数では見ず application 側で 2 行比較する場合も、結果は等価です。
 - 「自 CA から発行されてない」「ウィンドウ外」は `false` 戻り値、入力 PEM/DER が壊れている等の不正入力は throw。エラー扱いを 2 段階に分けています。
 - `ca` には**直接の発行者 1 本**を渡してください。intermediate を介して発行した leaf を root に対して投げると `false` になります (chain 遡及はしません)。
 
