@@ -13,7 +13,7 @@ EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理�
 - 証明書と鍵を PEM/DER で入出力する。
 - 暗号演算は `globalThis.crypto.subtle` に委譲する。
 
-EdgCA は汎用 PKI ライブラリではありません。server certificate 発行、証明書チェーン検証 API、失効情報管理、鍵の保管方法は提供しません。
+> ⚠ **PKI runtime ではありません。** EdgCA は発行 toolkit であり、汎用 PKI library や runtime ではありません。chain validation、失効確認 (CRL/OCSP)、鍵保管、ローテーションは**提供しません**。`verifyClientCertificateIssuedBy` は **mTLS 検証ではなく**、提示者の認証も**しません** — 詳細は下の [Verify](#verify-cloudflare-worker) 参照。CA を安全に運用するのは caller の責任です。完全な対象外 list は [NON_GOALS.md](NON_GOALS.md)。
 
 ## Install
 
@@ -52,9 +52,11 @@ const client = await issueClientCert({
   days: 30
 });
 
-console.log(client.certPem);
-console.log(client.privateKeyPem);
-console.log(client.certChainPem);
+// secrets manager / KV / vault に保管する想定。
+// client.privateKeyPem は秘密情報として扱い、log や転送に出さない。
+//   client.certPem        — 公開してよい証明書
+//   client.certChainPem   — mTLS で提示する完全 chain
+//   client.privateKeyPem  — 秘密。trusted channel でのみ受け渡す
 ```
 
 基本形は次の構造です。
@@ -77,13 +79,26 @@ EdgCA で作成した intermediate から client certificate を発行した場�
 
 ## Verify (Cloudflare Worker)
 
-このセクションは、**Cloudflare 側で client certificate が抽出済み**で、その値が `request.cf.tlsClientAuth` 経由で application に渡される運用を前提にしています。EdgCA は TLS handshake にも cert の DER parse にも関与せず、Cloudflare が露出した値を入力として受け取って identity 判定を行います。
+> ⚠ **この関数で出来ること・出来ないこと**
+>
+> `verifyClientCertificateIssuedBy` は **mTLS の検証ではありません** (そもそもこの構成では mTLS 検証自体が成立しません)。せいぜい *発行元検証* に留まります。すなわち「提示された証明書が指定 CA 局で発行されたか」を確認するだけで、これは「証明書を提示した相手が正当な持ち主であるかの認証」とは**まったく別物**です。
+>
+> client certificate はそもそも誰にでも提示してよい情報なので、内容は容易にコピーできます。**「誰でも client certificate の情報は持ち得る」と仮定しなければなりません**。したがって証明書情報を持っているという事実は、正当な持ち主であることの根拠には**絶対になりません**。
+>
+> 正当な持ち主であることを確認するには、加えて対応する秘密鍵を所持していることの確認 — すなわち秘密鍵で署名された情報を証明書中の公開鍵で検証する作業 — が必要です。通常の TLS handshake では client が `CertificateVerify` message でこれを行いますが、**Cloudflare Workers の runtime はこの署名を application に公開しません**。また Enterprise プラン以外では Cloudflare 自身の TLS レイヤーも自前 CA を知らないため、EdgCA で発行した証明書に対して `request.cf.tlsClientAuth.certVerified === "SUCCESS"` になることはありません。Workers 上の application code が proof-of-possession を検証する手段は (Enterprise プランを除き) 存在しません。
+>
+> 実用上の含意: どこかで (log、漏洩 storage、handshake 中のネットワーク観測など) 有効な証明書のコピーを入手した攻撃者は、それを提示してこの check を通過できます。この関数は *最低限の identity check の 1 層* として使うものであり、認証としては使えません。本物の認証には (a) Cloudflare Enterprise で TLS レイヤー mTLS を使うか、(b) server が発行した nonce を client が秘密鍵で署名して返す application layer の challenge-response を追加してください。
+>
+> その他の対象外 (この関数では検証しません): `BasicConstraints CA=false`、`EKU clientAuth`、失効確認、chain walking。
+
+このセクションは、**Cloudflare 側で client certificate が抽出済み**で、その値が `request.cf.tlsClientAuth` 経由で application に渡される運用を前提にしています。EdgCA は TLS handshake にも cert の DER parse にも関与せず、Cloudflare が露出した値を入力として受け取って上記の発行元判定を行います。
 
 ### Cloudflare が抽出した場合に渡される形式
 
 | field | 形式 | 例 |
 |---|---|---|
-| `certVerified` | mTLS 検証結果の文字列 | `"SUCCESS"` / `"FAILED:..."` / `"NONE"` |
+| `certPresented` | 提示の有無 | `"1"` / `"0"` |
+| `certVerified` | TLS レイヤーの検証結果文字列。**自前 CA + 非 Enterprise プランでは `"SUCCESS"` にはなりません** (TLS レイヤーが自前 CA を知らないため)。 | `"SUCCESS"` / `"FAILED:..."` / `"NONE"` |
 | `certRFC9440` | RFC 9440 Structured Field Item (Byte Sequence)。前後を `:` で囲んだ base64 | `":MIIB...:"` |
 | `certNotBefore` / `certNotAfter` | OpenSSL 風 textual 形式 (常に GMT)。単桁日は二重スペース | `"Dec 24 23:59:59 2025 GMT"` / `"Dec  4 23:59:59 2025 GMT"` |
 | `certSubjectDN`, `certIssuerDN`, `certSerial` 等 | 文字列 | identity 抽出用 |
@@ -109,9 +124,11 @@ const ca = await importCertificateAuthority({
 export default {
   async fetch(request: Request): Promise<Response> {
     const tls = request.cf?.tlsClientAuth;
-    if (!tls || tls.certVerified !== "SUCCESS") {
-      return new Response("mTLS required", { status: 401 });
+    if (!tls || tls.certPresented !== "1") {
+      return new Response("client certificate required", { status: 401 });
     }
+    // 注意: 自前 CA + 非 Enterprise では tls.certVerified !== "SUCCESS" が通常。
+    // 発行元判定は下の関数で application 側が行う。
 
     // Cloudflare 形式 → library 形式への変換
     //   certRFC9440 (":base64:")        → PEM 文字列
@@ -131,6 +148,9 @@ export default {
     if (!ok) {
       return new Response("not issued by us, or expired", { status: 403 });
     }
+
+    // 念のため: この check が通っても、提示者が秘密鍵を保有しているとは限らない。
+    // 本物の認証には別途 nonce を秘密鍵で署名させる challenge-response を重ねる。
 
     // 認可ロジック: cf.tlsClientAuth.certSubjectDN などから identity を抽出して使う
     return new Response(`hello, ${tls.certSubjectDN}`);

@@ -16,6 +16,39 @@ export interface VerifyClientCertificateIssuedByOptions {
   validity?: VerifyClientCertificateValidity;
 }
 
+/**
+ * Confirms that `options.certPem` was issued by `options.ca`.
+ *
+ * This is **not** mTLS verification, and does not even attempt to be.
+ * At most it is *issuance verification*: "the presented certificate was
+ * issued by the specified CA" — which is **not** the same as authenticating
+ * that the presenter is the certificate's legitimate owner.
+ *
+ * A client certificate is, by design, presentable to anyone, and its
+ * contents are trivially copyable. You must assume that anyone could be
+ * holding a valid copy. Therefore possession of valid certificate data
+ * **never** proves legitimate ownership.
+ *
+ * Proving legitimate ownership additionally requires verifying possession
+ * of the corresponding private key (a signature made by it, verified
+ * against the certificate's public key). The TLS handshake's
+ * `CertificateVerify` message normally provides this, but the Cloudflare
+ * Workers runtime does not expose that signature to the application. On
+ * non-Enterprise plans, Cloudflare's TLS layer also does not know about
+ * your self-managed CA, so `request.cf.tlsClientAuth.certVerified` will
+ * not be `"SUCCESS"` for certificates EdgCA issued. Application code on
+ * Workers (Enterprise excluded) has no way to verify proof-of-possession.
+ *
+ * Implication: anyone who has obtained a copy of a valid certificate
+ * (logs, leaked storage, network capture, etc.) can present it and pass
+ * this check. Use this as a minimum identity-check layer, not as
+ * authentication. For real authentication, use Cloudflare Enterprise mTLS
+ * at the TLS layer, or add an application-layer challenge-response that
+ * has the client sign a server-issued nonce with its private key.
+ *
+ * Also out of scope (not checked here): `BasicConstraints CA=false`,
+ * `EKU clientAuth`, revocation, and chain walking.
+ */
 export async function verifyClientCertificateIssuedBy(
   options: VerifyClientCertificateIssuedByOptions
 ): Promise<boolean> {

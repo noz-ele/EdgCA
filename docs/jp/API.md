@@ -206,7 +206,9 @@ intermediate CA を再 import する場合は、`issuerChainPem` に parent chai
 
 ### `verifyClientCertificateIssuedBy(options)`
 
-`options.ca` が `options.certPem` を発行した issuer か判定します。Cloudflare Workers で `request.cf.tlsClientAuth.certRFC9440` を decode した PEM を受け取り、自分の自己 CA が発行した cert かを application 側で確認するための post-handshake な identity check です。
+`options.ca` が `options.certPem` を発行した issuer か判定します。Cloudflare Workers で `request.cf.tlsClientAuth.certRFC9440` を decode した PEM を受け取り、自分の自己 CA が発行した cert かを application 側で確認するための post-handshake な発行元 check です。
+
+> ⚠ **これは mTLS の検証ではなく、提示者の認証もしません。** 単に「証明書が指定 CA で発行されたか」を判定するだけです。client certificate は誰にでも提示できる情報で内容は容易にコピーできるため、証明書情報を持っていることは正当な持ち主であることの根拠になりません。Proof-of-possession には対応する秘密鍵による署名検証が必要ですが、Cloudflare Workers runtime はその署名を公開しません。非 Enterprise プランでは自前 CA に対して `request.cf.tlsClientAuth.certVerified === "SUCCESS"` にもなりません。コピーした証明書を提示する攻撃者はこの check を通過します。本物の認証には Cloudflare Enterprise mTLS、または application 層の challenge-response (nonce を秘密鍵で署名させる) を重ねてください。詳細は [README.md → Verify](README.md#verify-cloudflare-worker) を参照。
 
 ```ts
 function verifyClientCertificateIssuedBy(options: {

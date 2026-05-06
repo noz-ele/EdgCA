@@ -1,6 +1,6 @@
 # EdgCA
 
-> [日本語](docs/jp/README.md) | English
+> [日本語](https://github.com/noz-ele/EdgCA/blob/main/docs/jp/README.md) | English
 
 EdgCA is a small TypeScript library that issues mTLS client certificates from a self-managed CA on Cloudflare Workers-compatible runtimes.
 
@@ -13,7 +13,7 @@ The scope is intentionally narrow:
 - Encode/decode certificates and keys as PEM/DER.
 - Delegate all cryptographic operations to `globalThis.crypto.subtle`.
 
-EdgCA is not a general-purpose PKI library. Server certificate issuance, public chain-validation APIs, revocation data, and key storage are out of scope.
+> ⚠ **Not a PKI runtime.** EdgCA is an issuance toolkit, not a general-purpose PKI library or runtime. It does **not** provide chain validation, revocation (CRL/OCSP), key storage, or rotation. `verifyClientCertificateIssuedBy` is **not** mTLS verification and does **not** authenticate the presenter — see [Verify](#verify-cloudflare-worker) below. Operating a CA safely is the caller's responsibility. Full list: [docs/en/NON_GOALS.md](https://github.com/noz-ele/EdgCA/blob/main/docs/en/NON_GOALS.md).
 
 ## Install
 
@@ -52,9 +52,11 @@ const client = await issueClientCert({
   days: 30
 });
 
-console.log(client.certPem);
-console.log(client.privateKeyPem);
-console.log(client.certChainPem);
+// Persist these via your secrets manager / KV / vault.
+// Treat client.privateKeyPem as a secret — never log or transmit it.
+//   client.certPem        — public certificate
+//   client.certChainPem   — full chain to present during mTLS
+//   client.privateKeyPem  — secret, hand off only over a trusted channel
 ```
 
 The basic shape is:
@@ -77,13 +79,26 @@ For a client certificate issued by an EdgCA-built intermediate, the result is `c
 
 ## Verify (Cloudflare Worker)
 
-This section assumes a deployment where **Cloudflare has already extracted the client certificate** and exposes it to your application via `request.cf.tlsClientAuth`. EdgCA participates in neither the TLS handshake nor DER parsing of the cert; it consumes the values Cloudflare hands you and performs the identity check.
+> ⚠ **What this is — and is not**
+>
+> `verifyClientCertificateIssuedBy` is **not** mTLS verification. (Real mTLS verification does not exist for a self-managed CA on Cloudflare Workers in the first place.) At most it is *issuance verification*: it confirms that the presented certificate was issued by the specified CA. **That is not the same as authenticating that the presenter is the certificate's legitimate owner.**
+>
+> A client certificate is, by design, presentable to anyone, and its contents are trivially copyable. You must assume that anyone can be holding a valid copy. Therefore possession of valid certificate data **never** proves legitimate ownership.
+>
+> Proving legitimate ownership additionally requires verifying possession of the corresponding private key — i.e., a signature made by the private key, verified against the certificate's public key. The TLS handshake's `CertificateVerify` message normally does this, but **the Cloudflare Workers runtime does not expose that signature to the application.** On non-Enterprise plans, Cloudflare's TLS layer also does not know about your self-managed CA, so `request.cf.tlsClientAuth.certVerified` will not be `"SUCCESS"` for certificates EdgCA issued. Workers application code (Enterprise plans excluded) has no way to verify proof-of-possession.
+>
+> Implication: an attacker who has obtained a copy of a valid certificate (logs, leaked storage, network capture, etc.) can present it and pass this check. Use this function as a *minimum* identity-check layer, not as authentication. For real authentication, either (a) use Cloudflare Enterprise with mTLS configured at the TLS layer (Cloudflare validates the handshake signature against your CA), or (b) add an application-layer challenge-response that has the client sign a server-issued nonce with its private key.
+>
+> Also out of scope (not checked by this function): `BasicConstraints CA=false`, `EKU clientAuth`, revocation, and chain walking.
+
+This section assumes a deployment where **Cloudflare has already extracted the client certificate** and exposes it to your application via `request.cf.tlsClientAuth`. EdgCA participates in neither the TLS handshake nor DER parsing of the cert; it consumes the values Cloudflare hands you and performs the issuance check above.
 
 ### Formats Cloudflare exposes after extraction
 
 | field | format | example |
 |---|---|---|
-| `certVerified` | mTLS verification status string | `"SUCCESS"` / `"FAILED:..."` / `"NONE"` |
+| `certPresented` | whether a client cert was sent | `"1"` / `"0"` |
+| `certVerified` | TLS-layer verification status string. **For self-managed CAs on non-Enterprise plans this will not be `"SUCCESS"`** — the TLS layer does not know about your CA. | `"SUCCESS"` / `"FAILED:..."` / `"NONE"` |
 | `certRFC9440` | RFC 9440 Structured Field Item (Byte Sequence). Base64 wrapped in `:` | `":MIIB...:"` |
 | `certNotBefore` / `certNotAfter` | OpenSSL-style textual format (always GMT). Single-digit day padded with two spaces | `"Dec 24 23:59:59 2025 GMT"` / `"Dec  4 23:59:59 2025 GMT"` |
 | `certSubjectDN`, `certIssuerDN`, `certSerial`, etc. | strings | identity extraction |
@@ -93,7 +108,7 @@ This section assumes a deployment where **Cloudflare has already extracted the c
 - `certRFC9440` (`":...:"`) → strip the surrounding colons, wrap with PEM markers.
 - `certNotBefore` / `certNotAfter` (textual) → `new Date(...)` (V8 / the Workers runtime parses this format).
 
-These parsers live in the caller, not in the library, because (a) we do not want to track Cloudflare's output-format changes, (b) we do not want to rely on runtime-dependent `Date.parse` leniency, and (c) the caller already holds the values, so reimplementing them here would be redundant. See [docs/en/NON_GOALS.md](docs/en/NON_GOALS.md) for the full rationale.
+These parsers live in the caller, not in the library, because (a) we do not want to track Cloudflare's output-format changes, (b) we do not want to rely on runtime-dependent `Date.parse` leniency, and (c) the caller already holds the values, so reimplementing them here would be redundant. See [docs/en/NON_GOALS.md](https://github.com/noz-ele/EdgCA/blob/main/docs/en/NON_GOALS.md) for the full rationale.
 
 ### Example
 
@@ -109,9 +124,11 @@ const ca = await importCertificateAuthority({
 export default {
   async fetch(request: Request): Promise<Response> {
     const tls = request.cf?.tlsClientAuth;
-    if (!tls || tls.certVerified !== "SUCCESS") {
-      return new Response("mTLS required", { status: 401 });
+    if (!tls || tls.certPresented !== "1") {
+      return new Response("client certificate required", { status: 401 });
     }
+    // Note: tls.certVerified !== "SUCCESS" is expected for self-managed CAs
+    // on non-Enterprise plans. The application performs the issuance check below.
 
     // Convert Cloudflare's formats to the library's formats.
     //   certRFC9440 (":base64:")        -> PEM string
@@ -131,6 +148,10 @@ export default {
     if (!ok) {
       return new Response("not issued by us, or expired", { status: 403 });
     }
+
+    // Reminder: passing this check does NOT prove the presenter holds the
+    // private key. For real authentication, layer a challenge-response
+    // (nonce signed with the client's private key) on top.
 
     // Authorization logic: derive identity from cf.tlsClientAuth.certSubjectDN, etc.
     return new Response(`hello, ${tls.certSubjectDN}`);
@@ -231,15 +252,15 @@ Tests use `@cloudflare/vitest-pool-workers` to verify WebCrypto behavior on the 
 
 Round-trip invariants in the lower layers are expressed as `fast-check` property-based tests, kept one file per target module under `test/<module>.property.test.ts`.
 
-- [test/der.property.test.ts](test/der.property.test.ts) — TLV round-trip for INTEGER / OID / OCTET STRING / BIT STRING / SEQUENCE
-- [test/bytes.property.test.ts](test/bytes.property.test.ts) — `concatBytes`, `binaryToBytes`/`bytesToBinary`, `bytesEqual`, `cloneBytes`
-- [test/ip.property.test.ts](test/ip.property.test.ts) — IPv4 dotted-quad and IPv6 (full form / `::` compression) encoding
-- [test/pem.property.test.ts](test/pem.property.test.ts) — round-trip between `certificateToPem` / `privateKeyDerToPem` / `publicKeyDerToPem` and `pemToDer` / `pemToDerWithLabel` / `splitPemBlocks`
+- [test/der.property.test.ts](https://github.com/noz-ele/EdgCA/blob/main/test/der.property.test.ts) — TLV round-trip for INTEGER / OID / OCTET STRING / BIT STRING / SEQUENCE
+- [test/bytes.property.test.ts](https://github.com/noz-ele/EdgCA/blob/main/test/bytes.property.test.ts) — `concatBytes`, `binaryToBytes`/`bytesToBinary`, `bytesEqual`, `cloneBytes`
+- [test/ip.property.test.ts](https://github.com/noz-ele/EdgCA/blob/main/test/ip.property.test.ts) — IPv4 dotted-quad and IPv6 (full form / `::` compression) encoding
+- [test/pem.property.test.ts](https://github.com/noz-ele/EdgCA/blob/main/test/pem.property.test.ts) — round-trip between `certificateToPem` / `privateKeyDerToPem` / `publicKeyDerToPem` and `pemToDer` / `pemToDerWithLabel` / `splitPemBlocks`
 
-`vitest.config.ts` includes `test/**/*.test.ts`, so `npm run test` runs them all together. The certificate-assembly layer (`ca.ts` / `x509.ts`) is intentionally outside the PBT scope and stays example-based in [test/edgca.test.ts](test/edgca.test.ts).
+`vitest.config.ts` includes `test/**/*.test.ts`, so `npm run test` runs them all together. The certificate-assembly layer (`ca.ts` / `x509.ts`) is intentionally outside the PBT scope and stays example-based in [test/edgca.test.ts](https://github.com/noz-ele/EdgCA/blob/main/test/edgca.test.ts).
 
 ## API Documentation
 
-See [docs/en/API.md](docs/en/API.md) for the full API reference.
+See [docs/en/API.md](https://github.com/noz-ele/EdgCA/blob/main/docs/en/API.md) for the full API reference.
 
-The initial implementation plan is preserved as history in [docs/jp/PLAN_HISTORY.md](docs/jp/PLAN_HISTORY.md) (Japanese only — archival material, not maintained in English).
+The initial implementation plan is preserved as history in [docs/jp/PLAN_HISTORY.md](https://github.com/noz-ele/EdgCA/blob/main/docs/jp/PLAN_HISTORY.md) (Japanese only — archival material, not maintained in English).

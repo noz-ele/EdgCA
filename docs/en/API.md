@@ -206,7 +206,9 @@ When re-importing an intermediate CA, pass the parent chain via `issuerChainPem`
 
 ### `verifyClientCertificateIssuedBy(options)`
 
-Decides whether `options.ca` was the issuer of `options.certPem`. This is a post-handshake identity check intended to be used in a Cloudflare Worker after decoding the PEM from `request.cf.tlsClientAuth.certRFC9440`, to confirm that the client certificate came from your own self-managed CA.
+Decides whether `options.ca` was the issuer of `options.certPem`. This is a post-handshake issuance check intended to be used in a Cloudflare Worker after decoding the PEM from `request.cf.tlsClientAuth.certRFC9440`, to confirm that the client certificate came from your own self-managed CA.
+
+> ⚠ **This is not mTLS verification, and it does not authenticate the presenter.** It only confirms the certificate was issued by the specified CA. A client certificate is by design presentable to anyone, and its contents are trivially copyable; possession of valid certificate data does **not** prove legitimate ownership. Proof-of-possession requires verifying a signature made by the corresponding private key, which the Cloudflare Workers runtime does not expose. On non-Enterprise plans, `request.cf.tlsClientAuth.certVerified` will not be `"SUCCESS"` for self-managed CAs either. An attacker holding a copied certificate will pass this check. For real authentication, use Cloudflare Enterprise mTLS or layer an application-level challenge-response (nonce signed with the client's private key). See [README.md → Verify](../../README.md#verify-cloudflare-worker) for the full discussion.
 
 ```ts
 function verifyClientCertificateIssuedBy(options: {
