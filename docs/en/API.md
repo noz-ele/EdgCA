@@ -2,7 +2,7 @@
 
 > [日本語](../jp/API.md) | English
 
-This document describes the public API exported by `edgca`.
+This document describes the public API exported by `@noz-ele/edgca`.
 
 ```ts
 import {
@@ -15,7 +15,7 @@ import {
   pemToDer,
   privateKeyToPem,
   publicKeyToPem
-} from "edgca";
+} from "@noz-ele/edgca";
 ```
 
 ## Types
@@ -246,7 +246,7 @@ If `now` is outside the window, the function returns `false` immediately without
 #### Usage (Cloudflare Worker)
 
 ```ts
-import { verifyClientCertificateIssuedBy } from "edgca";
+import { verifyClientCertificateIssuedBy } from "@noz-ele/edgca";
 
 const tls = request.cf!.tlsClientAuth!;
 

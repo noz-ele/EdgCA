@@ -2,7 +2,7 @@
 
 > 日本語 | [English](../en/API.md)
 
-この文書は `edgca` から export される public API のドラフトです。
+この文書は `@noz-ele/edgca` から export される public API のドラフトです。
 
 ```ts
 import {
@@ -15,7 +15,7 @@ import {
   pemToDer,
   privateKeyToPem,
   publicKeyToPem
-} from "edgca";
+} from "@noz-ele/edgca";
 ```
 
 ## Types
@@ -246,7 +246,7 @@ PEM や DER として parse 不能な入力は `Error` を投げます (CA 不�
 #### 使い方 (Cloudflare Worker)
 
 ```ts
-import { verifyClientCertificateIssuedBy } from "edgca";
+import { verifyClientCertificateIssuedBy } from "@noz-ele/edgca";
 
 const tls = request.cf!.tlsClientAuth!;
 

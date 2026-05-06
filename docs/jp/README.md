@@ -22,7 +22,7 @@ EdgCA は **v0.1.x の初期安定化フェーズ**です。作者が実際の C
 ## Install
 
 ```sh
-npm install edgca
+npm install @noz-ele/edgca
 ```
 
 ESM 専用 (`"type": "module"`) で、`globalThis.crypto.subtle` が動く runtime (Cloudflare Workers、Node.js 20+、modern browser 等) で動作します。CommonJS からの `require` は対象外です。
@@ -34,7 +34,7 @@ import {
   createRootCA,
   issueIntermediateCA,
   issueClientCert
-} from "edgca";
+} from "@noz-ele/edgca";
 
 const root = await createRootCA({
   subject: [{ type: "CN", value: "dev-root" }],
@@ -117,7 +117,7 @@ EdgCA `verifyClientCertificateIssuedBy` が直接受け取れるのは PEM (`cer
 ### 例
 
 ```ts
-import { importCertificateAuthority, verifyClientCertificateIssuedBy } from "edgca";
+import { importCertificateAuthority, verifyClientCertificateIssuedBy } from "@noz-ele/edgca";
 
 // Worker 起動時 (vault 等から読み込んだ CA を一度 import しておく)
 const ca = await importCertificateAuthority({

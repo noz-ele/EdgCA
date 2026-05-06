@@ -22,7 +22,7 @@ EdgCA is in **v0.1.x — early stabilization**. The author is currently validati
 ## Install
 
 ```sh
-npm install edgca
+npm install @noz-ele/edgca
 ```
 
 ESM-only (`"type": "module"`). Runs on any runtime where `globalThis.crypto.subtle` is available (Cloudflare Workers, Node.js 20+, modern browsers, etc.). CommonJS `require` is not supported.
@@ -34,7 +34,7 @@ import {
   createRootCA,
   issueIntermediateCA,
   issueClientCert
-} from "edgca";
+} from "@noz-ele/edgca";
 
 const root = await createRootCA({
   subject: [{ type: "CN", value: "dev-root" }],
@@ -117,7 +117,7 @@ These parsers live in the caller, not in the library, because (a) we do not want
 ### Example
 
 ```ts
-import { importCertificateAuthority, verifyClientCertificateIssuedBy } from "edgca";
+import { importCertificateAuthority, verifyClientCertificateIssuedBy } from "@noz-ele/edgca";
 
 // At Worker startup: import the CA loaded from your vault once.
 const ca = await importCertificateAuthority({
