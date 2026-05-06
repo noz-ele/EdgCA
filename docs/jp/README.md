@@ -96,7 +96,7 @@ EdgCA で作成した intermediate から client certificate を発行した場�
 ### Cloudflare が抽出した場合に渡される形式
 
 | field | 形式 | 例 |
-|---|---|---|
+| --- | --- | --- |
 | `certPresented` | 提示の有無 | `"1"` / `"0"` |
 | `certVerified` | TLS レイヤーの検証結果文字列。**自前 CA + 非 Enterprise プランでは `"SUCCESS"` にはなりません** (TLS レイヤーが自前 CA を知らないため)。 | `"SUCCESS"` / `"FAILED:..."` / `"NONE"` |
 | `certRFC9440` | RFC 9440 Structured Field Item (Byte Sequence)。前後を `:` で囲んだ base64 | `":MIIB...:"` |

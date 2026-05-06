@@ -236,7 +236,7 @@ Inputs that fail to parse as PEM or DER throw an `Error`. The two error categori
 An optional time-validity check. Evaluated only when provided. The values are converted by the caller from `cf.tlsClientAuth.certNotBefore` / `certNotAfter` to `Date` or epoch milliseconds (the library does not read the cert's own `notBefore` / `notAfter` fields).
 
 | field | type | required | default | meaning and constraints |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `notBefore` | `Date \| number` | ✅ | — | Invalid before this time. `Date` or epoch ms. `NaN` / non-finite throws. |
 | `notAfter` | `Date \| number` | ✅ | — | Invalid after this time. Same constraints as above. `notBefore > notAfter` throws. |
 | `now` | `Date \| number` | — | `Date.now()` | The "current" time used in the comparison. Can be set explicitly for tests or past-time verification. |
@@ -360,7 +360,7 @@ Legend:
 The argument to `createRootCA`. Represents the input set for creating a single self-signed root CA. At minimum it requires the subject DN and the validity period; whether to allow intermediates underneath (`pathLenConstraint`) and bringing in an existing private key (`privateKeyPem`) are optional. Both fresh issuance and reproducible issuance (with a brought-in key) are handled by a single interface.
 
 | field | type | required | default | meaning and constraints |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `subject` | `Subject` | ✅ | — | The subject DN of the root CA. Order is preserved. Because the cert is self-signed, the issuer DN holds the same value. See § `Subject` for details. Empty arrays are not allowed. |
 | `days` | `number` | ✅ | — | Validity in days from `notBefore`. Positive finite numbers only. One day is a flat `86_400_000ms` addition (no leap seconds). No upper-bound check. |
 | `notBefore` | `Date` | — | call time (`new Date()`) | The validity start time. Encoded as `UTCTime` for 1950–2049 and as `GeneralizedTime` outside that range. |
@@ -373,7 +373,7 @@ The argument to `createRootCA`. Represents the input set for creating a single s
 The argument to `issueIntermediateCA`. The input set for issuing a single intermediate CA from an existing root CA. Differs from `CreateRootCAOptions` in two ways: the parent root is passed via `ca`, and `pathLenConstraint` is effectively fixed at `0` because intermediates cannot have intermediates underneath them.
 
 | field | type | required | default | meaning and constraints |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `ca` | `CertificateAuthority` | ✅ | — | The parent root CA. Passing an intermediate as the parent throws. Passing a root with `pathLenConstraint=0` also throws. Passing a cert with `isCA=false` or no `keyCertSign` throws. |
 | `subject` | `Subject` | ✅ | — | The subject DN of the intermediate CA being issued. |
 | `days` | `number` | ✅ | — | Same as `CreateRootCAOptions.days`. Additionally, the library does not stop you from specifying a value that exceeds the issuer's `notAfter` (the resulting cert will be rejected by verifiers). |
@@ -387,7 +387,7 @@ The argument to `issueIntermediateCA`. The input set for issuing a single interm
 The argument to `issueClientCert`. The input set for issuing a single mTLS client certificate. Specify the issuer via `ca` (either a root or an intermediate is fine). Client cert keys are assumed to be short-lived, so unlike the CA options, this does not accept `privateKeyPem`. SAN is optional; when neither `dnsNames` nor `ipAddresses` is specified, the extension itself is omitted.
 
 | field | type | required | default | meaning and constraints |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `ca` | `CertificateAuthority` | ✅ | — | The issuer. Either a root or an intermediate is fine. Passing a cert with `isCA=false` or no `keyCertSign` throws. |
 | `subject` | `Subject` | ✅ | — | The subject DN of the client cert being issued. |
 | `days` | `number` | ✅ | — | Same as `CreateRootCAOptions.days`. |
@@ -403,7 +403,7 @@ The argument to `issueClientCert`. The input set for issuing a single mTLS clien
 The argument to `importCertificateAuthority`. The input for reconstructing a `CertificateAuthority` instance from persisted CA material (cert PEM + private key PEM, plus the parent chain when applicable). Used not for creating a new CA but for loading a stored CA at Worker startup so it can be used for subsequent issuance.
 
 | field | type | required | default | meaning and constraints |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `certPem` | `string` | ✅ | — | The CA certificate PEM to import. The first `BEGIN CERTIFICATE` block is read. |
 | `privateKeyPem` | `string` | ✅ | — | The PKCS#8 PEM private key (unencrypted) corresponding to `certPem`. The library performs a sign/verify round-trip against the public key to confirm the pair matches. Mismatches throw. |
 | `issuerChainPem` | `string` | — | `""` (empty) | When the imported subject is an intermediate CA, the PEM of its parent chain. Used to build `certChainPem` when issuing a client cert. Multiple `CERTIFICATE` blocks are concatenated with newlines. An empty string is treated as a root. |
@@ -415,7 +415,7 @@ The argument to `importCertificateAuthority`. The input for reconstructing a `Ce
 A single instance type that bundles a CA into three pieces: "private key + own cert + parent chain". Returned by `createRootCA` / `issueIntermediateCA` / `importCertificateAuthority`, and can be passed directly as the `ca` argument to `issueIntermediateCA` / `issueClientCert`. Treat it as one handle that bundles all the state the issuance functions need. To persist a CA, save the three values `certPem` / `privateKeyPem` / `issuerChainPem` and pass them back through `importCertificateAuthority` to restore.
 
 | field | type | meaning |
-|---|---|---|
+| --- | --- | --- |
 | `certPem` | `string` | The PEM of the CA's own certificate (`CERTIFICATE` block). |
 | `privateKeyPem` | `string` | The CA's PKCS#8 PEM private key, unencrypted. |
 | `publicKeyPem` | `string` | The CA's SPKI PEM public key. |
@@ -429,7 +429,7 @@ A single instance type that bundles a CA into three pieces: "private key + own c
 The return value of `issueClientCert`. A type that returns the issued client cert as three pieces: "private key + cert + complete chain". Cannot be reused for further issuance because no CA usage is intended (re-importing it would yield a `CertificateAuthority`, but since `issueClientCert` outputs a leaf cert, it would not function as an issuer). The complete chain to present to a verifier is provided in `certChainPem`.
 
 | field | type | meaning |
-|---|---|---|
+| --- | --- | --- |
 | `certPem` | `string` | The PEM of the client certificate. |
 | `privateKeyPem` | `string` | The client's PKCS#8 PEM private key, unencrypted. |
 | `publicKeyPem` | `string` | The client's SPKI PEM public key. |
@@ -443,7 +443,7 @@ The return value of `issueClientCert`. A type that returns the issued client cer
 A single entry that makes up a `Subject`. The Subject DN (Distinguished Name) of an X.509 cert is a structure of multiple attributes in order; one such attribute is represented as `{ type, value }`. EdgCA does not accept DN string input like `CN=foo,O=Example` — the structured array form is required by design. Multi-valued RDNs (multiple attributes within a single RDN) are also unsupported; one entry equals one RDN.
 
 | field | type | required | meaning and constraints |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `type` | `SubjectAttributeType` | ✅ | The attribute type. A short name (`CN`, `O`, `OU`, `C`, `ST`, `L`, `E`, `DC`, `SERIALNUMBER`, `STREET`, `POSTALCODE`, `TITLE`, `GIVENNAME`, `SURNAME`, `UID`) or a dotted OID string (`1.2.3.4.5`). Unsupported short names and malformed OIDs throw. |
 | `value` | `string` | ✅ | The attribute value. The string type is selected by OID (`C` → PrintableString, emailAddress → IA5String, otherwise UTF8String). The same rule applies to dotted OIDs equivalent to a short name. A `C` value that is not valid PrintableString throws. An emailAddress value that is not valid IA5 (ASCII) also throws. |
 
@@ -452,7 +452,7 @@ A single entry that makes up a `Subject`. The Subject DN (Distinguished Name) of
 `SerialNumber` is a union type alias (`bigint | number | string | Uint8Array`) used when the caller wants to specify the cert's serial number explicitly. The cases for explicit specification are limited; usually you should omit it and rely on the library's random 16-byte generation. Specify a value for audit requirements demanding determinism, tests requiring reproducibility, or when carrying a serial assigned by an external system. The interpretation per input type is:
 
 | input type | interpretation | constraints |
-|---|---|---|
+| --- | --- | --- |
 | omitted | 16-byte random, MSB cleared to make it positive | — |
 | `bigint` | encoded as the integer directly | DER-encoded length ≤ 20 octets |
 | `number` | encoded as the integer directly | same as above |

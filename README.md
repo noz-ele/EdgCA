@@ -96,7 +96,7 @@ This section assumes a deployment where **Cloudflare has already extracted the c
 ### Formats Cloudflare exposes after extraction
 
 | field | format | example |
-|---|---|---|
+| --- | --- | --- |
 | `certPresented` | whether a client cert was sent | `"1"` / `"0"` |
 | `certVerified` | TLS-layer verification status string. **For self-managed CAs on non-Enterprise plans this will not be `"SUCCESS"`** — the TLS layer does not know about your CA. | `"SUCCESS"` / `"FAILED:..."` / `"NONE"` |
 | `certRFC9440` | RFC 9440 Structured Field Item (Byte Sequence). Base64 wrapped in `:` | `":MIIB...:"` |

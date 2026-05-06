@@ -236,7 +236,7 @@ PEM や DER として parse 不能な入力は `Error` を投げます (CA 不�
 省略可能な時刻有効性 check。指定された場合のみ評価します。値はすべて呼び出し側が `cf.tlsClientAuth.certNotBefore` / `certNotAfter` から `Date` または epoch milliseconds に変換して渡します (library は cert の `notBefore` / `notAfter` field を参照しません)。
 
 | field | 型 | 必須 | default | 意味と制約 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `notBefore` | `Date \| number` | ✅ | — | この時刻より前は invalid。`Date` または epoch ms。`NaN` / 非有限値は例外。 |
 | `notAfter` | `Date \| number` | ✅ | — | この時刻より後は invalid。同上の制約。`notBefore > notAfter` は例外。 |
 | `now` | `Date \| number` | — | `Date.now()` | 比較する現在時刻。テスト・past-time 検証用に明示できる。 |
@@ -360,7 +360,7 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 `createRootCA` の引数。自己署名 root CA を 1 本作るための入力一式を表す。subject DN と有効期間が最低限必要で、配下に intermediate を置くか (`pathLenConstraint`) と既存秘密鍵の持ち込み (`privateKeyPem`) を任意で指定する。新規発行と再現発行 (持ち込み鍵) の両方を 1 つの interface で扱う。
 
 | field | 型 | 必須 | default | 意味と制約 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `subject` | `Subject` | ✅ | — | root CA の subject DN。配列順序は保持。self-signed のため issuer DN にも同値が入る。詳細は § `Subject` 参照。空配列は不可。 |
 | `days` | `number` | ✅ | — | `notBefore` からの有効日数。正の有限数のみ。1 日 = `86_400_000ms` の単純加算 (閏秒なし)。上限の check なし。 |
 | `notBefore` | `Date` | — | 呼び出し時刻 (`new Date()`) | validity の開始時刻。1950–2049 は `UTCTime`、それ以外は `GeneralizedTime` で encode。 |
@@ -373,7 +373,7 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 `issueIntermediateCA` の引数。既存 root CA から intermediate CA を 1 本発行するための入力。`CreateRootCAOptions` との違いは、親となる root を `ca` で渡す点と、intermediate のさらに下に intermediate を置けない設計のため `pathLenConstraint` が実質 `0` 固定である点。
 
 | field | 型 | 必須 | default | 意味と制約 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `ca` | `CertificateAuthority` | ✅ | — | 親となる root CA。intermediate を親にすると例外。`pathLenConstraint=0` の root を親にしても例外。`isCA=false` または `keyCertSign` なしの cert を渡しても例外。 |
 | `subject` | `Subject` | ✅ | — | 発行する intermediate CA の subject DN。 |
 | `days` | `number` | ✅ | — | `CreateRootCAOptions.days` と同じ。加えて、issuer の `notAfter` を超える指定をしても library は止めない (verifier 側で reject される cert ができる)。 |
@@ -387,7 +387,7 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 `issueClientCert` の引数。mTLS 用 client certificate を 1 本発行するための入力。`ca` で issuer を指定する (root / intermediate のどちらでも可)。client cert の秘密鍵は短命利用を前提に常に内部生成されるため、CA 用 options と違って `privateKeyPem` を受け付けない。SAN は任意で、未指定なら extension 自体が省略される。
 
 | field | 型 | 必須 | default | 意味と制約 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `ca` | `CertificateAuthority` | ✅ | — | 発行 issuer。root または intermediate どちらでも可。`isCA=false` または `keyCertSign` なしの cert を渡すと例外。 |
 | `subject` | `Subject` | ✅ | — | 発行する client cert の subject DN。 |
 | `days` | `number` | ✅ | — | `CreateRootCAOptions.days` と同じ。 |
@@ -403,7 +403,7 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 `importCertificateAuthority` の引数。永続化された CA 情報 (cert PEM + 秘密鍵 PEM、必要なら親 chain) を再構成して `CertificateAuthority` instance に戻すための入力。新規 CA を作るのではなく、保存済み CA を Workers の起動時に読み込んで以降の発行に使う運用で利用する。
 
 | field | 型 | 必須 | default | 意味と制約 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `certPem` | `string` | ✅ | — | import する CA certificate PEM。先頭の `BEGIN CERTIFICATE` block を読む。 |
 | `privateKeyPem` | `string` | ✅ | — | `certPem` に対応する PKCS#8 PEM 秘密鍵 (非暗号化)。public key と sign/verify で一致確認する。一致しない場合は例外。 |
 | `issuerChainPem` | `string` | — | `""` (空) | import 対象が intermediate CA の時、その親 chain の PEM。client cert 発行時の `certChainPem` 構築に使われる。複数 `CERTIFICATE` block を改行で連結して渡す。空文字列の場合 root として扱われる。 |
@@ -415,7 +415,7 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 CA を「秘密鍵 + 自 cert + 上位 chain」の 3 点で 1 つにまとめた instance 型。`createRootCA` / `issueIntermediateCA` / `importCertificateAuthority` の戻り値で、そのまま `issueIntermediateCA` / `issueClientCert` の `ca` 引数に渡せる。発行関数が必要とする状態をすべて 1 つに束ねたハンドルとして扱う。永続化する時は `certPem` / `privateKeyPem` / `issuerChainPem` の 3 つを保存し、復元時は `importCertificateAuthority` に渡す。
 
 | field | 型 | 意味 |
-|---|---|---|
+| --- | --- | --- |
 | `certPem` | `string` | 自 CA certificate の PEM (`CERTIFICATE` block)。 |
 | `privateKeyPem` | `string` | 自 CA 秘密鍵の PKCS#8 PEM、非暗号化。 |
 | `publicKeyPem` | `string` | 自 CA 公開鍵の SPKI PEM。 |
@@ -429,7 +429,7 @@ CA を「秘密鍵 + 自 cert + 上位 chain」の 3 点で 1 つにまとめた
 `issueClientCert` の戻り値。発行された client cert を「秘密鍵 + cert + 完全 chain」の 3 点で返す型。CA 用途は想定されないため、追加発行に使い回すことはできない (再 import すると `CertificateAuthority` にはなるが、`issueClientCert` が出力するのは leaf cert なので発行 issuer として機能しない)。verifier に提示する完成形 chain が `certChainPem` に入っている。
 
 | field | 型 | 意味 |
-|---|---|---|
+| --- | --- | --- |
 | `certPem` | `string` | client certificate の PEM。 |
 | `privateKeyPem` | `string` | client 秘密鍵の PKCS#8 PEM、非暗号化。 |
 | `publicKeyPem` | `string` | client 公開鍵の SPKI PEM。 |
@@ -443,7 +443,7 @@ CA を「秘密鍵 + 自 cert + 上位 chain」の 3 点で 1 つにまとめた
 `Subject` を構成する 1 entry。X.509 cert の Subject DN (Distinguished Name) は複数の attribute を順番に並べた構造で、その 1 つを `{ type, value }` で表現する。EdgCA は `CN=foo,O=Example` のような DN 文字列入力を受け付けず、必ずこの structured な配列で渡す設計。multi-valued RDN (1 つの RDN に複数 attribute) も非対応で、1 entry = 1 RDN。
 
 | field | 型 | 必須 | 意味と制約 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `type` | `SubjectAttributeType` | ✅ | attribute の種別。短縮名 (`CN`, `O`, `OU`, `C`, `ST`, `L`, `E`, `DC`, `SERIALNUMBER`, `STREET`, `POSTALCODE`, `TITLE`, `GIVENNAME`, `SURNAME`, `UID`) または dotted OID 文字列 (`1.2.3.4.5`)。未対応の短縮名・不正な OID は例外。 |
 | `value` | `string` | ✅ | attribute の値。OID に応じて string type を選択 (`C` → PrintableString、emailAddress → IA5String、他 → UTF8String)。短縮名と等価な dotted OID でも同じ規則。`C` の値が PrintableString として不正な場合は例外。emailAddress の値が IA5 (ASCII) として不正な場合も例外。 |
 
@@ -452,7 +452,7 @@ CA を「秘密鍵 + 自 cert + 上位 chain」の 3 点で 1 つにまとめた
 `SerialNumber` は cert の serial number を呼び出し側で明示する時に使う union 型 alias (`bigint | number | string | Uint8Array`)。明示する場面は限られ、通常は省略して library の random 生成 (16-byte) に任せる。決定的な値を要求する監査要件、再現性が必要なテスト、外部システムが採番する serial を引き継ぐ場合などで指定する。入力型ごとの解釈は次のとおり。
 
 | 入力型 | 解釈 | 制約 |
-|---|---|---|
+| --- | --- | --- |
 | 省略 | 16-byte random、MSB を clear して正値化 | — |
 | `bigint` | そのまま integer encode | DER encode 後 20 octet 以内 |
 | `number` | そのまま integer encode | 同上 |
