@@ -3636,6 +3636,218 @@ describe("verifyClientCertificateIssuedBy", () => {
   });
 });
 
+describe("verifyClientCertificateIssuedBy validity option", () => {
+  it("returns true when current time is inside the supplied window and identity checks pass", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const client = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
+
+    const now = Date.now();
+    expect(
+      await verifyClientCertificateIssuedBy({
+        ca: root,
+        certPem: client.certPem,
+        validity: {
+          notBefore: now - 1000,
+          notAfter: now + 1000,
+          now
+        }
+      })
+    ).toBe(true);
+  });
+
+  it("returns false when now is after notAfter", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const client = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
+
+    expect(
+      await verifyClientCertificateIssuedBy({
+        ca: root,
+        certPem: client.certPem,
+        validity: {
+          notBefore: new Date("2020-01-01T00:00:00Z"),
+          notAfter: new Date("2020-12-31T23:59:59Z"),
+          now: new Date("2021-06-01T00:00:00Z")
+        }
+      })
+    ).toBe(false);
+  });
+
+  it("returns false when now is before notBefore", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const client = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
+
+    expect(
+      await verifyClientCertificateIssuedBy({
+        ca: root,
+        certPem: client.certPem,
+        validity: {
+          notBefore: new Date("2030-01-01T00:00:00Z"),
+          notAfter: new Date("2030-12-31T23:59:59Z"),
+          now: new Date("2025-06-01T00:00:00Z")
+        }
+      })
+    ).toBe(false);
+  });
+
+  it("falls back to Date.now() when now is omitted", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const client = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
+
+    const realDateNow = Date.now;
+    const fixedNow = Date.parse("2099-01-01T00:00:00Z");
+    Date.now = () => fixedNow;
+    try {
+      // No now provided → uses Date.now() which we've stubbed to 2099.
+      // Window 2020 → 2021 is in the past, so this must be false.
+      expect(
+        await verifyClientCertificateIssuedBy({
+          ca: root,
+          certPem: client.certPem,
+          validity: {
+            notBefore: new Date("2020-01-01T00:00:00Z"),
+            notAfter: new Date("2021-01-01T00:00:00Z")
+          }
+        })
+      ).toBe(false);
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+
+  it("still rejects identity-mismatched cert when validity passes", async () => {
+    const realCa = await createRootCA({ subject: rootSubject, days: 3650 });
+    const otherCa = await createRootCA({
+      subject: [{ type: "CN", value: "other-root" }],
+      days: 3650
+    });
+    const client = await issueClientCert({ ca: realCa, subject: clientSubject, days: 30 });
+
+    const now = Date.now();
+    expect(
+      await verifyClientCertificateIssuedBy({
+        ca: otherCa,
+        certPem: client.certPem,
+        validity: { notBefore: now - 1000, notAfter: now + 1000, now }
+      })
+    ).toBe(false);
+  });
+
+  it("short-circuits to false on expired window without parsing the cert", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+
+    // certPem is garbage. With validity option failing first, we expect false
+    // (not a parse error) — proves the validity gate runs before pemToDerWithLabel.
+    expect(
+      await verifyClientCertificateIssuedBy({
+        ca: root,
+        certPem: "this is not a pem block at all",
+        validity: {
+          notBefore: new Date("2020-01-01T00:00:00Z"),
+          notAfter: new Date("2020-12-31T23:59:59Z"),
+          now: new Date("2099-01-01T00:00:00Z")
+        }
+      })
+    ).toBe(false);
+  });
+
+  it("throws when notBefore is greater than notAfter", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const client = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
+
+    await expect(
+      verifyClientCertificateIssuedBy({
+        ca: root,
+        certPem: client.certPem,
+        validity: {
+          notBefore: new Date("2030-01-01T00:00:00Z"),
+          notAfter: new Date("2020-01-01T00:00:00Z")
+        }
+      })
+    ).rejects.toThrow(/notBefore/);
+  });
+
+  it("throws on non-finite validity values (NaN Date or Infinity)", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const client = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
+
+    await expect(
+      verifyClientCertificateIssuedBy({
+        ca: root,
+        certPem: client.certPem,
+        validity: {
+          notBefore: new Date("not a real date"),
+          notAfter: Date.now() + 1000
+        }
+      })
+    ).rejects.toThrow(/finite/);
+
+    await expect(
+      verifyClientCertificateIssuedBy({
+        ca: root,
+        certPem: client.certPem,
+        validity: {
+          notBefore: 0,
+          notAfter: Number.POSITIVE_INFINITY
+        }
+      })
+    ).rejects.toThrow(/finite/);
+
+    await expect(
+      verifyClientCertificateIssuedBy({
+        ca: root,
+        certPem: client.certPem,
+        validity: {
+          notBefore: 0,
+          notAfter: Date.now() + 1000,
+          now: Number.NaN
+        }
+      })
+    ).rejects.toThrow(/finite/);
+  });
+
+  it("accepts Date and epoch-number values interchangeably", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const client = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
+    const now = Date.now();
+
+    expect(
+      await verifyClientCertificateIssuedBy({
+        ca: root,
+        certPem: client.certPem,
+        validity: { notBefore: new Date(now - 1000), notAfter: now + 1000, now: new Date(now) }
+      })
+    ).toBe(true);
+    expect(
+      await verifyClientCertificateIssuedBy({
+        ca: root,
+        certPem: client.certPem,
+        validity: { notBefore: now - 1000, notAfter: new Date(now + 1000), now }
+      })
+    ).toBe(true);
+  });
+
+  it("treats now exactly equal to notBefore or notAfter as inside the window", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const client = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
+    const t = 1_700_000_000_000;
+
+    expect(
+      await verifyClientCertificateIssuedBy({
+        ca: root,
+        certPem: client.certPem,
+        validity: { notBefore: t, notAfter: t + 1000, now: t }
+      })
+    ).toBe(true);
+    expect(
+      await verifyClientCertificateIssuedBy({
+        ca: root,
+        certPem: client.certPem,
+        validity: { notBefore: t, notAfter: t + 1000, now: t + 1000 }
+      })
+    ).toBe(true);
+  });
+});
+
 describe("subject encodes repeated attribute types in order", () => {
   it("emits two OU RDNs in input order without deduplication", async () => {
     const root = await createRootCA({

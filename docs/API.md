@@ -210,23 +210,40 @@ intermediate CA を再 import する場合は、`issuerChainPem` に parent chai
 function verifyClientCertificateIssuedBy(options: {
   ca: CertificateAuthority;
   certPem: string;
+  validity?: {
+    notBefore: Date | number;
+    notAfter: Date | number;
+    now?: Date | number;
+  };
 }): Promise<boolean>;
 ```
 
-判定は次の 3 つすべて成立で `true`、いずれかが不成立で `false` を return します。
+判定は次のすべてが成立で `true`、いずれかが不成立で `false` を return します。
 
+- (`validity` 指定時) `validity.notBefore ≤ now ≤ validity.notAfter` が成立する。
 - `certPem` の issuer DN が `ca` の subject DN と完全一致する。
 - `certPem` の Authority Key Identifier が `ca` の Subject Key Identifier と完全一致する。`certPem` が AKI を持たない場合は `false`。
 - `certPem` の signature を `ca.publicKey` で verify できる (ECDSA P-256 / SHA-256)。
 
 PEM や DER として parse 不能な入力は `Error` を投げます (CA 不一致 = `false`、入力破損 = throw、と扱いを分ける)。
 
-この関数は **発行 issuer 1 本に対する identity 確認** だけを行います。次は対象外です。
+#### `validity` option
 
-- `notBefore` / `notAfter` の時刻 check。値は `cf.tlsClientAuth.certNotBefore` / `certNotAfter` で application に露出されているため、application 側で 2 行比較すれば足りる。
+省略可能な時刻有効性 check。指定された場合のみ評価します。値はすべて呼び出し側が `cf.tlsClientAuth.certNotBefore` / `certNotAfter` から `Date` または epoch milliseconds に変換して渡します (library は cert の `notBefore` / `notAfter` field を参照しません)。
+
+| field | 型 | 必須 | default | 意味と制約 |
+|---|---|---|---|---|
+| `notBefore` | `Date \| number` | ✅ | — | この時刻より前は invalid。`Date` または epoch ms。`NaN` / 非有限値は例外。 |
+| `notAfter` | `Date \| number` | ✅ | — | この時刻より後は invalid。同上の制約。`notBefore > notAfter` は例外。 |
+| `now` | `Date \| number` | — | `Date.now()` | 比較する現在時刻。テスト・past-time 検証用に明示できる。 |
+
+時刻ウィンドウ外なら identity check を実行せず即 `false` を返します (cert parse・signature verify を skip して expensive な crypto を節約)。`validity` を省略した場合は時刻判定をしません。
+
+この関数は **発行 issuer 1 本に対する identity 確認 + (任意で) 時刻有効性** だけを行います。次は対象外です。
+
 - chain 遡及 (intermediate を介して root から発行された leaf を root に対して verify するなど)。`ca` には**直接の発行者** (root から直接発行なら root、intermediate 経由なら intermediate) を渡してください。
 - revocation check (CRL / OCSP)。
-- `cf.tlsClientAuth` 型からの自動抽出。RFC 9440 形式 (`:base64:`) からの decode は呼び出し側で行います。
+- `cf.tlsClientAuth` 型からの自動抽出。RFC 9440 形式 (`:base64:`) からの decode と、`certNotBefore` / `certNotAfter` 文字列の `Date` への parse は呼び出し側で行います。
 
 複数 CA を運用していて「どれが発行したか」を知りたい場合は、呼び出し側で CA 配列を回してください。
 
@@ -409,6 +426,6 @@ EdgCA は次を提供しません。
 - server certificate 発行。
 - 公開 certificate parsing API。
 - certificate chain validation (chain 遡及・PKI path building)。`verifyClientCertificateIssuedBy` は直接の発行者 1 本に対する identity 確認に限定。
-- 証明書の時刻検証 (`notBefore` / `notAfter`)。`cf.tlsClientAuth.certNotBefore` / `certNotAfter` で application が直接比較可能。
+- cert からの時刻 field の抽出。`verifyClientCertificateIssuedBy` の `validity` option は時刻 check を提供するが、`notBefore` / `notAfter` は呼び出し側が外から渡す (`cf.tlsClientAuth.certNotBefore` / `certNotAfter` を `Date` に変換するのは application 側)。
 - CRL、OCSP、失効 DB、失効確認。
 - 鍵の保管、暗号化保存、Cloudflare storage 連携。

@@ -8,7 +8,7 @@ EdgCA が**提供する**唯一の検証 API は `verifyClientCertificateIssuedB
 
 - **certificate chain validation**。`importCertificateAuthority` の `issuerChainPem` が `certPem` を実際に発行したかの cryptographic 検証はしない。caller が嘘の chain を渡せば嘘の chain が出力される。「検証できるから検証すべき」は採用しない。
 - **chain 遡及・PKI path building**。`verifyClientCertificateIssuedBy` も**直接の発行者 1 本**に対する判定のみ。intermediate を介して root から発行された leaf を root に対して verify する用途は対象外。
-- **時刻検証 (`notBefore` / `notAfter`)**。値は `cf.tlsClientAuth.certNotBefore` / `certNotAfter` で application に露出されているため、application 側で 2 行比較すれば足りる。library 関数化はしない。
+- **cert 自身からの時刻 field 抽出**。`verifyClientCertificateIssuedBy` の `validity` option は時刻 check を提供するが、`notBefore` / `notAfter` の値は**呼び出し側が外から渡す** (cert は parse しない)。`cf.tlsClientAuth.certNotBefore` / `certNotAfter` の文字列を `Date` に変換するのは application の責務。library 内に X.509 テキスト形式 (`"Dec  4 23:59:59 2025 GMT"` 等) や DER の `UTCTime` / `GeneralizedTime` の parser は持たない。
 - **CRL / OCSP / 失効 DB / 失効確認**。
 - **`certificateToPem(der)` での DER 妥当性検査**。先頭 byte が `0x30` (SEQUENCE) かどうかの shallow check も実装しない。本物の cert との区別はつかず、誤った安心感を与えるだけ。本気でやるなら `parseCertificateDer` 全実行が必要で、encoder の責務を超える。低 level encoder のまま。
 - **import した cert の RFC 適合検査**。期限切れ・壊れた署名・想定外 extension・複数 basicConstraints 等を含む `certPem` を渡しても error にはせず、入力に従ってそのまま発行する。

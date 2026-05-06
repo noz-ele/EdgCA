@@ -104,7 +104,7 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 - root CA 作成。
 - intermediate CA 発行。
 - mTLS client certificate 発行。
-- 自己 CA からの発行かを判定する identity 確認 API (`verifyClientCertificateIssuedBy`)。
+- 自己 CA からの発行かを判定する identity 確認 API (`verifyClientCertificateIssuedBy`、任意の時刻有効性 check 付き)。
 - PEM/DER helper。
 - Basic Constraints、Key Usage、Extended Key Usage、Subject Alternative Name、SKI、AKI。
 
@@ -112,7 +112,7 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 
 - server certificate 発行。
 - 公開 chain validation API。
-- 証明書の時刻検証 (`cf.tlsClientAuth.certNotBefore` / `certNotAfter` で application が直接比較可能)。
+- cert からの時刻 field の抽出。`verifyClientCertificateIssuedBy` の `validity` option は時刻 check 自体は提供するが、`notBefore` / `notAfter` 値は呼び出し側が `cf.tlsClientAuth` から渡す。
 - CRL、OCSP、失効 DB、失効確認。
 - 鍵の保管、暗号化保存、ローテーション永続化、KV/D1/R2/Secrets 連携。
 - RSA、EdDSA、別 elliptic curve。

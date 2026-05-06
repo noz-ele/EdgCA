@@ -8,7 +8,8 @@ export { pemToDer, certificateToPem } from "./pem.js";
 export { privateKeyToPem, publicKeyToPem } from "./crypto.js";
 export {
   verifyClientCertificateIssuedBy,
-  type VerifyClientCertificateIssuedByOptions
+  type VerifyClientCertificateIssuedByOptions,
+  type VerifyClientCertificateValidity
 } from "./verify.js";
 export type {
   CertificateAuthority,
