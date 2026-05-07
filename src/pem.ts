@@ -6,14 +6,6 @@ export function certificateToPem(der: Uint8Array): string {
   return encodePem("CERTIFICATE", der);
 }
 
-export function privateKeyDerToPem(der: Uint8Array): string {
-  return encodePem("PRIVATE KEY", der);
-}
-
-export function publicKeyDerToPem(der: Uint8Array): string {
-  return encodePem("PUBLIC KEY", der);
-}
-
 export function pemToDer(pem: string): Uint8Array {
   const match = /-----BEGIN (.+?)-----([\s\S]*?)-----END \1-----/.exec(pem);
   if (!match || !match[2]) {

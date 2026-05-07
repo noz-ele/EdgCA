@@ -1,6 +1,5 @@
 import { arrayBufferFromBytes, concatBytes } from "./bytes.js";
 import { integer, readChildren, readElement, readSequenceChildren, sequence, TAG } from "./der.js";
-import { pemToDerWithLabel, privateKeyDerToPem, publicKeyDerToPem } from "./pem.js";
 
 const EC_ALGORITHM: EcKeyGenParams = {
   name: "ECDSA",
@@ -53,31 +52,8 @@ export async function keyIdentifierFromSpki(spki: Uint8Array): Promise<Uint8Arra
   return digestSha1(subjectPublicKey.value.subarray(1));
 }
 
-export async function privateKeyToPem(key: CryptoKey): Promise<string> {
-  const der = new Uint8Array(await crypto.subtle.exportKey("pkcs8", key));
-  return privateKeyDerToPem(der);
-}
-
-export async function publicKeyToPem(key: CryptoKey): Promise<string> {
-  const der = new Uint8Array(await crypto.subtle.exportKey("spki", key));
-  return publicKeyDerToPem(der);
-}
-
 export async function exportSpki(key: CryptoKey): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.exportKey("spki", key));
-}
-
-export async function importPrivateKeyPem(pem: string): Promise<CryptoKey> {
-  return crypto.subtle.importKey("pkcs8", arrayBufferFromBytes(pemToDerWithLabel(pem, "PRIVATE KEY")), EC_ALGORITHM, true, ["sign"]);
-}
-
-export async function keyPairFromPrivateKeyPem(pem: string): Promise<CryptoKeyPair> {
-  const privateKey = await importPrivateKeyPem(pem);
-  const jwk = await crypto.subtle.exportKey("jwk", privateKey);
-  delete jwk.d;
-  jwk.key_ops = ["verify"];
-  const publicKey = await crypto.subtle.importKey("jwk", jwk, EC_ALGORITHM, true, ["verify"]);
-  return { privateKey, publicKey };
 }
 
 export async function importPublicKeySpki(spki: Uint8Array): Promise<CryptoKey> {

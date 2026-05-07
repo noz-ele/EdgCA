@@ -12,9 +12,7 @@ import {
   importCertificateAuthority,
   verifyClientCertificateIssuedBy,
   certificateToPem,
-  pemToDer,
-  privateKeyToPem,
-  publicKeyToPem
+  pemToDer
 } from "@noz-ele/edgca";
 ```
 
@@ -61,8 +59,6 @@ DN 文字列入力と multi-valued RDN は対応しません。
 ```ts
 interface CertificateAuthority {
   certPem: string;
-  privateKeyPem: string;
-  publicKeyPem: string;
   certDer: Uint8Array;
   privateKey: CryptoKey;
   publicKey: CryptoKey;
@@ -74,13 +70,13 @@ interface CertificateAuthority {
 
 EdgCA が扱う CA 階層は最大で `root CA -> intermediate CA -> client certificate` です。intermediate CA からさらに intermediate CA を発行する chain は対象外です。
 
+秘密鍵は `CryptoKey` として返されます。library は秘密鍵の string 表現 (PEM 等) を返しません。永続化が必要な場合は呼び出し側で `crypto.subtle.exportKey("pkcs8", privateKey)` などを行ってください (`privateKey` が extractable である必要があります)。
+
 ### `IssuedClientCertificate`
 
 ```ts
 interface IssuedClientCertificate {
   certPem: string;
-  privateKeyPem: string;
-  publicKeyPem: string;
   certDer: Uint8Array;
   privateKey: CryptoKey;
   publicKey: CryptoKey;
@@ -113,7 +109,7 @@ function createRootCA(options: {
   notBefore?: Date;
   serialNumber?: SerialNumber;
   pathLenConstraint?: number;
-  privateKeyPem?: string;
+  keyPair?: CryptoKeyPair;
 }): Promise<CertificateAuthority>;
 ```
 
@@ -128,7 +124,7 @@ root certificate は self-signed です。返却値の `issuerChainPem` は `""`
 
 `pathLenConstraint` 省略時は `1` です。指定できる値は `0` または `1` です。`0` の root CA は client certificate だけを発行でき、intermediate CA は発行できません。
 
-`privateKeyPem` を渡すと、その秘密鍵で root CA を発行します。鍵管理を呼び出し側に寄せるため、長期保管されている鍵を渡す利用形態が推奨です。省略時は内部で鍵を生成します (テスト・PoC 用途)。形式は PKCS#8 PEM (P-256 ECDSA、非暗号化)。
+`keyPair` を渡すと、その鍵ペアで root CA を発行します。鍵管理を呼び出し側に寄せるため、長期保管されている鍵を WebCrypto `importKey` で `CryptoKey` 化してから渡す利用形態が推奨です。省略時は内部で P-256 ECDSA 鍵を生成します (テスト・PoC 用途)。`privateKey` の usages に `"sign"`、`publicKey` の usages に `"verify"` が含まれている必要があります。
 
 ### `issueIntermediateCA(options)`
 
@@ -142,7 +138,7 @@ function issueIntermediateCA(options: {
   notBefore?: Date;
   serialNumber?: SerialNumber;
   pathLenConstraint?: number;
-  privateKeyPem?: string;
+  keyPair?: CryptoKeyPair;
 }): Promise<CertificateAuthority>;
 ```
 
@@ -159,7 +155,7 @@ issuer root CA が `pathLenConstraint=0` の場合、この関数は例外を投
 
 返却される CA の `issuerChainPem` には parent chain が保存されます。
 
-`privateKeyPem` を渡すと、その秘密鍵で intermediate CA を発行します。`createRootCA` と同じく、保管済みの鍵を渡す形が推奨です。省略時は内部で鍵を生成します。形式は PKCS#8 PEM (P-256 ECDSA、非暗号化)。
+`keyPair` を渡すと、その鍵ペアで intermediate CA を発行します。`createRootCA` と同じく、保管済みの鍵を `CryptoKey` 化してから渡す形が推奨です。省略時は内部で P-256 ECDSA 鍵を生成します。
 
 ### `issueClientCert(options)`
 
@@ -195,14 +191,16 @@ CA certificate と private key を import し、後続の発行に使える `Cer
 ```ts
 function importCertificateAuthority(options: {
   certPem: string;
-  privateKeyPem: string;
+  privateKey: CryptoKey;
   issuerChainPem?: string;
 }): Promise<CertificateAuthority>;
 ```
 
-private key は certificate の public key と対応している必要があります。正しくない `certPem` (期限切れ・壊れた署名・想定外の extension など) を渡しても error にはならず、入力に従ってそのまま誤った証明書が発行される仕様です。返却値は `createRootCA()` や `issueIntermediateCA()` と同じ `CertificateAuthority` 形状です。
+`privateKey` は certificate の public key と対応している必要があります (sign/verify round trip で確認します)。正しくない `certPem` (期限切れ・壊れた署名・想定外の extension など) を渡しても error にはならず、入力に従ってそのまま誤った証明書が発行される仕様です。返却値は `createRootCA()` や `issueIntermediateCA()` と同じ `CertificateAuthority` 形状です。
 
 intermediate CA を再 import する場合は、`issuerChainPem` に parent chain を渡します。この chain は client certificate 発行時の `certChainPem` 構築に使われます。
+
+呼び出し側は永続化された PKCS#8 PEM などを `crypto.subtle.importKey("pkcs8", …, { name: "ECDSA", namedCurve: "P-256" }, extractable, ["sign"])` で `CryptoKey` 化してから渡してください。library は format 変換を行いません。
 
 ### `verifyClientCertificateIssuedBy(options)`
 
@@ -235,11 +233,11 @@ PEM や DER として parse 不能な入力は `Error` を投げます (CA 不�
 
 省略可能な時刻有効性 check。指定された場合のみ評価します。値はすべて呼び出し側が `cf.tlsClientAuth.certNotBefore` / `certNotAfter` から `Date` または epoch milliseconds に変換して渡します (library は cert の `notBefore` / `notAfter` field を参照しません)。
 
-| field | 型 | 必須 | default | 意味と制約 |
-| --- | --- | --- | --- | --- |
-| `notBefore` | `Date \| number` | ✅ | — | この時刻より前は invalid。`Date` または epoch ms。`NaN` / 非有限値は例外。 |
-| `notAfter` | `Date \| number` | ✅ | — | この時刻より後は invalid。同上の制約。`notBefore > notAfter` は例外。 |
-| `now` | `Date \| number` | — | `Date.now()` | 比較する現在時刻。テスト・past-time 検証用に明示できる。 |
+| field      | 型               | 必須 | default      | 意味と制約                                                                                                |
+| ---------- | ---------------- | ---- | ------------ | --------------------------------------------------------------------------------------------------------- |
+| `notBefore` | `Date \| number` | ✅   | —            | この時刻より前は invalid。`Date` または epoch ms。`NaN` / 非有限値は例外。                                  |
+| `notAfter`  | `Date \| number` | ✅   | —            | この時刻より後は invalid。同上の制約。`notBefore > notAfter` は例外。                                       |
+| `now`       | `Date \| number` | —    | `Date.now()` | 比較する現在時刻。テスト・past-time 検証用に明示できる。                                                    |
 
 時刻ウィンドウ外なら identity check を実行せず即 `false` を返します (cert parse・signature verify を skip して expensive な crypto を節約)。`validity` を省略した場合は時刻判定をしません。
 
@@ -304,24 +302,6 @@ function certificateToPem(der: Uint8Array): string;
 function pemToDer(pem: string): Uint8Array;
 ```
 
-### `privateKeyToPem(key)`
-
-private `CryptoKey` を PKCS#8 PEM として export します。
-
-```ts
-function privateKeyToPem(key: CryptoKey): Promise<string>;
-```
-
-対象 key は extractable である必要があります。
-
-### `publicKeyToPem(key)`
-
-public `CryptoKey` を SPKI PEM として export します。
-
-```ts
-function publicKeyToPem(key: CryptoKey): Promise<string>;
-```
-
 ## Errors
 
 EdgCA は invalid input や対象外操作に対して `Error` を投げます。
@@ -357,108 +337,104 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 
 #### `CreateRootCAOptions`
 
-`createRootCA` の引数。自己署名 root CA を 1 本作るための入力一式を表す。subject DN と有効期間が最低限必要で、配下に intermediate を置くか (`pathLenConstraint`) と既存秘密鍵の持ち込み (`privateKeyPem`) を任意で指定する。新規発行と再現発行 (持ち込み鍵) の両方を 1 つの interface で扱う。
+`createRootCA` の引数。自己署名 root CA を 1 本作るための入力一式を表す。subject DN と有効期間が最低限必要で、配下に intermediate を置くか (`pathLenConstraint`) と既存鍵の持ち込み (`keyPair`) を任意で指定する。新規発行と再現発行 (持ち込み鍵) の両方を 1 つの interface で扱う。
 
-| field | 型 | 必須 | default | 意味と制約 |
-| --- | --- | --- | --- | --- |
-| `subject` | `Subject` | ✅ | — | root CA の subject DN。配列順序は保持。self-signed のため issuer DN にも同値が入る。詳細は § `Subject` 参照。空配列は不可。 |
-| `days` | `number` | ✅ | — | `notBefore` からの有効日数。正の有限数のみ。1 日 = `86_400_000ms` の単純加算 (閏秒なし)。上限の check なし。 |
-| `notBefore` | `Date` | — | 呼び出し時刻 (`new Date()`) | validity の開始時刻。1950–2049 は `UTCTime`、それ以外は `GeneralizedTime` で encode。 |
-| `serialNumber` | `SerialNumber` | — | CSPRNG 由来 16-byte random (正値、MSB cleared、CAB BR 7.1 の ≥64 bit entropy 要件を満たす) | 発行 cert を issuer 内で識別する integer の**呼び出し側明示指定**。通常は省略して default の random に任せ (Workers の stateless 性と業界標準準拠を両立)、監査・テスト再現性・外部システムからの採番引き継ぎ等で決定的な値が要る時だけ渡す。入力型は § `SerialNumber` 参照。DER encode 後 20 octet を超えると例外。 |
-| `pathLenConstraint` | `number` | — | `1` | root CA の下に作れる intermediate の段数。`0` または `1` のみ許容。`0` の root は intermediate を発行できず client cert 専用になる。 |
-| `privateKeyPem` | `string` | — | 内部生成 (P-256 ECDSA) | 持ち込み秘密鍵。形式は PKCS#8 PEM、非暗号化。長期保管されている鍵を渡すのが推奨ルート。省略時は WebCrypto で生成 (テスト・PoC 用途の簡便動作)。 |
+| field               | 型               | 必須 | default                                                                                       | 意味と制約                                                                                                                                                                                                                                                                                       |
+| ------------------- | ---------------- | ---- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `subject`           | `Subject`        | ✅   | —                                                                                             | root CA の subject DN。配列順序は保持。self-signed のため issuer DN にも同値が入る。詳細は § `Subject` 参照。空配列は不可。                                                                                                                                                                       |
+| `days`              | `number`         | ✅   | —                                                                                             | `notBefore` からの有効日数。正の有限数のみ。1 日 = `86_400_000ms` の単純加算 (閏秒なし)。上限の check なし。                                                                                                                                                                                       |
+| `notBefore`         | `Date`           | —    | 呼び出し時刻 (`new Date()`)                                                                    | validity の開始時刻。1950–2049 は `UTCTime`、それ以外は `GeneralizedTime` で encode。                                                                                                                                                                                                              |
+| `serialNumber`      | `SerialNumber`   | —    | CSPRNG 由来 16-byte random (正値、MSB cleared、CAB BR 7.1 の ≥64 bit entropy 要件を満たす) | 発行 cert を issuer 内で識別する integer の**呼び出し側明示指定**。通常は省略して default の random に任せ (Workers の stateless 性と業界標準準拠を両立)、監査・テスト再現性・外部システムからの採番引き継ぎ等で決定的な値が要る時だけ渡す。入力型は § `SerialNumber` 参照。DER encode 後 20 octet を超えると例外。 |
+| `pathLenConstraint` | `number`         | —    | `1`                                                                                           | root CA の下に作れる intermediate の段数。`0` または `1` のみ許容。`0` の root は intermediate を発行できず client cert 専用になる。                                                                                                                                                                |
+| `keyPair`           | `CryptoKeyPair` | —    | 内部生成 (P-256 ECDSA、`extractable: true`)                                                  | 持ち込み鍵ペア。`privateKey.usages` に `"sign"`、`publicKey.usages` に `"verify"` が含まれている必要がある。`extractable` は呼び出し側の選択で、library は `subtle.sign` / `subtle.exportKey("spki", publicKey)` のみ使う (private 側は extract 不要)。省略時は WebCrypto で生成。                |
 
 #### `IssueIntermediateCAOptions`
 
 `issueIntermediateCA` の引数。既存 root CA から intermediate CA を 1 本発行するための入力。`CreateRootCAOptions` との違いは、親となる root を `ca` で渡す点と、intermediate のさらに下に intermediate を置けない設計のため `pathLenConstraint` が実質 `0` 固定である点。
 
-| field | 型 | 必須 | default | 意味と制約 |
-| --- | --- | --- | --- | --- |
-| `ca` | `CertificateAuthority` | ✅ | — | 親となる root CA。intermediate を親にすると例外。`pathLenConstraint=0` の root を親にしても例外。`isCA=false` または `keyCertSign` なしの cert を渡しても例外。 |
-| `subject` | `Subject` | ✅ | — | 発行する intermediate CA の subject DN。 |
-| `days` | `number` | ✅ | — | `CreateRootCAOptions.days` と同じ。加えて、issuer の `notAfter` を超える指定をしても library は止めない (verifier 側で reject される cert ができる)。 |
-| `notBefore` | `Date` | — | 呼び出し時刻 | `CreateRootCAOptions.notBefore` と同じ。 |
-| `serialNumber` | `SerialNumber` | — | CSPRNG 由来 16-byte random | `CreateRootCAOptions.serialNumber` と同じ。 |
-| `pathLenConstraint` | `number` | — | `0` | 発行される intermediate の `pathLenConstraint` は常に `0`。明示する場合は `0` のみ許容、`1` 以上は例外。 |
-| `privateKeyPem` | `string` | — | 内部生成 | `CreateRootCAOptions.privateKeyPem` と同じ (intermediate CA の鍵を渡す)。 |
+| field               | 型                     | 必須 | default                       | 意味と制約                                                                                                                                                                                       |
+| ------------------- | ---------------------- | ---- | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ca`                | `CertificateAuthority` | ✅   | —                             | 親となる root CA。intermediate を親にすると例外。`pathLenConstraint=0` の root を親にしても例外。`isCA=false` または `keyCertSign` なしの cert を渡しても例外。                                  |
+| `subject`           | `Subject`              | ✅   | —                             | 発行する intermediate CA の subject DN。                                                                                                                                                          |
+| `days`              | `number`               | ✅   | —                             | `CreateRootCAOptions.days` と同じ。加えて、issuer の `notAfter` を超える指定をしても library は止めない (verifier 側で reject される cert ができる)。                                              |
+| `notBefore`         | `Date`                 | —    | 呼び出し時刻                  | `CreateRootCAOptions.notBefore` と同じ。                                                                                                                                                          |
+| `serialNumber`      | `SerialNumber`         | —    | CSPRNG 由来 16-byte random | `CreateRootCAOptions.serialNumber` と同じ。                                                                                                                                                       |
+| `pathLenConstraint` | `number`               | —    | `0`                           | 発行される intermediate の `pathLenConstraint` は常に `0`。明示する場合は `0` のみ許容、`1` 以上は例外。                                                                                          |
+| `keyPair`           | `CryptoKeyPair`       | —    | 内部生成                       | `CreateRootCAOptions.keyPair` と同じ (intermediate CA の鍵ペアを渡す)。                                                                                                                            |
 
 #### `IssueClientCertOptions`
 
-`issueClientCert` の引数。mTLS 用 client certificate を 1 本発行するための入力。`ca` で issuer を指定する (root / intermediate のどちらでも可)。client cert の秘密鍵は短命利用を前提に常に内部生成されるため、CA 用 options と違って `privateKeyPem` を受け付けない。SAN は任意で、未指定なら extension 自体が省略される。
+`issueClientCert` の引数。mTLS 用 client certificate を 1 本発行するための入力。`ca` で issuer を指定する (root / intermediate のどちらでも可)。client cert の鍵は短命利用を前提に常に内部生成されるため、CA 用 options と違って `keyPair` を受け付けない。SAN は任意で、未指定なら extension 自体が省略される。
 
-| field | 型 | 必須 | default | 意味と制約 |
-| --- | --- | --- | --- | --- |
-| `ca` | `CertificateAuthority` | ✅ | — | 発行 issuer。root または intermediate どちらでも可。`isCA=false` または `keyCertSign` なしの cert を渡すと例外。 |
-| `subject` | `Subject` | ✅ | — | 発行する client cert の subject DN。 |
-| `days` | `number` | ✅ | — | `CreateRootCAOptions.days` と同じ。 |
-| `notBefore` | `Date` | — | 呼び出し時刻 | `CreateRootCAOptions.notBefore` と同じ。 |
-| `serialNumber` | `SerialNumber` | — | CSPRNG 由来 16-byte random | `CreateRootCAOptions.serialNumber` と同じ。 |
-| `dnsNames` | `string[]` | — | `undefined` | SAN dNSName。指定時のみ SAN extension が出力される。RFC 1035 §2.3.1 preferred name syntax: 各 label は `[A-Za-z0-9]` で始終端し内部に `-` 可、label 長 ≤63 chars、全長 ≤253 chars、先頭の `*.` ワイルドカード可。違反は例外。 |
-| `ipAddresses` | `string[]` | — | `undefined` | SAN iPAddress。IPv4 / IPv6 文字列。`dnsNames` と併用可。両者未指定なら SAN extension 自体が省略される。 |
+| field          | 型                     | 必須 | default                       | 意味と制約                                                                                                                                                                                                       |
+| -------------- | ---------------------- | ---- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ca`           | `CertificateAuthority` | ✅   | —                             | 発行 issuer。root または intermediate どちらでも可。`isCA=false` または `keyCertSign` なしの cert を渡すと例外。                                                                                                  |
+| `subject`      | `Subject`              | ✅   | —                             | 発行する client cert の subject DN。                                                                                                                                                                              |
+| `days`         | `number`               | ✅   | —                             | `CreateRootCAOptions.days` と同じ。                                                                                                                                                                              |
+| `notBefore`    | `Date`                 | —    | 呼び出し時刻                  | `CreateRootCAOptions.notBefore` と同じ。                                                                                                                                                                          |
+| `serialNumber` | `SerialNumber`         | —    | CSPRNG 由来 16-byte random | `CreateRootCAOptions.serialNumber` と同じ。                                                                                                                                                                       |
+| `dnsNames`     | `string[]`             | —    | `undefined`                   | SAN dNSName。指定時のみ SAN extension が出力される。RFC 1035 §2.3.1 preferred name syntax: 各 label は `[A-Za-z0-9]` で始終端し内部に `-` 可、label 長 ≤63 chars、全長 ≤253 chars、先頭の `*.` ワイルドカード可。違反は例外。 |
+| `ipAddresses`  | `string[]`             | —    | `undefined`                   | SAN iPAddress。IPv4 / IPv6 文字列。`dnsNames` と併用可。両者未指定なら SAN extension 自体が省略される。                                                                                                          |
 
-`issueClientCert` は client cert の秘密鍵を**常に内部生成**するため、`privateKeyPem` option はない。client cert の鍵は ephemeral 想定。
+`issueClientCert` は client cert の鍵を**常に内部生成**するため、`keyPair` option はない。client cert の鍵は ephemeral 想定。
 
 #### `ImportCertificateAuthorityOptions`
 
-`importCertificateAuthority` の引数。永続化された CA 情報 (cert PEM + 秘密鍵 PEM、必要なら親 chain) を再構成して `CertificateAuthority` instance に戻すための入力。新規 CA を作るのではなく、保存済み CA を Workers の起動時に読み込んで以降の発行に使う運用で利用する。
+`importCertificateAuthority` の引数。永続化された CA 情報 (cert PEM + 秘密鍵 `CryptoKey`、必要なら親 chain) を再構成して `CertificateAuthority` instance に戻すための入力。新規 CA を作るのではなく、保存済み CA を Workers の起動時に読み込んで以降の発行に使う運用で利用する。
 
-| field | 型 | 必須 | default | 意味と制約 |
-| --- | --- | --- | --- | --- |
-| `certPem` | `string` | ✅ | — | import する CA certificate PEM。先頭の `BEGIN CERTIFICATE` block を読む。 |
-| `privateKeyPem` | `string` | ✅ | — | `certPem` に対応する PKCS#8 PEM 秘密鍵 (非暗号化)。public key と sign/verify で一致確認する。一致しない場合は例外。 |
-| `issuerChainPem` | `string` | — | `""` (空) | import 対象が intermediate CA の時、その親 chain の PEM。client cert 発行時の `certChainPem` 構築に使われる。複数 `CERTIFICATE` block を改行で連結して渡す。空文字列の場合 root として扱われる。 |
+| field             | 型          | 必須 | default     | 意味と制約                                                                                                                                                                                                       |
+| ----------------- | ----------- | ---- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `certPem`         | `string`    | ✅   | —           | import する CA certificate PEM。先頭の `BEGIN CERTIFICATE` block を読む。                                                                                                                                       |
+| `privateKey`      | `CryptoKey` | ✅   | —           | `certPem` に対応する private `CryptoKey` (ECDSA P-256、`["sign"]` 用途)。public key と sign/verify で一致確認する。一致しない場合は例外。`extractable` は呼び出し側の選択。format 変換 (PEM → CryptoKey 等) は呼び出し側で行う。 |
+| `issuerChainPem`  | `string`    | —    | `""` (空)   | import 対象が intermediate CA の時、その親 chain の PEM。client cert 発行時の `certChainPem` 構築に使われる。複数 `CERTIFICATE` block を改行で連結して渡す。空文字列の場合 root として扱われる。                            |
 
 ### Results
 
 #### `CertificateAuthority`
 
-CA を「秘密鍵 + 自 cert + 上位 chain」の 3 点で 1 つにまとめた instance 型。`createRootCA` / `issueIntermediateCA` / `importCertificateAuthority` の戻り値で、そのまま `issueIntermediateCA` / `issueClientCert` の `ca` 引数に渡せる。発行関数が必要とする状態をすべて 1 つに束ねたハンドルとして扱う。永続化する時は `certPem` / `privateKeyPem` / `issuerChainPem` の 3 つを保存し、復元時は `importCertificateAuthority` に渡す。
+CA を「秘密鍵 + 自 cert + 上位 chain」の 3 点で 1 つにまとめた instance 型。`createRootCA` / `issueIntermediateCA` / `importCertificateAuthority` の戻り値で、そのまま `issueIntermediateCA` / `issueClientCert` の `ca` 引数に渡せる。発行関数が必要とする状態をすべて 1 つに束ねたハンドルとして扱う。永続化する時は `certPem` / `privateKey` (caller 側で `subtle.exportKey` する) / `issuerChainPem` を保存し、復元時は再 import した `CryptoKey` と `certPem` を `importCertificateAuthority` に渡す。
 
-| field | 型 | 意味 |
-| --- | --- | --- |
-| `certPem` | `string` | 自 CA certificate の PEM (`CERTIFICATE` block)。 |
-| `privateKeyPem` | `string` | 自 CA 秘密鍵の PKCS#8 PEM、非暗号化。 |
-| `publicKeyPem` | `string` | 自 CA 公開鍵の SPKI PEM。 |
-| `certDer` | `Uint8Array` | 自 CA certificate の DER bytes。`certPem` を decode したものと等価。 |
-| `privateKey` | `CryptoKey` | WebCrypto `CryptoKey` instance。`["sign"]` 用途、extractable。 |
-| `publicKey` | `CryptoKey` | WebCrypto `CryptoKey` instance。`["verify"]` 用途。 |
-| `issuerChainPem` | `string` | 上位 CA chain の PEM。root CA では `""`。intermediate CA では root の PEM。複数 CA を含む場合は改行区切り。 |
+| field            | 型           | 意味                                                                                |
+| ---------------- | ------------ | ----------------------------------------------------------------------------------- |
+| `certPem`        | `string`     | 自 CA certificate の PEM (`CERTIFICATE` block)。                                    |
+| `certDer`        | `Uint8Array` | 自 CA certificate の DER bytes。`certPem` を decode したものと等価。                  |
+| `privateKey`     | `CryptoKey`  | WebCrypto `CryptoKey` instance。`["sign"]` 用途。                                   |
+| `publicKey`      | `CryptoKey`  | WebCrypto `CryptoKey` instance。`["verify"]` 用途。                                 |
+| `issuerChainPem` | `string`     | 上位 CA chain の PEM。root CA では `""`。intermediate CA では root の PEM。複数 CA を含む場合は改行区切り。 |
 
 #### `IssuedClientCertificate`
 
 `issueClientCert` の戻り値。発行された client cert を「秘密鍵 + cert + 完全 chain」の 3 点で返す型。CA 用途は想定されないため、追加発行に使い回すことはできない (再 import すると `CertificateAuthority` にはなるが、`issueClientCert` が出力するのは leaf cert なので発行 issuer として機能しない)。verifier に提示する完成形 chain が `certChainPem` に入っている。
 
-| field | 型 | 意味 |
-| --- | --- | --- |
-| `certPem` | `string` | client certificate の PEM。 |
-| `privateKeyPem` | `string` | client 秘密鍵の PKCS#8 PEM、非暗号化。 |
-| `publicKeyPem` | `string` | client 公開鍵の SPKI PEM。 |
-| `certDer` | `Uint8Array` | client cert の DER bytes。 |
-| `privateKey` | `CryptoKey` | WebCrypto `CryptoKey`。`["sign"]` 用途、extractable。 |
-| `publicKey` | `CryptoKey` | WebCrypto `CryptoKey`。`["verify"]` 用途。 |
-| `certChainPem` | `string` | leaf + issuer + issuerChain を改行で連結した完全 chain。intermediate 経由で発行した場合は `client + intermediate + root` の順。 |
+| field           | 型           | 意味                                                                              |
+| --------------- | ------------ | --------------------------------------------------------------------------------- |
+| `certPem`       | `string`     | client certificate の PEM。                                                       |
+| `certDer`       | `Uint8Array` | client cert の DER bytes。                                                         |
+| `privateKey`    | `CryptoKey`  | WebCrypto `CryptoKey`。`["sign"]` 用途。                                          |
+| `publicKey`     | `CryptoKey`  | WebCrypto `CryptoKey`。`["verify"]` 用途。                                        |
+| `certChainPem`  | `string`     | leaf + issuer + issuerChain を改行で連結した完全 chain。intermediate 経由で発行した場合は `client + intermediate + root` の順。 |
 
 ### `SubjectAttribute`
 
 `Subject` を構成する 1 entry。X.509 cert の Subject DN (Distinguished Name) は複数の attribute を順番に並べた構造で、その 1 つを `{ type, value }` で表現する。EdgCA は `CN=foo,O=Example` のような DN 文字列入力を受け付けず、必ずこの structured な配列で渡す設計。multi-valued RDN (1 つの RDN に複数 attribute) も非対応で、1 entry = 1 RDN。
 
-| field | 型 | 必須 | 意味と制約 |
-| --- | --- | --- | --- |
-| `type` | `SubjectAttributeType` | ✅ | attribute の種別。短縮名 (`CN`, `O`, `OU`, `C`, `ST`, `L`, `E`, `DC`, `SERIALNUMBER`, `STREET`, `POSTALCODE`, `TITLE`, `GIVENNAME`, `SURNAME`, `UID`) または dotted OID 文字列 (`1.2.3.4.5`)。未対応の短縮名・不正な OID は例外。 |
-| `value` | `string` | ✅ | attribute の値。OID に応じて string type を選択 (`C` → PrintableString、emailAddress → IA5String、他 → UTF8String)。短縮名と等価な dotted OID でも同じ規則。`C` の値が PrintableString として不正な場合は例外。emailAddress の値が IA5 (ASCII) として不正な場合も例外。 |
+| field   | 型                     | 必須 | 意味と制約                                                                                                                                                                                                                                                                                                            |
+| ------- | ---------------------- | ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `type`  | `SubjectAttributeType` | ✅   | attribute の種別。短縮名 (`CN`, `O`, `OU`, `C`, `ST`, `L`, `E`, `DC`, `SERIALNUMBER`, `STREET`, `POSTALCODE`, `TITLE`, `GIVENNAME`, `SURNAME`, `UID`) または dotted OID 文字列 (`1.2.3.4.5`)。未対応の短縮名・不正な OID は例外。                                                                                          |
+| `value` | `string`               | ✅   | attribute の値。OID に応じて string type を選択 (`C` → PrintableString、emailAddress → IA5String、他 → UTF8String)。短縮名と等価な dotted OID でも同じ規則。`C` の値が PrintableString として不正な場合は例外。emailAddress の値が IA5 (ASCII) として不正な場合も例外。                                                            |
 
 ### `SerialNumber` 入力形式
 
 `SerialNumber` は cert の serial number を呼び出し側で明示する時に使う union 型 alias (`bigint | number | string | Uint8Array`)。明示する場面は限られ、通常は省略して library の random 生成 (16-byte) に任せる。決定的な値を要求する監査要件、再現性が必要なテスト、外部システムが採番する serial を引き継ぐ場合などで指定する。入力型ごとの解釈は次のとおり。
 
-| 入力型 | 解釈 | 制約 |
-| --- | --- | --- |
-| 省略 | 16-byte random、MSB を clear して正値化 | — |
-| `bigint` | そのまま integer encode | DER encode 後 20 octet 以内 |
-| `number` | そのまま integer encode | 同上 |
-| `string` (`/^\d+$/`) | decimal として `BigInt` 変換 | 同上 |
-| `string` (hex) | 偶数桁化して bytes として読む | 同上 |
-| `Uint8Array` | bytes 列として直接利用 | 1 byte 以上、20 byte 以内 |
+| 入力型                | 解釈                                       | 制約                            |
+| --------------------- | ------------------------------------------ | ------------------------------- |
+| 省略                  | 16-byte random、MSB を clear して正値化   | —                               |
+| `bigint`              | そのまま integer encode                   | DER encode 後 20 octet 以内     |
+| `number`              | そのまま integer encode                   | 同上                            |
+| `string` (`/^\d+$/`) | decimal として `BigInt` 変換              | 同上                            |
+| `string` (hex)        | 偶数桁化して bytes として読む             | 同上                            |
+| `Uint8Array`          | bytes 列として直接利用                    | 1 byte 以上、20 byte 以内       |
 
 ## Non-Goals
 
@@ -470,3 +446,4 @@ EdgCA は次を提供しません。
 - cert からの時刻 field の抽出。`verifyClientCertificateIssuedBy` の `validity` option は時刻 check を提供するが、`notBefore` / `notAfter` は呼び出し側が外から渡す (`cf.tlsClientAuth.certNotBefore` / `certNotAfter` を `Date` に変換するのは application 側)。
 - CRL、OCSP、失効 DB、失効確認。
 - 鍵の保管、暗号化保存、Cloudflare storage 連携。
+- key の format 変換 (PEM ↔ CryptoKey、JWK ↔ CryptoKey 等)。永続化形式の選択と変換は呼び出し側で WebCrypto API を直接使って行う。

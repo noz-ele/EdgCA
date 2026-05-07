@@ -30,8 +30,6 @@ export type SerialNumber = bigint | number | string | Uint8Array;
 
 export interface CertificateAuthority {
   certPem: string;
-  privateKeyPem: string;
-  publicKeyPem: string;
   certDer: Uint8Array;
   privateKey: CryptoKey;
   publicKey: CryptoKey;
@@ -40,8 +38,6 @@ export interface CertificateAuthority {
 
 export interface IssuedClientCertificate {
   certPem: string;
-  privateKeyPem: string;
-  publicKeyPem: string;
   certDer: Uint8Array;
   privateKey: CryptoKey;
   publicKey: CryptoKey;
@@ -54,7 +50,7 @@ export interface CreateRootCAOptions {
   notBefore?: Date;
   serialNumber?: SerialNumber;
   pathLenConstraint?: number;
-  privateKeyPem?: string;
+  keyPair?: CryptoKeyPair;
 }
 
 export interface IssueIntermediateCAOptions {
@@ -64,7 +60,7 @@ export interface IssueIntermediateCAOptions {
   notBefore?: Date;
   serialNumber?: SerialNumber;
   pathLenConstraint?: number;
-  privateKeyPem?: string;
+  keyPair?: CryptoKeyPair;
 }
 
 export interface IssueClientCertOptions {
@@ -79,6 +75,6 @@ export interface IssueClientCertOptions {
 
 export interface ImportCertificateAuthorityOptions {
   certPem: string;
-  privateKeyPem: string;
+  privateKey: CryptoKey;
   issuerChainPem?: string;
 }

@@ -2,8 +2,6 @@ import { describe, expect, it } from "vitest";
 import fc from "fast-check";
 import {
   certificateToPem,
-  privateKeyDerToPem,
-  publicKeyDerToPem,
   pemToDer,
   pemToDerWithLabel,
   splitPemBlocks
@@ -20,18 +18,10 @@ describe("pem round-trip", () => {
     );
   });
 
-  it("privateKeyDerToPem ↔ pemToDerWithLabel", () => {
+  it("certificateToPem ↔ pemToDerWithLabel CERTIFICATE", () => {
     fc.assert(
       fc.property(nonEmptyBytes, (der) => {
-        expect(pemToDerWithLabel(privateKeyDerToPem(der), "PRIVATE KEY")).toEqual(der);
-      })
-    );
-  });
-
-  it("publicKeyDerToPem ↔ pemToDerWithLabel", () => {
-    fc.assert(
-      fc.property(nonEmptyBytes, (der) => {
-        expect(pemToDerWithLabel(publicKeyDerToPem(der), "PUBLIC KEY")).toEqual(der);
+        expect(pemToDerWithLabel(certificateToPem(der), "CERTIFICATE")).toEqual(der);
       })
     );
   });

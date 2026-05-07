@@ -12,9 +12,7 @@ import {
   importCertificateAuthority,
   verifyClientCertificateIssuedBy,
   certificateToPem,
-  pemToDer,
-  privateKeyToPem,
-  publicKeyToPem
+  pemToDer
 } from "@noz-ele/edgca";
 ```
 
@@ -61,8 +59,6 @@ DN string input and multi-valued RDNs are not supported.
 ```ts
 interface CertificateAuthority {
   certPem: string;
-  privateKeyPem: string;
-  publicKeyPem: string;
   certDer: Uint8Array;
   privateKey: CryptoKey;
   publicKey: CryptoKey;
@@ -74,13 +70,13 @@ interface CertificateAuthority {
 
 The deepest CA hierarchy EdgCA targets is `root CA -> intermediate CA -> client certificate`. Issuing further intermediate CAs from an intermediate is out of scope.
 
+Private keys are returned as `CryptoKey` only. The library does not produce string forms (PEM, etc.) of private keys. If you need to persist the key, call `crypto.subtle.exportKey("pkcs8", privateKey)` (or another export form) yourself; the key must be extractable for that to work.
+
 ### `IssuedClientCertificate`
 
 ```ts
 interface IssuedClientCertificate {
   certPem: string;
-  privateKeyPem: string;
-  publicKeyPem: string;
   certDer: Uint8Array;
   privateKey: CryptoKey;
   publicKey: CryptoKey;
@@ -113,7 +109,7 @@ function createRootCA(options: {
   notBefore?: Date;
   serialNumber?: SerialNumber;
   pathLenConstraint?: number;
-  privateKeyPem?: string;
+  keyPair?: CryptoKeyPair;
 }): Promise<CertificateAuthority>;
 ```
 
@@ -128,7 +124,7 @@ The root certificate is self-signed. The returned `issuerChainPem` is `""`.
 
 `pathLenConstraint` defaults to `1`. The only allowed values are `0` and `1`. A root with `pathLenConstraint=0` can only issue client certificates; it cannot issue intermediate CAs.
 
-When `privateKeyPem` is provided, the root CA is issued with that key. Passing a key that is already in long-term storage is the recommended path because it keeps key management on the caller's side. When omitted, the library generates a key internally (test / PoC use). The format is PKCS#8 PEM (P-256 ECDSA, unencrypted).
+When `keyPair` is provided, the root CA is issued with that key pair. The recommended path is to load a key from long-term storage, turn it into a `CryptoKey` via WebCrypto's `importKey`, and pass it here. When omitted, the library generates a P-256 ECDSA key pair internally (test / PoC use). `privateKey.usages` must include `"sign"` and `publicKey.usages` must include `"verify"`.
 
 ### `issueIntermediateCA(options)`
 
@@ -142,7 +138,7 @@ function issueIntermediateCA(options: {
   notBefore?: Date;
   serialNumber?: SerialNumber;
   pathLenConstraint?: number;
-  privateKeyPem?: string;
+  keyPair?: CryptoKeyPair;
 }): Promise<CertificateAuthority>;
 ```
 
@@ -159,7 +155,7 @@ If the issuer root CA has `pathLenConstraint=0`, this function throws. This prev
 
 The returned CA's `issuerChainPem` carries the parent chain.
 
-When `privateKeyPem` is provided, the intermediate CA is issued with that key. As with `createRootCA`, passing an already-stored key is the recommended path. When omitted, the library generates a key internally. The format is PKCS#8 PEM (P-256 ECDSA, unencrypted).
+When `keyPair` is provided, the intermediate CA is issued with that key pair. As with `createRootCA`, the recommended path is to import a stored key into a `CryptoKey` and pass it here. When omitted, the library generates a P-256 ECDSA key pair internally.
 
 ### `issueClientCert(options)`
 
@@ -195,14 +191,16 @@ Imports a CA certificate and private key and returns a `CertificateAuthority` us
 ```ts
 function importCertificateAuthority(options: {
   certPem: string;
-  privateKeyPem: string;
+  privateKey: CryptoKey;
   issuerChainPem?: string;
 }): Promise<CertificateAuthority>;
 ```
 
-The private key must correspond to the public key of the certificate. An incorrect `certPem` (expired, broken signature, unexpected extensions, etc.) does not raise an error — by design, certificates are issued exactly as the input dictates. The return value has the same `CertificateAuthority` shape as `createRootCA()` and `issueIntermediateCA()`.
+`privateKey` must correspond to the public key of the certificate (verified via a sign/verify round trip). An incorrect `certPem` (expired, broken signature, unexpected extensions, etc.) does not raise an error — by design, certificates are issued exactly as the input dictates. The return value has the same `CertificateAuthority` shape as `createRootCA()` and `issueIntermediateCA()`.
 
 When re-importing an intermediate CA, pass the parent chain via `issuerChainPem`. This chain is used to build `certChainPem` when issuing a client certificate.
+
+The caller is responsible for turning persisted key material into a `CryptoKey` — for example, `crypto.subtle.importKey("pkcs8", …, { name: "ECDSA", namedCurve: "P-256" }, extractable, ["sign"])` for PKCS#8 PEM. The library does not perform format conversion.
 
 ### `verifyClientCertificateIssuedBy(options)`
 
@@ -304,24 +302,6 @@ Decodes the first PEM block in the given string into DER bytes.
 function pemToDer(pem: string): Uint8Array;
 ```
 
-### `privateKeyToPem(key)`
-
-Exports a private `CryptoKey` as PKCS#8 PEM.
-
-```ts
-function privateKeyToPem(key: CryptoKey): Promise<string>;
-```
-
-The key must be extractable.
-
-### `publicKeyToPem(key)`
-
-Exports a public `CryptoKey` as SPKI PEM.
-
-```ts
-function publicKeyToPem(key: CryptoKey): Promise<string>;
-```
-
 ## Errors
 
 EdgCA throws `Error` for invalid input or operations outside its scope.
@@ -357,7 +337,7 @@ Legend:
 
 #### `CreateRootCAOptions`
 
-The argument to `createRootCA`. Represents the input set for creating a single self-signed root CA. At minimum it requires the subject DN and the validity period; whether to allow intermediates underneath (`pathLenConstraint`) and bringing in an existing private key (`privateKeyPem`) are optional. Both fresh issuance and reproducible issuance (with a brought-in key) are handled by a single interface.
+The argument to `createRootCA`. Represents the input set for creating a single self-signed root CA. At minimum it requires the subject DN and the validity period; whether to allow intermediates underneath (`pathLenConstraint`) and bringing in an existing key pair (`keyPair`) are optional. Both fresh issuance and reproducible issuance (with a brought-in key) are handled by a single interface.
 
 | field | type | required | default | meaning and constraints |
 | --- | --- | --- | --- | --- |
@@ -366,7 +346,7 @@ The argument to `createRootCA`. Represents the input set for creating a single s
 | `notBefore` | `Date` | — | call time (`new Date()`) | The validity start time. Encoded as `UTCTime` for 1950–2049 and as `GeneralizedTime` outside that range. |
 | `serialNumber` | `SerialNumber` | — | CSPRNG-derived 16-byte random (positive, MSB cleared, satisfies CAB BR 7.1's ≥64 bit entropy requirement) | Caller's **explicit** specification of the integer that identifies the issued cert within the issuer. Normally omit this and let the default random value handle it (this satisfies both the stateless nature of Workers and industry standards); only pass a value when you need a deterministic one — for audit, test reproducibility, or carrying a serial assigned by an external system. See § `SerialNumber` for input shapes. After DER encoding, exceeding 20 octets throws. |
 | `pathLenConstraint` | `number` | — | `1` | The number of intermediate levels allowed under this root. Only `0` or `1` is allowed. A root with `0` cannot issue intermediates and is reserved for client certs only. |
-| `privateKeyPem` | `string` | — | generated internally (P-256 ECDSA) | A brought-in private key. PKCS#8 PEM, unencrypted. The recommended path is to pass a key already in long-term storage. If omitted, a key is generated via WebCrypto (a convenience for tests / PoCs). |
+| `keyPair` | `CryptoKeyPair` | — | generated internally (P-256 ECDSA, `extractable: true`) | A brought-in key pair. `privateKey.usages` must include `"sign"` and `publicKey.usages` must include `"verify"`. Extractability is the caller's choice; the library only uses `subtle.sign` and `subtle.exportKey("spki", publicKey)` (the private key does not need to be extractable). When omitted, a key pair is generated via WebCrypto. |
 
 #### `IssueIntermediateCAOptions`
 
@@ -380,11 +360,11 @@ The argument to `issueIntermediateCA`. The input set for issuing a single interm
 | `notBefore` | `Date` | — | call time | Same as `CreateRootCAOptions.notBefore`. |
 | `serialNumber` | `SerialNumber` | — | CSPRNG-derived 16-byte random | Same as `CreateRootCAOptions.serialNumber`. |
 | `pathLenConstraint` | `number` | — | `0` | The `pathLenConstraint` of the issued intermediate is always `0`. If specified explicitly, only `0` is allowed; `1` or higher throws. |
-| `privateKeyPem` | `string` | — | generated internally | Same as `CreateRootCAOptions.privateKeyPem` (the intermediate CA's key). |
+| `keyPair` | `CryptoKeyPair` | — | generated internally | Same as `CreateRootCAOptions.keyPair` (the intermediate CA's key pair). |
 
 #### `IssueClientCertOptions`
 
-The argument to `issueClientCert`. The input set for issuing a single mTLS client certificate. Specify the issuer via `ca` (either a root or an intermediate is fine). Client cert keys are assumed to be short-lived, so unlike the CA options, this does not accept `privateKeyPem`. SAN is optional; when neither `dnsNames` nor `ipAddresses` is specified, the extension itself is omitted.
+The argument to `issueClientCert`. The input set for issuing a single mTLS client certificate. Specify the issuer via `ca` (either a root or an intermediate is fine). Client cert keys are assumed to be short-lived, so unlike the CA options, this does not accept `keyPair`. SAN is optional; when neither `dnsNames` nor `ipAddresses` is specified, the extension itself is omitted.
 
 | field | type | required | default | meaning and constraints |
 | --- | --- | --- | --- | --- |
@@ -396,31 +376,29 @@ The argument to `issueClientCert`. The input set for issuing a single mTLS clien
 | `dnsNames` | `string[]` | — | `undefined` | SAN dNSName entries. The SAN extension is emitted only when this is specified. RFC 1035 §2.3.1 preferred name syntax: each label starts and ends with `[A-Za-z0-9]` and may contain `-` internally; label length ≤63 chars; total length ≤253 chars; a leading `*.` wildcard is allowed. Violations throw. |
 | `ipAddresses` | `string[]` | — | `undefined` | SAN iPAddress entries. IPv4 / IPv6 strings. Can be combined with `dnsNames`. When neither is specified, the SAN extension itself is omitted. |
 
-`issueClientCert` **always** generates the client cert key internally, so there is no `privateKeyPem` option. Client cert keys are assumed to be ephemeral.
+`issueClientCert` **always** generates the client cert key internally, so there is no `keyPair` option. Client cert keys are assumed to be ephemeral.
 
 #### `ImportCertificateAuthorityOptions`
 
-The argument to `importCertificateAuthority`. The input for reconstructing a `CertificateAuthority` instance from persisted CA material (cert PEM + private key PEM, plus the parent chain when applicable). Used not for creating a new CA but for loading a stored CA at Worker startup so it can be used for subsequent issuance.
+The argument to `importCertificateAuthority`. The input for reconstructing a `CertificateAuthority` instance from persisted CA material (cert PEM + private `CryptoKey`, plus the parent chain when applicable). Used not for creating a new CA but for loading a stored CA at Worker startup so it can be used for subsequent issuance.
 
 | field | type | required | default | meaning and constraints |
 | --- | --- | --- | --- | --- |
 | `certPem` | `string` | ✅ | — | The CA certificate PEM to import. The first `BEGIN CERTIFICATE` block is read. |
-| `privateKeyPem` | `string` | ✅ | — | The PKCS#8 PEM private key (unencrypted) corresponding to `certPem`. The library performs a sign/verify round-trip against the public key to confirm the pair matches. Mismatches throw. |
+| `privateKey` | `CryptoKey` | ✅ | — | The private `CryptoKey` (ECDSA P-256, `["sign"]` usage) corresponding to `certPem`. The library performs a sign/verify round-trip against the public key to confirm the pair matches. Mismatches throw. Extractability is the caller's choice. Format conversion (PEM → CryptoKey, etc.) is the caller's job. |
 | `issuerChainPem` | `string` | — | `""` (empty) | When the imported subject is an intermediate CA, the PEM of its parent chain. Used to build `certChainPem` when issuing a client cert. Multiple `CERTIFICATE` blocks are concatenated with newlines. An empty string is treated as a root. |
 
 ### Results
 
 #### `CertificateAuthority`
 
-A single instance type that bundles a CA into three pieces: "private key + own cert + parent chain". Returned by `createRootCA` / `issueIntermediateCA` / `importCertificateAuthority`, and can be passed directly as the `ca` argument to `issueIntermediateCA` / `issueClientCert`. Treat it as one handle that bundles all the state the issuance functions need. To persist a CA, save the three values `certPem` / `privateKeyPem` / `issuerChainPem` and pass them back through `importCertificateAuthority` to restore.
+A single instance type that bundles a CA into three pieces: "private key + own cert + parent chain". Returned by `createRootCA` / `issueIntermediateCA` / `importCertificateAuthority`, and can be passed directly as the `ca` argument to `issueIntermediateCA` / `issueClientCert`. Treat it as one handle that bundles all the state the issuance functions need. To persist a CA, save `certPem` and the exported private-key bytes (export with `subtle.exportKey` on the caller side) along with `issuerChainPem`; restore by re-importing the key into a `CryptoKey` and passing it back through `importCertificateAuthority`.
 
 | field | type | meaning |
 | --- | --- | --- |
 | `certPem` | `string` | The PEM of the CA's own certificate (`CERTIFICATE` block). |
-| `privateKeyPem` | `string` | The CA's PKCS#8 PEM private key, unencrypted. |
-| `publicKeyPem` | `string` | The CA's SPKI PEM public key. |
 | `certDer` | `Uint8Array` | The DER bytes of the CA's own certificate. Equivalent to decoding `certPem`. |
-| `privateKey` | `CryptoKey` | A WebCrypto `CryptoKey` instance for `["sign"]`, extractable. |
+| `privateKey` | `CryptoKey` | A WebCrypto `CryptoKey` instance for `["sign"]`. |
 | `publicKey` | `CryptoKey` | A WebCrypto `CryptoKey` instance for `["verify"]`. |
 | `issuerChainPem` | `string` | The PEM of the parent CA chain. `""` for a root CA. For an intermediate, the PEM of the root. When multiple CAs are included, they are separated by newlines. |
 
@@ -431,10 +409,8 @@ The return value of `issueClientCert`. A type that returns the issued client cer
 | field | type | meaning |
 | --- | --- | --- |
 | `certPem` | `string` | The PEM of the client certificate. |
-| `privateKeyPem` | `string` | The client's PKCS#8 PEM private key, unencrypted. |
-| `publicKeyPem` | `string` | The client's SPKI PEM public key. |
 | `certDer` | `Uint8Array` | The DER bytes of the client certificate. |
-| `privateKey` | `CryptoKey` | A WebCrypto `CryptoKey` for `["sign"]`, extractable. |
+| `privateKey` | `CryptoKey` | A WebCrypto `CryptoKey` for `["sign"]`. |
 | `publicKey` | `CryptoKey` | A WebCrypto `CryptoKey` for `["verify"]`. |
 | `certChainPem` | `string` | leaf + issuer + issuerChain joined by newlines, forming the complete chain. When issued via an intermediate, the order is `client + intermediate + root`. |
 
@@ -470,3 +446,4 @@ EdgCA does not provide:
 - Extraction of time fields from a cert. `verifyClientCertificateIssuedBy`'s `validity` option provides a time check, but `notBefore` / `notAfter` are passed in by the caller (it is the application's job to convert `cf.tlsClientAuth.certNotBefore` / `certNotAfter` to `Date`).
 - CRL, OCSP, revocation databases, revocation checks.
 - Key storage, encryption-at-rest, or Cloudflare storage integration.
+- Key format conversion (PEM ↔ CryptoKey, JWK ↔ CryptoKey, etc.). The choice and conversion of a persistence format are done by the caller, using the WebCrypto API directly.

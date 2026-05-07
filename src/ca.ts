@@ -3,11 +3,7 @@ import {
   assertKeyPairMatches,
   exportSpki,
   generateKeyPair,
-  importPrivateKeyPem,
   keyIdentifierFromSpki,
-  keyPairFromPrivateKeyPem,
-  privateKeyToPem,
-  publicKeyToPem,
   signDer
 } from "./crypto.js";
 import { encodeName } from "./name.js";
@@ -34,7 +30,7 @@ import {
 } from "./x509.js";
 
 export async function createRootCA(options: CreateRootCAOptions): Promise<CertificateAuthority> {
-  const keyPair = await resolveKeyPair(options.privateKeyPem);
+  const keyPair = await resolveKeyPair(options.keyPair);
   const subjectNameDer = encodeName(options.subject);
   const spki = await exportSpki(keyPair.publicKey);
   const keyIdentifier = await keyIdentifierFromSpki(spki);
@@ -65,7 +61,7 @@ export async function issueIntermediateCA(options: IssueIntermediateCAOptions): 
   assertCanIssueCertificate(issuer);
   assertCanIssueIntermediate(issuer, issuerChainPem, options.pathLenConstraint);
 
-  const keyPair = await resolveKeyPair(options.privateKeyPem);
+  const keyPair = await resolveKeyPair(options.keyPair);
   const subjectNameDer = encodeName(options.subject);
   const spki = await exportSpki(keyPair.publicKey);
   const subjectKeyIdentifier = await keyIdentifierFromSpki(spki);
@@ -125,8 +121,6 @@ export async function issueClientCert(options: IssueClientCertOptions): Promise<
 
   return {
     certPem,
-    privateKeyPem: await privateKeyToPem(keyPair.privateKey),
-    publicKeyPem: await publicKeyToPem(keyPair.publicKey),
     certDer: cloneBytes(certDer),
     privateKey: keyPair.privateKey,
     publicKey: keyPair.publicKey,
@@ -140,15 +134,12 @@ export async function importCertificateAuthority(options: ImportCertificateAutho
 
   const certDer = pemToDerWithLabel(options.certPem, "CERTIFICATE");
   const parsed = await parseCertificateDer(certDer);
-  const privateKey = await importPrivateKeyPem(options.privateKeyPem);
-  await assertKeyPairMatches(privateKey, parsed.publicKey);
+  await assertKeyPairMatches(options.privateKey, parsed.publicKey);
 
   return {
     certPem: options.certPem,
-    privateKeyPem: options.privateKeyPem,
-    publicKeyPem: await publicKeyToPem(parsed.publicKey),
     certDer: cloneBytes(certDer),
-    privateKey,
+    privateKey: options.privateKey,
     publicKey: parsed.publicKey,
     issuerChainPem
   };
@@ -167,9 +158,9 @@ function assertIssuerChainPem(chainPem: string): void {
   }
 }
 
-async function resolveKeyPair(privateKeyPem: string | undefined): Promise<CryptoKeyPair> {
-  if (privateKeyPem !== undefined) {
-    return keyPairFromPrivateKeyPem(privateKeyPem);
+async function resolveKeyPair(provided: CryptoKeyPair | undefined): Promise<CryptoKeyPair> {
+  if (provided !== undefined) {
+    return provided;
   }
   return generateKeyPair();
 }
@@ -181,8 +172,6 @@ async function assembleCertificateAuthority(
 ): Promise<CertificateAuthority> {
   return {
     certPem: certificateToPem(certDer),
-    privateKeyPem: await privateKeyToPem(keyPair.privateKey),
-    publicKeyPem: await publicKeyToPem(keyPair.publicKey),
     certDer: cloneBytes(certDer),
     privateKey: keyPair.privateKey,
     publicKey: keyPair.publicKey,

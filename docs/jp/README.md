@@ -57,10 +57,12 @@ const client = await issueClientCert({
 });
 
 // secrets manager / KV / vault に保管する想定。
-// client.privateKeyPem は秘密情報として扱い、log や転送に出さない。
+// `client.privateKey` は CryptoKey。永続化する場合は
+// crypto.subtle.exportKey("pkcs8", client.privateKey) などで自分で取り出し、
+// 取り出したバイト列を秘密情報として扱う (log や転送に出さない)。
 //   client.certPem        — 公開してよい証明書
 //   client.certChainPem   — mTLS で提示する完全 chain
-//   client.privateKeyPem  — 秘密。trusted channel でのみ受け渡す
+//   client.privateKey     — 秘密の CryptoKey。trusted channel でのみ受け渡す
 ```
 
 基本形は次の構造です。
@@ -117,12 +119,22 @@ EdgCA `verifyClientCertificateIssuedBy` が直接受け取れるのは PEM (`cer
 ### 例
 
 ```ts
-import { importCertificateAuthority, verifyClientCertificateIssuedBy } from "@noz-ele/edgca";
+import { importCertificateAuthority, pemToDer, verifyClientCertificateIssuedBy } from "@noz-ele/edgca";
 
-// Worker 起動時 (vault 等から読み込んだ CA を一度 import しておく)
+// Worker 起動時 (vault 等から読み込んだ CA を一度 import しておく)。
+// 秘密鍵は CryptoKey でしか受け取らないので、永続化形式
+// (PKCS#8 PEM、JWK、生バイト列など) を application 側で CryptoKey に変換する。
+const pkcs8Der = pemToDer(env.CA_PRIVATE_KEY_PEM);
+const privateKey = await crypto.subtle.importKey(
+  "pkcs8",
+  pkcs8Der,
+  { name: "ECDSA", namedCurve: "P-256" },
+  /* extractable */ false,
+  ["sign"]
+);
 const ca = await importCertificateAuthority({
   certPem: env.CA_CERT_PEM,
-  privateKeyPem: env.CA_PRIVATE_KEY_PEM
+  privateKey
 });
 
 export default {
@@ -215,30 +227,56 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 
 ## Key Handling
 
-このライブラリは秘密鍵 PEM を返すため、生成鍵は extractable です。
+EdgCA は鍵を `CryptoKey` でのみ受け渡しします。秘密鍵の string 形式 (PEM、JWK、base64 など) を library から返すことも、入力として受け取ることもありません。秘密素材が JS の string heap に library 境界で残らないよう設計されています。内部生成された鍵は extractable で、永続化が必要な場合は呼び出し側で `crypto.subtle.exportKey` を直接呼んでバイト列を取り出します。永続化形式の選択は呼び出し側の責任です。
 
-EdgCA は鍵の生成と import/export だけを扱います。鍵をどこに保存するか、保存時にどう暗号化するか、ローテーション状態をどう永続化するか、Cloudflare storage products とどう連携するかは application 側の責務です。
+EdgCA が扱うのは鍵の生成・署名・公開鍵の SPKI export だけです。鍵をどこに保存するか、保存時にどう暗号化するか、ローテーション状態をどう永続化するか、Cloudflare storage products とどう連携するかはすべて application 側の責務です。
 
 ### CA 鍵の持ち込み (推奨)
 
-root CA と intermediate CA は長期保管が前提です。鍵管理を呼び出し側に寄せるため、`createRootCA` と `issueIntermediateCA` は既に保管されている秘密鍵を `privateKeyPem` で受け取れます。鍵のライフサイクル (生成・保管・ローテーション) を呼び出し側の鍵管理基盤で一貫して扱えるため、こちらが推奨ルートです。
+root CA と intermediate CA は長期保管が前提です。鍵管理を呼び出し側に寄せるため、`createRootCA` と `issueIntermediateCA` は持ち込み鍵ペアを `keyPair: CryptoKeyPair` で受け取れます。鍵のライフサイクル (生成・保管・ローテーション・永続化形式の選択) を呼び出し側の鍵管理基盤で一貫して扱えるため、こちらが推奨ルートです。
 
 ```ts
+// 永続化形式から CryptoKeyPair を復元する。下は PKCS#8 PEM を vault に
+// 保存している場合の一例。JWK や生バイト列で持っているならその経路で
+// import すればよい。
+async function loadKeyPair(label: string): Promise<CryptoKeyPair> {
+  const pkcs8 = pemToDer(loadFromVault(`${label}-private-pem`));
+  const privateKey = await crypto.subtle.importKey(
+    "pkcs8",
+    pkcs8,
+    { name: "ECDSA", namedCurve: "P-256" },
+    /* extractable */ false,
+    ["sign"]
+  );
+  // 公開鍵の SPKI も別保存しているなら、それを直接 import するほうが速い。
+  const jwk = await crypto.subtle.exportKey("jwk", privateKey);
+  delete jwk.d;
+  jwk.key_ops = ["verify"];
+  const publicKey = await crypto.subtle.importKey(
+    "jwk",
+    jwk,
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["verify"]
+  );
+  return { privateKey, publicKey };
+}
+
 const root = await createRootCA({
   subject: [{ type: "CN", value: "dev-root" }],
   days: 3650,
-  privateKeyPem: loadFromVault("root")    // 既に保管されている PKCS#8 PEM
+  keyPair: await loadKeyPair("root")
 });
 
 const intermediate = await issueIntermediateCA({
   ca: root,
   subject: [{ type: "CN", value: "dev-intermediate" }],
   days: 365,
-  privateKeyPem: loadFromVault("intermediate")
+  keyPair: await loadKeyPair("intermediate")
 });
 ```
 
-`privateKeyPem` を省略した場合は内部で鍵を生成します。テストや PoC 用途の簡便動作です。client certificate の鍵は ephemeral 想定のため `issueClientCert` では常に内部生成です。
+`keyPair` を省略した場合は内部で鍵ペアを生成します。テストや PoC 用途の簡便動作です。client certificate の鍵は ephemeral 想定のため `issueClientCert` では常に内部生成です。
 
 ## Development
 
@@ -258,7 +296,7 @@ npm audit
 - [test/der.property.test.ts](../../test/der.property.test.ts) — INTEGER / OID / OCTET STRING / BIT STRING / SEQUENCE の TLV round-trip
 - [test/bytes.property.test.ts](../../test/bytes.property.test.ts) — `concatBytes`、`binaryToBytes`/`bytesToBinary`、`bytesEqual`、`cloneBytes`
 - [test/ip.property.test.ts](../../test/ip.property.test.ts) — IPv4 dotted-quad と IPv6（full form / `::` compression）の encode
-- [test/pem.property.test.ts](../../test/pem.property.test.ts) — `certificateToPem` / `privateKeyDerToPem` / `publicKeyDerToPem` と `pemToDer` / `pemToDerWithLabel` / `splitPemBlocks` の round-trip
+- [test/pem.property.test.ts](../../test/pem.property.test.ts) — `certificateToPem` と `pemToDer` / `pemToDerWithLabel` / `splitPemBlocks` の round-trip
 
 `vitest.config.ts` の include は `test/**/*.test.ts` なので `npm run test` で同時に走ります。`cert` 組み立て層（`ca.ts` / `x509.ts`）は scope 上 PBT 対象外で、example-based のまま [test/edgca.test.ts](../../test/edgca.test.ts) に集約しています。
 

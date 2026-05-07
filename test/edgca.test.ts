@@ -6,10 +6,16 @@ import {
   issueClientCert,
   issueIntermediateCA,
   pemToDer,
-  privateKeyToPem,
-  publicKeyToPem,
   verifyClientCertificateIssuedBy
 } from "../src/index.js";
+
+async function exportPkcs8Bytes(key: CryptoKey): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.exportKey("pkcs8", key));
+}
+
+async function exportSpkiBytes(key: CryptoKey): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.exportKey("spki", key));
+}
 import {
   arrayBufferFromBytes,
   asciiBytes,
@@ -260,7 +266,7 @@ describe("EdgCA issuing API", () => {
     });
     const importedIntermediate = await importCertificateAuthority({
       certPem: intermediate.certPem,
-      privateKeyPem: intermediate.privateKeyPem,
+      privateKey: intermediate.privateKey,
       issuerChainPem: intermediate.issuerChainPem
     });
     const client = await issueClientCert({
@@ -272,8 +278,6 @@ describe("EdgCA issuing API", () => {
     expect(importedIntermediate.issuerChainPem).toBe(root.certPem);
     expect(certificateToPem(pemToDer(intermediate.certPem))).toBe(intermediate.certPem);
     expect(certificateToPem(pemToDerWithLabel(intermediate.certPem, "CERTIFICATE"))).toBe(intermediate.certPem);
-    await expect(privateKeyToPem(intermediate.privateKey)).resolves.toBe(intermediate.privateKeyPem);
-    await expect(publicKeyToPem(intermediate.publicKey)).resolves.toBe(intermediate.publicKeyPem);
     expect(() => pemToDerWithLabel(intermediate.certPem, "PRIVATE KEY")).toThrow("expected PRIVATE KEY");
     expect(splitPemBlocks(client.certChainPem)).toEqual([
       client.certPem.trim(),
@@ -287,11 +291,21 @@ describe("EdgCA issuing API", () => {
     const reissued = await createRootCA({
       subject: rootSubject,
       days: 365,
-      privateKeyPem: seed.privateKeyPem
+      keyPair: { privateKey: seed.privateKey, publicKey: seed.publicKey }
     });
 
-    expect(reissued.privateKeyPem).toBe(seed.privateKeyPem);
-    expect(reissued.publicKeyPem).toBe(seed.publicKeyPem);
+    expect(
+      bytesEqual(
+        await exportPkcs8Bytes(reissued.privateKey),
+        await exportPkcs8Bytes(seed.privateKey)
+      )
+    ).toBe(true);
+    expect(
+      bytesEqual(
+        await exportSpkiBytes(reissued.publicKey),
+        await exportSpkiBytes(seed.publicKey)
+      )
+    ).toBe(true);
 
     const seedParsed = await parseCertificate(seed.certDer);
     const reissuedParsed = await parseCertificate(reissued.certDer);
@@ -310,45 +324,19 @@ describe("EdgCA issuing API", () => {
       ca: root,
       subject: intermediateSubject,
       days: 365,
-      privateKeyPem: seed.privateKeyPem
+      keyPair: { privateKey: seed.privateKey, publicKey: seed.publicKey }
     });
 
-    expect(intermediate.privateKeyPem).toBe(seed.privateKeyPem);
+    expect(
+      bytesEqual(
+        await exportPkcs8Bytes(intermediate.privateKey),
+        await exportPkcs8Bytes(seed.privateKey)
+      )
+    ).toBe(true);
 
     const parsedRoot = await parseCertificate(root.certDer);
     const parsedIntermediate = await parseCertificate(intermediate.certDer);
     await expect(expectSignatureValid(parsedRoot, parsedIntermediate)).resolves.toBe(true);
-  });
-
-  it("rejects a non-PRIVATE-KEY PEM passed as privateKeyPem", async () => {
-    const root = await createRootCA({ subject: rootSubject, days: 365 });
-    await expect(
-      createRootCA({
-        subject: rootSubject,
-        days: 365,
-        privateKeyPem: root.certPem
-      })
-    ).rejects.toThrow("expected PRIVATE KEY");
-  });
-
-  it("rejects an explicitly empty privateKeyPem", async () => {
-    const root = await createRootCA({ subject: rootSubject, days: 3650 });
-
-    await expect(
-      createRootCA({
-        subject: rootSubject,
-        days: 365,
-        privateKeyPem: ""
-      })
-    ).rejects.toThrow("expected PRIVATE KEY");
-    await expect(
-      issueIntermediateCA({
-        ca: root,
-        subject: intermediateSubject,
-        days: 365,
-        privateKeyPem: ""
-      })
-    ).rejects.toThrow("expected PRIVATE KEY");
   });
 
   it("rejects importing a CA certificate with a mismatched private key", async () => {
@@ -361,7 +349,7 @@ describe("EdgCA issuing API", () => {
     await expect(
       importCertificateAuthority({
         certPem: root.certPem,
-        privateKeyPem: otherRoot.privateKeyPem
+        privateKey: otherRoot.privateKey
       })
     ).rejects.toThrow("does not match");
   });
@@ -375,7 +363,7 @@ describe("EdgCA issuing API", () => {
     });
     const importedLeaf = await importCertificateAuthority({
       certPem: client.certPem,
-      privateKeyPem: client.privateKeyPem,
+      privateKey: client.privateKey,
       issuerChainPem: root.certPem
     });
 
@@ -852,20 +840,10 @@ describe("input validation", () => {
     const root = await createRootCA({ subject: rootSubject, days: 365 });
     await expect(
       importCertificateAuthority({
-        certPem: root.privateKeyPem,
-        privateKeyPem: root.privateKeyPem
+        certPem: "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+        privateKey: root.privateKey
       })
     ).rejects.toThrow("expected CERTIFICATE");
-  });
-
-  it("rejects importCertificateAuthority when privateKeyPem has wrong label", async () => {
-    const root = await createRootCA({ subject: rootSubject, days: 365 });
-    await expect(
-      importCertificateAuthority({
-        certPem: root.certPem,
-        privateKeyPem: root.certPem
-      })
-    ).rejects.toThrow("expected PRIVATE KEY");
   });
 
   it("rejects importCertificateAuthority when issuerChainPem contains a non-CERTIFICATE block", async () => {
@@ -878,8 +856,8 @@ describe("input validation", () => {
     await expect(
       importCertificateAuthority({
         certPem: intermediate.certPem,
-        privateKeyPem: intermediate.privateKeyPem,
-        issuerChainPem: intermediate.privateKeyPem
+        privateKey: intermediate.privateKey,
+        issuerChainPem: "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"
       })
     ).rejects.toThrow("expected CERTIFICATE");
   });
@@ -894,7 +872,7 @@ describe("input validation", () => {
     await expect(
       importCertificateAuthority({
         certPem: intermediate.certPem,
-        privateKeyPem: intermediate.privateKeyPem,
+        privateKey: intermediate.privateKey,
         issuerChainPem: "not a pem block"
       })
     ).rejects.toThrow("CERTIFICATE blocks");
@@ -953,7 +931,7 @@ describe("input validation", () => {
     await expect(
       importCertificateAuthority({
         certPem: truncatedPem,
-        privateKeyPem: root.privateKeyPem
+        privateKey: root.privateKey
       })
     ).rejects.toThrow();
   });
@@ -1642,7 +1620,7 @@ describe("certificate parser malformed-input paths", () => {
     const mutated = sequence(tbs.raw, algo.raw, new Uint8Array([TAG.BIT_STRING, sig.value.length, ...bitStringWithUnusedBits]));
     const pem = certificateToPem(mutated);
     await expect(
-      importCertificateAuthority({ certPem: pem, privateKeyPem: root.privateKeyPem })
+      importCertificateAuthority({ certPem: pem, privateKey: root.privateKey })
     ).rejects.toThrow("Invalid certificate signature value");
   });
 
@@ -1653,7 +1631,7 @@ describe("certificate parser malformed-input paths", () => {
     padded[root.certDer.length] = 0x00;
     const pem = certificateToPem(padded);
     await expect(
-      importCertificateAuthority({ certPem: pem, privateKeyPem: root.privateKeyPem })
+      importCertificateAuthority({ certPem: pem, privateKey: root.privateKey })
     ).rejects.toThrow();
   });
 });
@@ -2131,7 +2109,7 @@ describe("import root CA then issue intermediate", () => {
     const original = await createRootCA({ subject: rootSubject, days: 3650 });
     const imported = await importCertificateAuthority({
       certPem: original.certPem,
-      privateKeyPem: original.privateKeyPem
+      privateKey: original.privateKey
     });
     const intermediate = await issueIntermediateCA({
       ca: imported,
@@ -2345,7 +2323,8 @@ describe("splitPemBlocks edge cases", () => {
 
   it("returns mixed-label blocks together", async () => {
     const root = await createRootCA({ subject: rootSubject, days: 365 });
-    const blocks = splitPemBlocks(root.certPem + root.privateKeyPem);
+    const fakePrivatePem = "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----";
+    const blocks = splitPemBlocks(root.certPem + fakePrivatePem);
     expect(blocks.length).toBe(2);
     expect(blocks[0]).toContain("BEGIN CERTIFICATE");
     expect(blocks[1]).toContain("BEGIN PRIVATE KEY");
@@ -2514,7 +2493,7 @@ describe("issuerChainPem whitespace handling", () => {
     const root = await createRootCA({ subject: rootSubject, days: 365 });
     const ca = await importCertificateAuthority({
       certPem: root.certPem,
-      privateKeyPem: root.privateKeyPem,
+      privateKey: root.privateKey,
       issuerChainPem: "   \n\n\t  \n"
     });
     const intermediate = await issueIntermediateCA({
@@ -2641,7 +2620,7 @@ describe("certDer/certPem round-trip consistency", () => {
     const original = await createRootCA({ subject: rootSubject, days: 365 });
     const imported = await importCertificateAuthority({
       certPem: original.certPem,
-      privateKeyPem: original.privateKeyPem
+      privateKey: original.privateKey
     });
     expect(certificateToPem(imported.certDer)).toBe(imported.certPem);
     expect(pemToDer(imported.certPem)).toEqual(imported.certDer);
@@ -2729,7 +2708,7 @@ describe("isRootCa rejects self-signed-with-chain", () => {
     });
     const fakeCA = await importCertificateAuthority({
       certPem: root.certPem,
-      privateKeyPem: root.privateKeyPem,
+      privateKey: root.privateKey,
       issuerChainPem: otherRoot.certPem
     });
     await expect(
@@ -2743,8 +2722,12 @@ describe("issueClientCert key uniqueness", () => {
     const root = await createRootCA({ subject: rootSubject, days: 365 });
     const a = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
     const b = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
-    expect(a.privateKeyPem).not.toBe(b.privateKeyPem);
-    expect(a.publicKeyPem).not.toBe(b.publicKeyPem);
+    expect(
+      bytesEqual(await exportPkcs8Bytes(a.privateKey), await exportPkcs8Bytes(b.privateKey))
+    ).toBe(false);
+    expect(
+      bytesEqual(await exportSpkiBytes(a.publicKey), await exportSpkiBytes(b.publicKey))
+    ).toBe(false);
   });
 });
 
@@ -2761,7 +2744,8 @@ describe("pemToDerWithLabel block selection", () => {
 
   it("skips blocks of other labels and returns the requested one", async () => {
     const root = await createRootCA({ subject: rootSubject, days: 365 });
-    const combined = root.privateKeyPem + root.certPem;
+    const fakePrivatePem = "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n";
+    const combined = fakePrivatePem + root.certPem;
     expect(pemToDerWithLabel(combined, "CERTIFICATE")).toEqual(root.certDer);
   });
 });
@@ -2815,7 +2799,7 @@ describe("AKI fallback to SHA-1(SPKI) when issuer has no SKI extension", () => {
 
     const importedCA = await importCertificateAuthority({
       certPem: noSkiPem,
-      privateKeyPem: root.privateKeyPem
+      privateKey: root.privateKey
     });
     const parsedNoSki = await parseCertificateDer(noSkiDer);
     expect(parsedNoSki.subjectKeyIdentifier).toBeUndefined();
@@ -2843,7 +2827,7 @@ describe("AKI fallback to SHA-1(SPKI) when issuer has no SKI extension", () => {
     const noSkiPem = certificateToPem(stripSkiExtension(root.certDer));
     const importedCA = await importCertificateAuthority({
       certPem: noSkiPem,
-      privateKeyPem: root.privateKeyPem
+      privateKey: root.privateKey
     });
     const client = await issueClientCert({
       ca: importedCA,
@@ -2878,7 +2862,7 @@ describe("import-time CA validation rejections", () => {
     const malformedPem = certificateToPem(malformedDer);
     const importedCA = await importCertificateAuthority({
       certPem: malformedPem,
-      privateKeyPem: root.privateKeyPem
+      privateKey: root.privateKey
     });
     await expect(
       issueClientCert({ ca: importedCA, subject: clientSubject, days: 30 })
@@ -2893,7 +2877,7 @@ describe("import-time CA validation rejections", () => {
     const malformedPem = certificateToPem(malformedDer);
     const importedCA = await importCertificateAuthority({
       certPem: malformedPem,
-      privateKeyPem: root.privateKeyPem
+      privateKey: root.privateKey
     });
     await expect(
       issueClientCert({ ca: importedCA, subject: clientSubject, days: 30 })
@@ -2907,7 +2891,7 @@ describe("import-time CA validation rejections", () => {
     const malformedPem = certificateToPem(malformedDer);
     const importedCA = await importCertificateAuthority({
       certPem: malformedPem,
-      privateKeyPem: root.privateKeyPem
+      privateKey: root.privateKey
     });
     await expect(
       issueClientCert({ ca: importedCA, subject: clientSubject, days: 30 })
@@ -2928,7 +2912,7 @@ describe("importCertificateAuthority does not validate signature (non-goal docum
     const tamperedPem = certificateToPem(tamperedDer);
     const ca = await importCertificateAuthority({
       certPem: tamperedPem,
-      privateKeyPem: root.privateKeyPem
+      privateKey: root.privateKey
     });
     expect(ca.certPem).toBe(tamperedPem);
     const client = await issueClientCert({ ca, subject: clientSubject, days: 30 });
@@ -2950,7 +2934,7 @@ describe("parser tolerates unknown extension OIDs", () => {
     const newCertPem = certificateToPem(newCertDer);
     const ca = await importCertificateAuthority({
       certPem: newCertPem,
-      privateKeyPem: root.privateKeyPem
+      privateKey: root.privateKey
     });
     const client = await issueClientCert({ ca, subject: clientSubject, days: 30 });
     expect(client.certPem.startsWith("-----BEGIN CERTIFICATE-----")).toBe(true);
@@ -3410,7 +3394,7 @@ describe("verifyClientCertificateIssuedBy", () => {
     const original = await createRootCA({ subject: rootSubject, days: 3650 });
     const importedRoot = await importCertificateAuthority({
       certPem: original.certPem,
-      privateKeyPem: original.privateKeyPem
+      privateKey: original.privateKey
     });
     const importedIntermediate = await issueIntermediateCA({
       ca: importedRoot,
@@ -3419,7 +3403,7 @@ describe("verifyClientCertificateIssuedBy", () => {
     });
     const reimportedIntermediate = await importCertificateAuthority({
       certPem: importedIntermediate.certPem,
-      privateKeyPem: importedIntermediate.privateKeyPem,
+      privateKey: importedIntermediate.privateKey,
       issuerChainPem: importedIntermediate.issuerChainPem
     });
     const client = await issueClientCert({
@@ -3439,12 +3423,12 @@ describe("verifyClientCertificateIssuedBy", () => {
     ).toBe(false);
   });
 
-  it("returns true for a client cert issued by a CA built from a brought-in privateKeyPem", async () => {
+  it("returns true for a client cert issued by a CA built from a brought-in keyPair", async () => {
     const seed = await createRootCA({ subject: rootSubject, days: 3650 });
     const broughtIn = await createRootCA({
       subject: rootSubject,
       days: 3650,
-      privateKeyPem: seed.privateKeyPem
+      keyPair: { privateKey: seed.privateKey, publicKey: seed.publicKey }
     });
     const client = await issueClientCert({
       ca: broughtIn,
@@ -3631,7 +3615,10 @@ describe("verifyClientCertificateIssuedBy", () => {
     const root = await createRootCA({ subject: rootSubject, days: 3650 });
 
     await expect(
-      verifyClientCertificateIssuedBy({ ca: root, certPem: root.publicKeyPem })
+      verifyClientCertificateIssuedBy({
+        ca: root,
+        certPem: "-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----"
+      })
     ).rejects.toThrow();
   });
 });
@@ -3871,5 +3858,104 @@ describe("subject encodes repeated attribute types in order", () => {
       "team-alpha",
       "team-beta"
     ]);
+  });
+});
+
+describe("CryptoKey input boundary failures", () => {
+  it("rejects createRootCA when keyPair uses a non-P-256 curve", async () => {
+    const wrongCurve = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-384" },
+      true,
+      ["sign", "verify"]
+    );
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        keyPair: wrongCurve
+      })
+    ).rejects.toThrow();
+  });
+
+  it("rejects createRootCA when keyPair uses a non-ECDSA algorithm", async () => {
+    const rsa = await crypto.subtle.generateKey(
+      {
+        name: "RSA-PSS",
+        modulusLength: 2048,
+        publicExponent: new Uint8Array([1, 0, 1]),
+        hash: "SHA-256"
+      },
+      true,
+      ["sign", "verify"]
+    );
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        keyPair: rsa
+      })
+    ).rejects.toThrow();
+  });
+
+  it("rejects createRootCA when keyPair.publicKey is not extractable", async () => {
+    const extractable = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const spki = await crypto.subtle.exportKey("spki", extractable.publicKey);
+    const nonExtractablePublic = await crypto.subtle.importKey(
+      "spki",
+      spki,
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["verify"]
+    );
+    const keyPair: CryptoKeyPair = {
+      privateKey: extractable.privateKey,
+      publicKey: nonExtractablePublic
+    };
+    await expect(
+      createRootCA({
+        subject: rootSubject,
+        days: 365,
+        keyPair
+      })
+    ).rejects.toThrow();
+  });
+
+  it("rejects importCertificateAuthority when privateKey uses a non-P-256 curve", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const wrongCurve = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-384" },
+      true,
+      ["sign", "verify"]
+    );
+    await expect(
+      importCertificateAuthority({
+        certPem: root.certPem,
+        privateKey: wrongCurve.privateKey
+      })
+    ).rejects.toThrow();
+  });
+
+  it("rejects importCertificateAuthority when privateKey is RSA, not ECDSA", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const rsa = await crypto.subtle.generateKey(
+      {
+        name: "RSA-PSS",
+        modulusLength: 2048,
+        publicExponent: new Uint8Array([1, 0, 1]),
+        hash: "SHA-256"
+      },
+      true,
+      ["sign", "verify"]
+    );
+    await expect(
+      importCertificateAuthority({
+        certPem: root.certPem,
+        privateKey: rsa.privateKey
+      })
+    ).rejects.toThrow();
   });
 });

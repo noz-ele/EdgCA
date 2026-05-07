@@ -10,7 +10,7 @@ The scope is intentionally narrow:
 - Issue an intermediate CA from a root CA.
 - Issue an mTLS client certificate and private key from an intermediate CA.
 - Decide whether a received client certificate was issued by your own CA.
-- Encode/decode certificates and keys as PEM/DER.
+- Encode/decode certificates as PEM/DER. Keys are exchanged as `CryptoKey` only — the library never returns or accepts string forms (PEM, JWK, etc.) of private keys.
 - Delegate all cryptographic operations to `globalThis.crypto.subtle`.
 
 > ⚠ **Not a PKI runtime.** EdgCA is an issuance toolkit, not a general-purpose PKI library or runtime. It does **not** provide chain validation, revocation (CRL/OCSP), key storage, or rotation. `verifyClientCertificateIssuedBy` is **not** mTLS verification and does **not** authenticate the presenter — see [Verify](#verify-cloudflare-worker) below. Operating a CA safely is the caller's responsibility. Full list: [docs/en/NON_GOALS.md](https://github.com/noz-ele/EdgCA/blob/main/docs/en/NON_GOALS.md).
@@ -57,10 +57,12 @@ const client = await issueClientCert({
 });
 
 // Persist these via your secrets manager / KV / vault.
-// Treat client.privateKeyPem as a secret — never log or transmit it.
+// `client.privateKey` is a CryptoKey. To persist it, export with
+// crypto.subtle.exportKey("pkcs8", client.privateKey) (or another form)
+// and treat the resulting bytes as a secret — never log or transmit them.
 //   client.certPem        — public certificate
 //   client.certChainPem   — full chain to present during mTLS
-//   client.privateKeyPem  — secret, hand off only over a trusted channel
+//   client.privateKey     — secret CryptoKey, hand off only over a trusted channel
 ```
 
 The basic shape is:
@@ -117,12 +119,22 @@ These parsers live in the caller, not in the library, because (a) we do not want
 ### Example
 
 ```ts
-import { importCertificateAuthority, verifyClientCertificateIssuedBy } from "@noz-ele/edgca";
+import { importCertificateAuthority, pemToDer, verifyClientCertificateIssuedBy } from "@noz-ele/edgca";
 
 // At Worker startup: import the CA loaded from your vault once.
+// The library accepts the private key as a CryptoKey only — convert from
+// whatever persistence format you use (PKCS#8 PEM, JWK, raw bytes, ...).
+const pkcs8Der = pemToDer(env.CA_PRIVATE_KEY_PEM);
+const privateKey = await crypto.subtle.importKey(
+  "pkcs8",
+  pkcs8Der,
+  { name: "ECDSA", namedCurve: "P-256" },
+  /* extractable */ false,
+  ["sign"]
+);
 const ca = await importCertificateAuthority({
   certPem: env.CA_CERT_PEM,
-  privateKeyPem: env.CA_PRIVATE_KEY_PEM
+  privateKey
 });
 
 export default {
@@ -216,30 +228,56 @@ Intentionally out of scope:
 
 ## Key Handling
 
-This library returns private keys as PEM, so generated keys are extractable.
+EdgCA exchanges keys as `CryptoKey` only. The library never returns or accepts string forms (PEM, JWK, base64, ...) of private keys, so secret material does not live on the JS string heap at the library boundary. Internally generated keys are extractable so the caller can persist them by calling `crypto.subtle.exportKey` directly, but the choice of persistence format is the caller's.
 
-EdgCA only handles key generation and import/export. Where keys are stored, how they are encrypted at rest, how rotation state is persisted, and how they integrate with Cloudflare storage products are all the application's responsibility.
+EdgCA only handles key generation, signing, and SPKI export of public keys. Where keys are stored, how they are encrypted at rest, how rotation state is persisted, and how they integrate with Cloudflare storage products are all the application's responsibility.
 
 ### Bringing your own CA key (recommended)
 
-Root and intermediate CAs are long-lived. To keep key management on the caller's side, `createRootCA` and `issueIntermediateCA` accept an existing `privateKeyPem`. This lets the caller's key-management infrastructure handle the full key lifecycle (generation, storage, rotation) consistently, which is the recommended path.
+Root and intermediate CAs are long-lived. To keep key management on the caller's side, `createRootCA` and `issueIntermediateCA` accept an existing `keyPair: CryptoKeyPair`. This lets the caller's key-management infrastructure handle the full key lifecycle (generation, storage, rotation) consistently — including the choice of persistence format — which is the recommended path.
 
 ```ts
+// Restore a CryptoKeyPair from whatever persistence format you use.
+// Below is one example that converts PKCS#8 PEM stored in a vault.
+async function loadKeyPair(label: string): Promise<CryptoKeyPair> {
+  const pkcs8 = pemToDer(loadFromVault(`${label}-private-pem`));
+  const privateKey = await crypto.subtle.importKey(
+    "pkcs8",
+    pkcs8,
+    { name: "ECDSA", namedCurve: "P-256" },
+    /* extractable */ false,
+    ["sign"]
+  );
+  // Derive the matching public key. If you also persist the public key as
+  // SPKI, import that directly instead of round-tripping through JWK.
+  const jwk = await crypto.subtle.exportKey("jwk", privateKey);
+  delete jwk.d;
+  jwk.key_ops = ["verify"];
+  const publicKey = await crypto.subtle.importKey(
+    "jwk",
+    jwk,
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["verify"]
+  );
+  return { privateKey, publicKey };
+}
+
 const root = await createRootCA({
   subject: [{ type: "CN", value: "dev-root" }],
   days: 3650,
-  privateKeyPem: loadFromVault("root")    // PKCS#8 PEM already in your vault
+  keyPair: await loadKeyPair("root")
 });
 
 const intermediate = await issueIntermediateCA({
   ca: root,
   subject: [{ type: "CN", value: "dev-intermediate" }],
   days: 365,
-  privateKeyPem: loadFromVault("intermediate")
+  keyPair: await loadKeyPair("intermediate")
 });
 ```
 
-Omitting `privateKeyPem` causes the library to generate a key internally — convenient for tests and PoCs. Client-certificate keys are intended to be ephemeral, so `issueClientCert` always generates internally.
+Omitting `keyPair` causes the library to generate a key pair internally — convenient for tests and PoCs. Client-certificate keys are intended to be ephemeral, so `issueClientCert` always generates internally.
 
 ## Development
 
@@ -259,7 +297,7 @@ Round-trip invariants in the lower layers are expressed as `fast-check` property
 - [test/der.property.test.ts](https://github.com/noz-ele/EdgCA/blob/main/test/der.property.test.ts) — TLV round-trip for INTEGER / OID / OCTET STRING / BIT STRING / SEQUENCE
 - [test/bytes.property.test.ts](https://github.com/noz-ele/EdgCA/blob/main/test/bytes.property.test.ts) — `concatBytes`, `binaryToBytes`/`bytesToBinary`, `bytesEqual`, `cloneBytes`
 - [test/ip.property.test.ts](https://github.com/noz-ele/EdgCA/blob/main/test/ip.property.test.ts) — IPv4 dotted-quad and IPv6 (full form / `::` compression) encoding
-- [test/pem.property.test.ts](https://github.com/noz-ele/EdgCA/blob/main/test/pem.property.test.ts) — round-trip between `certificateToPem` / `privateKeyDerToPem` / `publicKeyDerToPem` and `pemToDer` / `pemToDerWithLabel` / `splitPemBlocks`
+- [test/pem.property.test.ts](https://github.com/noz-ele/EdgCA/blob/main/test/pem.property.test.ts) — round-trip between `certificateToPem` and `pemToDer` / `pemToDerWithLabel` / `splitPemBlocks`
 
 `vitest.config.ts` includes `test/**/*.test.ts`, so `npm run test` runs them all together. The certificate-assembly layer (`ca.ts` / `x509.ts`) is intentionally outside the PBT scope and stays example-based in [test/edgca.test.ts](https://github.com/noz-ele/EdgCA/blob/main/test/edgca.test.ts).
 
