@@ -5177,3 +5177,333 @@ describe("CSR additional edge cases and contracts", () => {
     }
   });
 });
+
+describe("CryptoKey reference and input mutability contracts", () => {
+  it("createRootCA returns the caller-provided keyPair members by reference", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["sign", "verify"]
+    );
+    const root = await createRootCA({ subject: rootSubject, days: 3650, keyPair });
+    expect(root.privateKey).toBe(keyPair.privateKey);
+    expect(root.publicKey).toBe(keyPair.publicKey);
+  });
+
+  it("issueIntermediateCA returns the caller-provided keyPair members by reference", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const intermediateKeyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-384" },
+      false,
+      ["sign", "verify"]
+    );
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365,
+      keyPair: intermediateKeyPair
+    });
+    expect(intermediate.privateKey).toBe(intermediateKeyPair.privateKey);
+    expect(intermediate.publicKey).toBe(intermediateKeyPair.publicKey);
+  });
+
+  it("importCertificateAuthority returns the caller-provided privateKey by reference", async () => {
+    const seed = await createRootCA({ subject: rootSubject, days: 3650 });
+    const reimported = await importCertificateAuthority({
+      certPem: seed.certPem,
+      privateKey: seed.privateKey
+    });
+    expect(reimported.privateKey).toBe(seed.privateKey);
+  });
+
+  it("does not mutate the caller's dnsNames / ipAddresses arrays during issuance", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const dnsNames = ["a.example.test", "b.example.test"];
+    const ipAddresses = ["10.0.0.1", "::1"];
+    const dnsNamesSnapshot = [...dnsNames];
+    const ipAddressesSnapshot = [...ipAddresses];
+    await issueClientCert({
+      ca: root,
+      subject: clientSubject,
+      days: 30,
+      dnsNames,
+      ipAddresses
+    });
+    expect(dnsNames).toEqual(dnsNamesSnapshot);
+    expect(ipAddresses).toEqual(ipAddressesSnapshot);
+  });
+
+  it("does not let mutation of the issued leaf's certDer corrupt subsequent re-parses", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const leaf = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
+    // Caller mutating their copy of the bytes must not affect the PEM form
+    // (which was independently encoded), nor the chain string.
+    const certPemSnapshot = leaf.certPem;
+    const certChainSnapshot = leaf.certChainPem;
+    leaf.certDer.fill(0);
+    expect(leaf.certPem).toBe(certPemSnapshot);
+    expect(leaf.certChainPem).toBe(certChainSnapshot);
+    // pemToDer of the original PEM still produces a valid cert structure.
+    expect(pemToDer(certPemSnapshot)[0]).toBe(0x30);
+  });
+});
+
+describe("verifyClientCertificateIssuedBy boundary semantics", () => {
+  it("returns true when verifying a self-signed root against itself", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: root, certPem: root.certPem })
+    ).toBe(true);
+  });
+
+  it("returns false when verifying a leaf against the grandparent root (no chain walking)", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365
+    });
+    const leaf = await issueClientCert({
+      ca: intermediate,
+      subject: clientSubject,
+      days: 30
+    });
+    // The leaf was issued by the intermediate, not by the root. Pinning the
+    // contract: the library does *not* walk the chain — passing the root
+    // returns false even though the cert is "valid in the chain".
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: root, certPem: leaf.certPem })
+    ).toBe(false);
+    // Sanity: the same leaf verified against the direct issuer returns true.
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: intermediate, certPem: leaf.certPem })
+    ).toBe(true);
+  });
+});
+
+describe("error path contracts", () => {
+  it("rejects issueClientCertForPublicKey when given a private key in the publicKey slot", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    await expect(
+      issueClientCertForPublicKey({
+        ca: root,
+        publicKey: keyPair.privateKey, // wrong type — exportSpki rejects private keys
+        subject: clientSubject,
+        days: 30
+      })
+    ).rejects.toThrow();
+  });
+
+  it("rejects assertKeyPairMatches when private and public keys are on different curves", async () => {
+    const p256 = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const p384 = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-384" },
+      true,
+      ["sign", "verify"]
+    );
+    // signDer with P-256 → 64-byte raw, but verifyDer dispatches on the
+    // public key's P-384 → expects 96-byte raw. Either ecdsaDerToRaw rejects
+    // the signature or subtle.verify returns false; in both cases we end up
+    // throwing from assertKeyPairMatches's "does not match" path or rethrow
+    // the WebCrypto error.
+    await expect(assertKeyPairMatches(p256.privateKey, p384.publicKey)).rejects.toThrow();
+  });
+
+  it("rejects pemToDerWithLabel when the body is not valid base64", async () => {
+    const malformed = "-----BEGIN CERTIFICATE-----\n@@@not_base64@@@\n-----END CERTIFICATE-----";
+    expect(() => pemToDerWithLabel(malformed, "CERTIFICATE")).toThrow();
+  });
+
+  it("rejects importCertificateAuthority when privateKey lacks the sign usage", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    // Re-import the same key as a *verify-only* CryptoKey by exporting JWK,
+    // stripping `d`, and re-importing as a public verify key. Then pass that
+    // public CryptoKey as `privateKey` — assertKeyPairMatches runs signDer
+    // first, which fails because the key has no sign usage / is type:public.
+    const jwk = await crypto.subtle.exportKey("jwk", root.privateKey);
+    delete jwk.d;
+    jwk.key_ops = ["verify"];
+    const verifyOnly = await crypto.subtle.importKey(
+      "jwk",
+      jwk,
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["verify"]
+    );
+    await expect(
+      importCertificateAuthority({ certPem: root.certPem, privateKey: verifyOnly })
+    ).rejects.toThrow();
+  });
+});
+
+describe("CSR documenting behaviors", () => {
+  it("surfaces duplicate dNSName entries in requestedDnsNames as-is (no dedup)", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const fixture = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      // Bypass the cert-side encoder's dedup by hand-rolling the SAN.
+      extraAttributes: [
+        {
+          oid: OID.extensionRequest,
+          valuesDer: [
+            sequence(
+              sequence(
+                oid(OID.subjectAltName),
+                octetString(
+                  sequence(
+                    der(0x82, asciiBytes("dup.example.test")),
+                    der(0x82, asciiBytes("dup.example.test"))
+                  )
+                )
+              )
+            )
+          ]
+        }
+      ]
+    });
+    const parsed = await parseCertificateSigningRequest(fixture.der);
+    expect(parsed.requestedDnsNames).toEqual(["dup.example.test", "dup.example.test"]);
+  });
+
+  it("returns the first extensionRequest attribute and silently ignores any duplicates", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const firstSan = sequence(
+      sequence(
+        oid(OID.subjectAltName),
+        octetString(sequence(der(0x82, asciiBytes("first.example.test"))))
+      )
+    );
+    const secondSan = sequence(
+      sequence(
+        oid(OID.subjectAltName),
+        octetString(sequence(der(0x82, asciiBytes("second.example.test"))))
+      )
+    );
+    const fixture = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      extraAttributes: [
+        { oid: OID.extensionRequest, valuesDer: [firstSan] },
+        { oid: OID.extensionRequest, valuesDer: [secondSan] }
+      ]
+    });
+    const parsed = await parseCertificateSigningRequest(fixture.der);
+    expect(parsed.requestedDnsNames).toEqual(["first.example.test"]);
+    // The duplicate still flows through otherAttributes filter (oid !== extensionRequest)
+    // and is dropped — verify it does not surface anywhere user-visible.
+    expect(parsed.otherAttributes).toEqual([]);
+  });
+
+  it("preserves multi-attribute subject order in CSR round-trip", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const orderedSubject: Subject = [
+      { type: "OU", value: "first" },
+      { type: "CN", value: "middle" },
+      { type: "O", value: "last" }
+    ];
+    const fixture = await buildCsrFixture({ subject: orderedSubject, keyPair });
+    const parsed = await parseCertificateSigningRequest(fixture.der);
+    expect(parsed.subject.map((a) => a.type)).toEqual(["OU", "CN", "O"]);
+  });
+});
+
+describe("structural pinning for caller-controlled inputs", () => {
+  it("importCertificateAuthority's first-block selection: certPem with multiple CERTIFICATE blocks uses the first", async () => {
+    const a = await createRootCA({ subject: [{ type: "CN", value: "first-root" }], days: 3650 });
+    const b = await createRootCA({ subject: [{ type: "CN", value: "second-root" }], days: 3650 });
+    const combined = `${a.certPem}\n${b.certPem}`;
+    const reimported = await importCertificateAuthority({
+      certPem: combined,
+      privateKey: a.privateKey
+    });
+    expect(reimported.certDer).toEqual(a.certDer);
+  });
+
+  it("importCertificateAuthority accepts a multi-cert issuerChainPem and forwards it verbatim", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365
+    });
+    const leaf = await issueClientCert({
+      ca: intermediate,
+      subject: clientSubject,
+      days: 30
+    });
+    // Synthesize a 2-cert issuerChainPem (intermediate + root) and re-import
+    // the leaf as a "CA" (it isn't, but importCertificateAuthority does not
+    // pre-validate basicConstraints — that check happens at issuance time).
+    const synthChain = `${intermediate.certPem}\n${root.certPem}`;
+    const reimported = await importCertificateAuthority({
+      certPem: leaf.certPem,
+      privateKey: leaf.privateKey,
+      issuerChainPem: synthChain
+    });
+    expect(reimported.issuerChainPem).toBe(synthChain);
+    // The lib-side scope rule (issuance from a non-CA) still bites later:
+    await expect(
+      issueClientCert({ ca: reimported, subject: clientSubject, days: 30 })
+    ).rejects.toThrow("Issuer certificate is not a CA");
+  });
+
+  it("buildCertificate / buildTbsCertificate trust the caller's issuerCurve: a mismatched value produces a self-verifying-but-mislabeled cert", async () => {
+    // Demonstrate the silent footgun: caller signs with a P-256 key but
+    // claims P-384 for the issuerCurve. The cert's signatureAlgorithm OID
+    // says ecdsaWithSha384, while the actual signature is P-256/SHA-256.
+    //
+    // EdgCA's own verifier dispatches on the *publicKey's* curve, not the
+    // claimed OID, so verifyClientCertificateIssuedBy still returns true.
+    // A strict external verifier that respects the OID would reject the cert.
+    // This test pins the documented contract: caller controls issuerCurve,
+    // library does not validate it against the actual signing key.
+    const real = await createRootCA({ subject: rootSubject, days: 3650 });
+    const realCertElement = readElement(real.certDer);
+    const realChildren = readSequenceChildren(realCertElement);
+    const tbs = realChildren[0]!;
+    const tbsChildren = readSequenceChildren(tbs);
+    // Rebuild the TBS but with the signatureAlgorithm field rewritten to
+    // claim ecdsaWithSha384.
+    const lyingTbs = sequence(
+      tbsChildren[0]!.raw,
+      tbsChildren[1]!.raw,
+      sequence(oid(OID.ecdsaWithSha384)),
+      ...tbsChildren.slice(3).map((child) => child.raw)
+    );
+    const sig = await signDer(real.privateKey, lyingTbs);
+    const lyingCertDer = buildCertificate(lyingTbs, sig, "P-384");
+    const lyingPem = certificateToPem(lyingCertDer);
+    // The lib's own verify ignores the lying OID and uses the real CA key's
+    // curve (P-256), so it returns true.
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: real, certPem: lyingPem })
+    ).toBe(true);
+    // But the cert *does* contain the lying OID byte-for-byte.
+    const lyingCertElement = readElement(lyingCertDer);
+    const lyingChildren = readSequenceChildren(lyingCertElement);
+    const outerSigAlgOid = decodeOid(readSequenceChildren(lyingChildren[1]!)[0]!.value);
+    expect(outerSigAlgOid).toBe(OID.ecdsaWithSha384);
+  });
+});
