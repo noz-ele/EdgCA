@@ -21,7 +21,7 @@ ECDSA on **NIST P-256, P-384, and P-521** is supported throughout (signing, veri
 
 ## Status
 
-EdgCA is in **v0.1.x — early stabilization**. The author is currently validating the library against real Cloudflare Workers deployments, and the API surface may still shift. To keep that validation focused, **external Issues and PRs are temporarily restricted** and will be re-opened once the API settles. Reading, cloning, forking, and `npm install` are unaffected.
+EdgCA is in **v0.2.x — early stabilization**. The author is currently validating the library against real Cloudflare Workers deployments, and the API surface may still shift. To keep that validation focused, **external Issues and PRs are temporarily restricted** and will be re-opened once the API settles. Reading, cloning, forking, and `npm install` are unaffected.
 
 ## Install
 
