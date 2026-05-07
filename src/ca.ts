@@ -1,6 +1,7 @@
 import { bytesEqual, cloneBytes } from "./bytes.js";
 import {
   assertKeyPairMatches,
+  curveOf,
   exportSpki,
   generateKeyPair,
   keyIdentifierFromSpki,
@@ -13,9 +14,12 @@ import type {
   CertificateAuthority,
   CreateRootCAOptions,
   ImportCertificateAuthorityOptions,
+  IssueClientCertForPublicKeyOptions,
   IssueClientCertOptions,
   IssueIntermediateCAOptions,
-  IssuedClientCertificate
+  IssuedClientCertificate,
+  IssuedClientCertificateForPublicKey,
+  Subject
 } from "./types.js";
 import {
   authorityKeyIdentifierExtension,
@@ -31,6 +35,7 @@ import {
 
 export async function createRootCA(options: CreateRootCAOptions): Promise<CertificateAuthority> {
   const keyPair = await resolveKeyPair(options.keyPair);
+  const issuerCurve = curveOf(keyPair.privateKey);
   const subjectNameDer = encodeName(options.subject);
   const spki = await exportSpki(keyPair.publicKey);
   const keyIdentifier = await keyIdentifierFromSpki(spki);
@@ -48,10 +53,11 @@ export async function createRootCA(options: CreateRootCAOptions): Promise<Certif
     issuerNameDer: subjectNameDer,
     subjectNameDer,
     subjectPublicKeyInfoDer: spki,
-    extensions
+    extensions,
+    issuerCurve
   });
   const signatureDer = await signDer(keyPair.privateKey, tbsCertificateDer);
-  const certDer = buildCertificate(tbsCertificateDer, signatureDer);
+  const certDer = buildCertificate(tbsCertificateDer, signatureDer, issuerCurve);
   return assembleCertificateAuthority(certDer, keyPair, "");
 }
 
@@ -61,6 +67,7 @@ export async function issueIntermediateCA(options: IssueIntermediateCAOptions): 
   assertCanIssueCertificate(issuer);
   assertCanIssueIntermediate(issuer, issuerChainPem, options.pathLenConstraint);
 
+  const issuerCurve = curveOf(options.ca.privateKey);
   const keyPair = await resolveKeyPair(options.keyPair);
   const subjectNameDer = encodeName(options.subject);
   const spki = await exportSpki(keyPair.publicKey);
@@ -79,25 +86,84 @@ export async function issueIntermediateCA(options: IssueIntermediateCAOptions): 
     issuerNameDer: issuer.subjectNameDer,
     subjectNameDer,
     subjectPublicKeyInfoDer: spki,
-    extensions
+    extensions,
+    issuerCurve
   });
   const signatureDer = await signDer(options.ca.privateKey, tbsCertificateDer);
-  const certDer = buildCertificate(tbsCertificateDer, signatureDer);
+  const certDer = buildCertificate(tbsCertificateDer, signatureDer, issuerCurve);
   const childChainPem = joinPemChain([options.ca.certPem, issuerChainPem]);
   return assembleCertificateAuthority(certDer, keyPair, childChainPem);
 }
 
 export async function issueClientCert(options: IssueClientCertOptions): Promise<IssuedClientCertificate> {
-  const issuer = await parseIssuer(options.ca);
-  const issuerChainPem = options.ca.issuerChainPem;
+  const keyPair = await generateKeyPair();
+  const built = await buildClientCertificate(
+    options.ca,
+    keyPair.publicKey,
+    {
+      subject: options.subject,
+      days: options.days,
+      notBefore: options.notBefore,
+      serialNumber: options.serialNumber,
+      dnsNames: options.dnsNames,
+      ipAddresses: options.ipAddresses
+    }
+  );
+  return {
+    certPem: built.certPem,
+    certDer: built.certDer,
+    privateKey: keyPair.privateKey,
+    publicKey: keyPair.publicKey,
+    certChainPem: built.certChainPem
+  };
+}
+
+export async function issueClientCertForPublicKey(
+  options: IssueClientCertForPublicKeyOptions
+): Promise<IssuedClientCertificateForPublicKey> {
+  const built = await buildClientCertificate(
+    options.ca,
+    options.publicKey,
+    {
+      subject: options.subject,
+      days: options.days,
+      notBefore: options.notBefore,
+      serialNumber: options.serialNumber,
+      dnsNames: options.dnsNames,
+      ipAddresses: options.ipAddresses
+    }
+  );
+  return {
+    certPem: built.certPem,
+    certDer: built.certDer,
+    certChainPem: built.certChainPem
+  };
+}
+
+interface ClientCertContent {
+  subject: Subject;
+  days: number;
+  notBefore?: Date | undefined;
+  serialNumber?: IssueClientCertOptions["serialNumber"];
+  dnsNames?: readonly string[] | undefined;
+  ipAddresses?: readonly string[] | undefined;
+}
+
+async function buildClientCertificate(
+  ca: CertificateAuthority,
+  subjectPublicKey: CryptoKey,
+  content: ClientCertContent
+): Promise<{ certPem: string; certDer: Uint8Array; certChainPem: string }> {
+  const issuer = await parseIssuer(ca);
+  const issuerChainPem = ca.issuerChainPem;
   assertCanIssueCertificate(issuer);
 
-  const keyPair = await generateKeyPair();
-  const subjectNameDer = encodeName(options.subject);
-  const spki = await exportSpki(keyPair.publicKey);
+  const issuerCurve = curveOf(ca.privateKey);
+  const subjectNameDer = encodeName(content.subject);
+  const spki = await exportSpki(subjectPublicKey);
   const subjectKeyIdentifier = await keyIdentifierFromSpki(spki);
   const authorityKeyIdentifier = issuer.subjectKeyIdentifier ?? await keyIdentifierFromSpki(issuer.subjectPublicKeyInfoDer);
-  const san = subjectAltNameExtension(options.dnsNames, options.ipAddresses);
+  const san = subjectAltNameExtension(content.dnsNames, content.ipAddresses);
   const extensions = [
     basicConstraintsLeafExtension(),
     keyUsageExtension(["digitalSignature"]),
@@ -107,24 +173,23 @@ export async function issueClientCert(options: IssueClientCertOptions): Promise<
     ...(san ? [san] : [])
   ];
   const { tbsCertificateDer } = buildTbsCertificate({
-    serialNumber: options.serialNumber,
-    notBefore: options.notBefore,
-    days: options.days,
+    serialNumber: content.serialNumber,
+    notBefore: content.notBefore,
+    days: content.days,
     issuerNameDer: issuer.subjectNameDer,
     subjectNameDer,
     subjectPublicKeyInfoDer: spki,
-    extensions
+    extensions,
+    issuerCurve
   });
-  const signatureDer = await signDer(options.ca.privateKey, tbsCertificateDer);
-  const certDer = buildCertificate(tbsCertificateDer, signatureDer);
+  const signatureDer = await signDer(ca.privateKey, tbsCertificateDer);
+  const certDer = buildCertificate(tbsCertificateDer, signatureDer, issuerCurve);
   const certPem = certificateToPem(certDer);
 
   return {
     certPem,
     certDer: cloneBytes(certDer),
-    privateKey: keyPair.privateKey,
-    publicKey: keyPair.publicKey,
-    certChainPem: joinPemChain([certPem, options.ca.certPem, issuerChainPem])
+    certChainPem: joinPemChain([certPem, ca.certPem, issuerChainPem])
   };
 }
 

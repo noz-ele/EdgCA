@@ -9,12 +9,17 @@ import {
   createRootCA,
   issueIntermediateCA,
   issueClientCert,
+  issueClientCertForPublicKey,
   importCertificateAuthority,
+  parseCertificateSigningRequest,
+  verifyCertificateSigningRequestSignature,
   verifyClientCertificateIssuedBy,
   certificateToPem,
   pemToDer
 } from "@noz-ele/edgca";
 ```
+
+ECDSA は **NIST P-256 / P-384 / P-521** をサポートします。内部生成のデフォルト curve は P-256 で、それ以外を使う場合は WebCrypto で `CryptoKeyPair` を生成し `keyPair` option で渡します。各 curve に対応する hash は標準ペアリング (P-256/SHA-256、P-384/SHA-384、P-521/SHA-512) です。CA hierarchy 内で curve を混在できます (例: P-256 root → P-384 intermediate → P-521 leaf)。各 cert の signatureAlgorithm は **issuer** の curve を反映します。
 
 ## Types
 
@@ -183,6 +188,78 @@ function issueClientCert(options: {
 - `dnsNames` または `ipAddresses` が指定された場合のみ Subject Alternative Name。
 
 client certificate における SAN は任意です。
+
+### `issueClientCertForPublicKey(options)`
+
+呼び出し側が用意した公開鍵に対して mTLS client certificate を発行します。`issueClientCert` と違い library は鍵ペアを生成せず、cert と DER と chain だけを返します。client が自分で秘密鍵を管理し CSR で enrollment する flow で使います。
+
+```ts
+function issueClientCertForPublicKey(options: {
+  ca: CertificateAuthority;
+  publicKey: CryptoKey;
+  subject: Subject;
+  days: number;
+  notBefore?: Date;
+  serialNumber?: SerialNumber;
+  dnsNames?: string[];
+  ipAddresses?: string[];
+}): Promise<{
+  certPem: string;
+  certDer: Uint8Array;
+  certChainPem: string;
+}>;
+```
+
+発行 cert の extension は `issueClientCert` と同じ (`basicConstraints CA=false`、`keyUsage digitalSignature`、EKU `clientAuth`、SKI、AKI、optional SAN)。埋め込まれる `subjectPublicKeyInfo` は `options.publicKey` を `subtle.exportKey("spki", …)` で export して入れるため、caller の公開鍵は extractable である必要があります。CA の署名 curve が signature algorithm を決め、leaf の埋め込み curve はそれと独立で良い。
+
+この関数は leaf の秘密鍵を一切扱いません。client 側の秘密鍵管理 (POP 検証など、後述の `verifyCertificateSigningRequestSignature` を参照) は呼び出し側の責務です。
+
+### `parseCertificateSigningRequest(input)`
+
+PKCS#10 (RFC 2986) CSR を DER バイト列または PEM 文字列で受け取り、発行に必要な構造化 field を取り出し、それ以外は raw bytes として呼び出し側に渡します。
+
+```ts
+function parseCertificateSigningRequest(
+  input: string | Uint8Array
+): Promise<ParsedCertificateSigningRequest>;
+
+interface ParsedCertificateSigningRequest {
+  subject: Subject;
+  publicKey: CryptoKey;
+  subjectPublicKeyInfoDer: Uint8Array;
+  requestedDnsNames: readonly string[];
+  requestedIpAddresses: readonly string[];
+  requestedExtensions: readonly { oid: string; critical: boolean; valueDer: Uint8Array }[];
+  otherAttributes: readonly { oid: string; valuesDer: ReadonlyArray<Uint8Array> }[];
+  signatureAlgorithmOid: string;
+  signatureDer: Uint8Array;
+  certificationRequestInfoDer: Uint8Array;
+}
+```
+
+挙動:
+
+- **algorithm 範囲**: `ecdsa-with-SHA256` / `ecdsa-with-SHA384` / `ecdsa-with-SHA512` のみ受理。RSA、Ed25519 等は `Unsupported CSR signatureAlgorithm` で throw。
+- **PEM label**: `CERTIFICATE REQUEST` (RFC 7468) と legacy `NEW CERTIFICATE REQUEST` の両方を受理。
+- **subject**: encoder と同じ前提 (single-valued RDN のみ) で `Subject` 配列に decode。`UTF8String` / `PrintableString` / `IA5String` 値型に対応。
+- **SAN 抽出**: `extensionRequest` 属性の SAN から `requestedDnsNames` と `requestedIpAddresses` を取り出す。IPv4 は dotted-quad、IPv6 は RFC 5952 の `::` 圧縮 (最長ゼロランをまとめる)。
+- **`requestedExtensions`**: `extensionRequest` に入っている全 X.509 extension (SAN を含む)。`valueDer` は OCTET STRING の中身。
+- **`otherAttributes`**: OID が `extensionRequest` 以外の CSR-level attribute (例: `challengePassword`) の生 DER。
+- **`certificationRequestInfoDer`**: 内側 `CertificationRequestInfo` SEQUENCE の生バイト列、POP 検証用。
+
+library は **policy を一切適用しません**。CSR の主張 subject/SAN を採用するか、algorithm が許容ラインかなどは EdgCA の外で判断します。
+
+### `verifyCertificateSigningRequestSignature(parsed)`
+
+CSR 自身の埋め込み公開鍵で CSR 署名を検証します (POP)。
+
+```ts
+function verifyCertificateSigningRequestSignature(
+  parsed: ParsedCertificateSigningRequest
+): Promise<boolean>;
+```
+
+`parsed.certificationRequestInfoDer` への署名が `parsed.publicKey` で verify できれば `true`。これは「CSR を作った主体が対応する秘密鍵を持っている」ことを示すだけで、**identity の確認や発行可否の認可ではありません**。enrollment flow の transport (mTLS) や application 層の認証と組み合わせて使います。
 
 ### `importCertificateAuthority(options)`
 

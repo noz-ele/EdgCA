@@ -1,4 +1,5 @@
 import { asciiBytes, concatBytes } from "./bytes.js";
+import { signatureAlgorithmOidForCurve, type SupportedCurve } from "./crypto.js";
 import {
   bitString,
   boolean,
@@ -26,6 +27,7 @@ export interface CertificateBuildInput {
   subjectNameDer: Uint8Array;
   subjectPublicKeyInfoDer: Uint8Array;
   extensions: Uint8Array[];
+  issuerCurve: SupportedCurve;
 }
 
 export interface TbsCertificateResult {
@@ -41,7 +43,7 @@ export function buildTbsCertificate(input: CertificateBuildInput): TbsCertificat
   const tbsCertificateDer = sequence(
     explicit(0, integer(2)),
     serialNumberDer,
-    ecdsaWithSha256AlgorithmIdentifier(),
+    ecdsaSignatureAlgorithmIdentifier(input.issuerCurve),
     input.issuerNameDer,
     sequence(encodeTime(notBefore), encodeTime(notAfter)),
     input.subjectNameDer,
@@ -57,12 +59,16 @@ export function buildTbsCertificate(input: CertificateBuildInput): TbsCertificat
   };
 }
 
-export function buildCertificate(tbsCertificateDer: Uint8Array, signatureDer: Uint8Array): Uint8Array {
-  return sequence(tbsCertificateDer, ecdsaWithSha256AlgorithmIdentifier(), bitString(signatureDer));
+export function buildCertificate(
+  tbsCertificateDer: Uint8Array,
+  signatureDer: Uint8Array,
+  issuerCurve: SupportedCurve
+): Uint8Array {
+  return sequence(tbsCertificateDer, ecdsaSignatureAlgorithmIdentifier(issuerCurve), bitString(signatureDer));
 }
 
-export function ecdsaWithSha256AlgorithmIdentifier(): Uint8Array {
-  return sequence(oid(OID.ecdsaWithSha256));
+export function ecdsaSignatureAlgorithmIdentifier(curve: SupportedCurve): Uint8Array {
+  return sequence(oid(signatureAlgorithmOidForCurve(curve)));
 }
 
 export function basicConstraintsCaExtension(pathLenConstraint: number): Uint8Array {

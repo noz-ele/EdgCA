@@ -4,8 +4,11 @@ import {
   createRootCA,
   importCertificateAuthority,
   issueClientCert,
+  issueClientCertForPublicKey,
   issueIntermediateCA,
+  parseCertificateSigningRequest,
   pemToDer,
+  verifyCertificateSigningRequestSignature,
   verifyClientCertificateIssuedBy
 } from "../src/index.js";
 
@@ -32,6 +35,7 @@ import {
   ecdsaRawToDer,
   exportSpki,
   generateKeyPair,
+  importPublicKeySpki,
   keyIdentifierFromSpki,
   signDer,
   verifyDer
@@ -92,6 +96,7 @@ import {
   parseSubjectKeyIdentifier,
   subjectPublicKeyBits
 } from "./helpers/x509.js";
+import { buildCsrFixture } from "./helpers/csr.js";
 
 const rootSubject: Subject = [
   { type: "CN", value: "dev-root" },
@@ -1212,7 +1217,7 @@ describe("low-level encoders", () => {
     raw[32] = 0x7f;
     raw[63] = 0x02;
 
-    expect(ecdsaDerToRaw(ecdsaRawToDer(raw))).toEqual(raw);
+    expect(ecdsaDerToRaw(ecdsaRawToDer(raw, 32), 32)).toEqual(raw);
   });
 
   it("encodes clientAuth EKU as an OID sequence", async () => {
@@ -1489,22 +1494,24 @@ describe("OID encoder boundaries", () => {
 });
 
 describe("ECDSA signature converter error paths", () => {
-  it("rejects ecdsaRawToDer with wrong-length raw input", () => {
-    expect(() => ecdsaRawToDer(new Uint8Array(0))).toThrow("64 bytes");
-    expect(() => ecdsaRawToDer(new Uint8Array(63))).toThrow("64 bytes");
-    expect(() => ecdsaRawToDer(new Uint8Array(65))).toThrow("64 bytes");
+  it("rejects ecdsaRawToDer with wrong-length raw input for the requested component size", () => {
+    expect(() => ecdsaRawToDer(new Uint8Array(0), 32)).toThrow("64 bytes");
+    expect(() => ecdsaRawToDer(new Uint8Array(63), 32)).toThrow("64 bytes");
+    expect(() => ecdsaRawToDer(new Uint8Array(65), 32)).toThrow("64 bytes");
+    expect(() => ecdsaRawToDer(new Uint8Array(64), 48)).toThrow("96 bytes");
+    expect(() => ecdsaRawToDer(new Uint8Array(96), 66)).toThrow("132 bytes");
   });
 
   it("rejects ecdsaDerToRaw when root is not a SEQUENCE", () => {
-    expect(() => ecdsaDerToRaw(new Uint8Array([0x04, 0x00]))).toThrow("Invalid DER ECDSA signature");
+    expect(() => ecdsaDerToRaw(new Uint8Array([0x04, 0x00]), 32)).toThrow("Invalid DER ECDSA signature");
   });
 
   it("rejects ecdsaDerToRaw with trailing bytes after the SEQUENCE", () => {
-    const valid = ecdsaRawToDer(new Uint8Array(64).fill(0x01));
+    const valid = ecdsaRawToDer(new Uint8Array(64).fill(0x01), 32);
     const trailing = new Uint8Array(valid.length + 1);
     trailing.set(valid);
     trailing[valid.length] = 0x00;
-    expect(() => ecdsaDerToRaw(trailing)).toThrow("Invalid DER ECDSA signature");
+    expect(() => ecdsaDerToRaw(trailing, 32)).toThrow("Invalid DER ECDSA signature");
   });
 
   it("rejects ecdsaDerToRaw whose r or s is not an INTEGER", () => {
@@ -1513,16 +1520,16 @@ describe("ECDSA signature converter error paths", () => {
     innerBytes.set(notInt, 0);
     innerBytes.set(notInt, notInt.length);
     const malformed = sequence(notInt, notInt);
-    expect(() => ecdsaDerToRaw(malformed)).toThrow("Invalid DER ECDSA signature integers");
+    expect(() => ecdsaDerToRaw(malformed, 32)).toThrow("Invalid DER ECDSA signature integers");
   });
 
-  it("rejects ecdsa integers wider than 32 bytes (P-256)", () => {
+  it("rejects ecdsa integers wider than the requested component size", () => {
     const oversized = new Uint8Array(33).fill(0x01);
     const malformed = sequence(
       new Uint8Array([TAG.INTEGER, oversized.length, ...oversized]),
       new Uint8Array([TAG.INTEGER, 0x01, 0x01])
     );
-    expect(() => ecdsaDerToRaw(malformed)).toThrow("wider than P-256");
+    expect(() => ecdsaDerToRaw(malformed, 32)).toThrow("wider than 32 bytes");
   });
 });
 
@@ -2761,10 +2768,11 @@ describe("buildTbsCertificate empty extensions", () => {
       subjectNameDer,
       subjectPublicKeyInfoDer: spki,
       extensions: [],
-      serialNumber: 1
+      serialNumber: 1,
+      issuerCurve: "P-256"
     });
     const sig = await signDer(pair.privateKey, tbsCertificateDer);
-    const certDer = buildCertificate(tbsCertificateDer, sig);
+    const certDer = buildCertificate(tbsCertificateDer, sig, "P-256");
     const parsed = await parseCertificateDer(certDer);
     expect(parsed.isCA).toBe(false);
     expect(parsed.keyCertSign).toBe(false);
@@ -3199,13 +3207,14 @@ describe("certificate parser truncated-structure paths", () => {
       subjectNameDer,
       subjectPublicKeyInfoDer: spki,
       extensions: [],
-      serialNumber: 1
+      serialNumber: 1,
+      issuerCurve: "P-256"
     });
     const tbsChildren = readSequenceChildren(readElement(tbsCertificateDer));
     expect(tbsChildren[tbsChildren.length - 1]!.tag).toBe(0xa3);
     const tbsWithoutExtTag = sequence(...tbsChildren.slice(0, -1).map((child) => child.raw));
     const signature = await signDer(pair.privateKey, tbsWithoutExtTag);
-    const certDer = buildCertificate(tbsWithoutExtTag, signature);
+    const certDer = buildCertificate(tbsWithoutExtTag, signature, "P-256");
 
     const parsed = await parseCertificateDer(certDer);
     expect(parsed.isCA).toBe(false);
@@ -3494,7 +3503,7 @@ describe("verifyClientCertificateIssuedBy", () => {
     // Splice: B's TBS bytes paired with A's genuine CA signature.
     // Both halves are individually authentic (issuer DN, AKI both match realCa),
     // but the signature is over A's TBS hash, so verify against B's TBS must fail.
-    const splicedDer = buildCertificate(parsedB.tbsCertificateDer, parsedA.signatureDer);
+    const splicedDer = buildCertificate(parsedB.tbsCertificateDer, parsedA.signatureDer, "P-256");
     const splicedPem = certificateToPem(splicedDer);
 
     expect(
@@ -3515,7 +3524,7 @@ describe("verifyClientCertificateIssuedBy", () => {
     // but signed with an attacker key. Signature verify against realCa.publicKey must fail.
     const attackerKeyPair = await generateKeyPair();
     const forgedSignatureDer = await signDer(attackerKeyPair.privateKey, realParsed.tbsCertificateDer);
-    const forgedCertDer = buildCertificate(realParsed.tbsCertificateDer, forgedSignatureDer);
+    const forgedCertDer = buildCertificate(realParsed.tbsCertificateDer, forgedSignatureDer, "P-256");
     const forgedPem = certificateToPem(forgedCertDer);
 
     expect(
@@ -3544,10 +3553,11 @@ describe("verifyClientCertificateIssuedBy", () => {
         extendedKeyUsageClientAuthExtension(),
         subjectKeyIdentifierExtension(leafSki)
         // intentionally no authorityKeyIdentifierExtension
-      ]
+      ],
+      issuerCurve: "P-256"
     });
     const signature = await signDer(realCa.privateKey, tbsCertificateDer);
-    const certPem = certificateToPem(buildCertificate(tbsCertificateDer, signature));
+    const certPem = certificateToPem(buildCertificate(tbsCertificateDer, signature, "P-256"));
 
     expect(
       await verifyClientCertificateIssuedBy({ ca: realCa, certPem })
@@ -3576,10 +3586,11 @@ describe("verifyClientCertificateIssuedBy", () => {
         extendedKeyUsageClientAuthExtension(),
         subjectKeyIdentifierExtension(leafSki),
         authorityKeyIdentifierExtension(wrongAki)
-      ]
+      ],
+      issuerCurve: "P-256"
     });
     const signature = await signDer(realCa.privateKey, tbsCertificateDer);
-    const certPem = certificateToPem(buildCertificate(tbsCertificateDer, signature));
+    const certPem = certificateToPem(buildCertificate(tbsCertificateDer, signature, "P-256"));
 
     expect(
       await verifyClientCertificateIssuedBy({ ca: realCa, certPem })
@@ -3862,21 +3873,6 @@ describe("subject encodes repeated attribute types in order", () => {
 });
 
 describe("CryptoKey input boundary failures", () => {
-  it("rejects createRootCA when keyPair uses a non-P-256 curve", async () => {
-    const wrongCurve = await crypto.subtle.generateKey(
-      { name: "ECDSA", namedCurve: "P-384" },
-      true,
-      ["sign", "verify"]
-    );
-    await expect(
-      createRootCA({
-        subject: rootSubject,
-        days: 365,
-        keyPair: wrongCurve
-      })
-    ).rejects.toThrow();
-  });
-
   it("rejects createRootCA when keyPair uses a non-ECDSA algorithm", async () => {
     const rsa = await crypto.subtle.generateKey(
       {
@@ -3894,7 +3890,7 @@ describe("CryptoKey input boundary failures", () => {
         days: 365,
         keyPair: rsa
       })
-    ).rejects.toThrow();
+    ).rejects.toThrow("Expected ECDSA key");
   });
 
   it("rejects createRootCA when keyPair.publicKey is not extractable", async () => {
@@ -3924,21 +3920,6 @@ describe("CryptoKey input boundary failures", () => {
     ).rejects.toThrow();
   });
 
-  it("rejects importCertificateAuthority when privateKey uses a non-P-256 curve", async () => {
-    const root = await createRootCA({ subject: rootSubject, days: 3650 });
-    const wrongCurve = await crypto.subtle.generateKey(
-      { name: "ECDSA", namedCurve: "P-384" },
-      true,
-      ["sign", "verify"]
-    );
-    await expect(
-      importCertificateAuthority({
-        certPem: root.certPem,
-        privateKey: wrongCurve.privateKey
-      })
-    ).rejects.toThrow();
-  });
-
   it("rejects importCertificateAuthority when privateKey is RSA, not ECDSA", async () => {
     const root = await createRootCA({ subject: rootSubject, days: 3650 });
     const rsa = await crypto.subtle.generateKey(
@@ -3956,6 +3937,874 @@ describe("CryptoKey input boundary failures", () => {
         certPem: root.certPem,
         privateKey: rsa.privateKey
       })
+    ).rejects.toThrow("Expected ECDSA key");
+  });
+
+  it("rejects importCertificateAuthority when privateKey curve does not match certificate's curve", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const wrongCurve = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-384" },
+      true,
+      ["sign", "verify"]
+    );
+    await expect(
+      importCertificateAuthority({
+        certPem: root.certPem,
+        privateKey: wrongCurve.privateKey
+      })
     ).rejects.toThrow();
+  });
+});
+
+describe("importPublicKeySpki error paths", () => {
+  it("rejects a non-SEQUENCE root", async () => {
+    await expect(importPublicKeySpki(new Uint8Array([0x04, 0x00]))).rejects.toThrow(
+      "Invalid SubjectPublicKeyInfo"
+    );
+  });
+
+  it("rejects when the algorithm element is not a SEQUENCE", async () => {
+    const bad = sequence(integer(0), bitString(new Uint8Array([0x04])));
+    await expect(importPublicKeySpki(bad)).rejects.toThrow("Invalid SubjectPublicKeyInfo algorithm");
+  });
+
+  it("rejects when the algorithm OID is missing or wrong-tagged", async () => {
+    const bad = sequence(sequence(integer(0)), bitString(new Uint8Array([0x04])));
+    await expect(importPublicKeySpki(bad)).rejects.toThrow(
+      "Invalid SubjectPublicKeyInfo algorithm OID"
+    );
+  });
+
+  it("rejects when the algorithm OID is not id-ecPublicKey", async () => {
+    const bad = sequence(
+      sequence(oid("1.2.840.113549.1.1.1"), oid(OID.secp256r1)),
+      bitString(new Uint8Array([0x04]))
+    );
+    await expect(importPublicKeySpki(bad)).rejects.toThrow(
+      "SubjectPublicKeyInfo is not an EC public key"
+    );
+  });
+
+  it("rejects when EC parameters are missing or not a named-curve OID", async () => {
+    const bad = sequence(
+      sequence(oid(OID.ecPublicKey), integer(0)),
+      bitString(new Uint8Array([0x04]))
+    );
+    await expect(importPublicKeySpki(bad)).rejects.toThrow(
+      "EC SubjectPublicKeyInfo parameters must be a named-curve OID"
+    );
+  });
+
+  it("rejects when the named-curve OID is not P-256/384/521", async () => {
+    const secp192r1 = "1.2.840.10045.3.1.1";
+    const bad = sequence(
+      sequence(oid(OID.ecPublicKey), oid(secp192r1)),
+      bitString(new Uint8Array([0x04]))
+    );
+    await expect(importPublicKeySpki(bad)).rejects.toThrow("Unsupported EC named curve OID");
+  });
+});
+
+describe("multi-curve ECDSA support", () => {
+  for (const curve of ["P-256", "P-384", "P-521"] as const) {
+    it(`creates a self-signed root and issues a leaf with ${curve}`, async () => {
+      const keyPair = await crypto.subtle.generateKey(
+        { name: "ECDSA", namedCurve: curve },
+        true,
+        ["sign", "verify"]
+      );
+      const root = await createRootCA({
+        subject: rootSubject,
+        days: 3650,
+        keyPair
+      });
+      expect((root.privateKey.algorithm as EcKeyAlgorithm).namedCurve).toBe(curve);
+
+      const client = await issueClientCert({
+        ca: root,
+        subject: clientSubject,
+        days: 30
+      });
+      const parsedRoot = await parseCertificate(root.certDer);
+      const parsedClient = await parseCertificate(client.certDer);
+      await expect(expectSignatureValid(parsedRoot, parsedRoot)).resolves.toBe(true);
+      await expect(expectSignatureValid(parsedRoot, parsedClient)).resolves.toBe(true);
+      expect(
+        await verifyClientCertificateIssuedBy({ ca: root, certPem: client.certPem })
+      ).toBe(true);
+    });
+  }
+
+  it("issues a P-384 intermediate from a P-256 root and a leaf below it", async () => {
+    const rootKeyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const intermediateKeyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-384" },
+      true,
+      ["sign", "verify"]
+    );
+    const root = await createRootCA({
+      subject: rootSubject,
+      days: 3650,
+      keyPair: rootKeyPair
+    });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365,
+      keyPair: intermediateKeyPair
+    });
+    expect((intermediate.privateKey.algorithm as EcKeyAlgorithm).namedCurve).toBe("P-384");
+
+    const parsedRoot = await parseCertificate(root.certDer);
+    const parsedIntermediate = await parseCertificate(intermediate.certDer);
+    await expect(expectSignatureValid(parsedRoot, parsedIntermediate)).resolves.toBe(true);
+
+    const client = await issueClientCert({
+      ca: intermediate,
+      subject: clientSubject,
+      days: 30
+    });
+    const parsedClient = await parseCertificate(client.certDer);
+    await expect(expectSignatureValid(parsedIntermediate, parsedClient)).resolves.toBe(true);
+  });
+
+  it("re-imports a P-521 root via importCertificateAuthority", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-521" },
+      true,
+      ["sign", "verify"]
+    );
+    const root = await createRootCA({ subject: rootSubject, days: 3650, keyPair });
+    const reimported = await importCertificateAuthority({
+      certPem: root.certPem,
+      privateKey: root.privateKey
+    });
+    expect((reimported.publicKey.algorithm as EcKeyAlgorithm).namedCurve).toBe("P-521");
+    const client = await issueClientCert({
+      ca: reimported,
+      subject: clientSubject,
+      days: 30
+    });
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: reimported, certPem: client.certPem })
+    ).toBe(true);
+  });
+});
+
+describe("issueClientCertForPublicKey", () => {
+  it("issues a client cert from a caller-provided P-256 public key without returning a private key", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const subjectKeyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const issued = await issueClientCertForPublicKey({
+      ca: root,
+      publicKey: subjectKeyPair.publicKey,
+      subject: clientSubject,
+      days: 30,
+      dnsNames: ["client.example.test"]
+    });
+
+    expect((issued as object).hasOwnProperty("privateKey")).toBe(false);
+    expect(splitPemBlocks(issued.certChainPem)).toEqual([
+      issued.certPem.trim(),
+      root.certPem.trim()
+    ]);
+
+    const parsedRoot = await parseCertificate(root.certDer);
+    const parsedClient = await parseCertificate(issued.certDer);
+    await expect(expectSignatureValid(parsedRoot, parsedClient)).resolves.toBe(true);
+
+    // Subject cert SPKI matches the caller's public key.
+    const callerSpki = await exportSpki(subjectKeyPair.publicKey);
+    expect(Array.from(parsedClient.subjectPublicKeyInfoDer)).toEqual(Array.from(callerSpki));
+
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: root, certPem: issued.certPem })
+    ).toBe(true);
+  });
+
+  it("issues a P-384 client cert under a P-256 CA when only the public key is provided", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const subjectKeyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-384" },
+      true,
+      ["sign", "verify"]
+    );
+    const issued = await issueClientCertForPublicKey({
+      ca: root,
+      publicKey: subjectKeyPair.publicKey,
+      subject: clientSubject,
+      days: 30
+    });
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: root, certPem: issued.certPem })
+    ).toBe(true);
+  });
+
+  it("rejects issueClientCertForPublicKey when ca is a non-CA leaf", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const leaf = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
+    const reimportedLeaf = await importCertificateAuthority({
+      certPem: leaf.certPem,
+      privateKey: leaf.privateKey,
+      issuerChainPem: root.certPem
+    });
+    const otherKey = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    await expect(
+      issueClientCertForPublicKey({
+        ca: reimportedLeaf,
+        publicKey: otherKey.publicKey,
+        subject: [{ type: "CN", value: "blocked" }],
+        days: 30
+      })
+    ).rejects.toThrow("Issuer certificate is not a CA");
+  });
+});
+
+describe("CSR parsing and POP verification", () => {
+  it("parses a valid P-256 CSR with subject and SAN extensionRequest", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const fixture = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      dnsNames: ["client.example.test", "alt.example.test"],
+      ipAddresses: [{ v4: [10, 0, 0, 1] }]
+    });
+    const parsed = await parseCertificateSigningRequest(fixture.der);
+    expect(parsed.subject).toEqual(clientSubject);
+    expect(parsed.requestedDnsNames).toEqual(["client.example.test", "alt.example.test"]);
+    expect(parsed.requestedIpAddresses).toEqual(["10.0.0.1"]);
+    expect(parsed.signatureAlgorithmOid).toBe(OID.ecdsaWithSha256);
+    expect(parsed.requestedExtensions.length).toBe(1);
+    expect(parsed.requestedExtensions[0]!.oid).toBe(OID.subjectAltName);
+    expect(parsed.otherAttributes.length).toBe(0);
+    expect(await verifyCertificateSigningRequestSignature(parsed)).toBe(true);
+  });
+
+  for (const curve of ["P-384", "P-521"] as const) {
+    it(`parses a valid ${curve} CSR and verifies its POP signature`, async () => {
+      const keyPair = await crypto.subtle.generateKey(
+        { name: "ECDSA", namedCurve: curve },
+        true,
+        ["sign", "verify"]
+      );
+      const fixture = await buildCsrFixture({ subject: clientSubject, keyPair });
+      const parsed = await parseCertificateSigningRequest(fixture.der);
+      expect((parsed.publicKey.algorithm as EcKeyAlgorithm).namedCurve).toBe(curve);
+      expect(await verifyCertificateSigningRequestSignature(parsed)).toBe(true);
+    });
+  }
+
+  it("accepts an IPv6 SAN and decodes the bytes back to RFC 5952 form", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const fixture = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      ipAddresses: [{ v6: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] }]
+    });
+    const parsed = await parseCertificateSigningRequest(fixture.der);
+    expect(parsed.requestedIpAddresses).toEqual(["2001:db8::1"]);
+  });
+
+  it("accepts both CERTIFICATE REQUEST and NEW CERTIFICATE REQUEST PEM labels", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const fixture = await buildCsrFixture({ subject: clientSubject, keyPair });
+    const fromStandard = await parseCertificateSigningRequest(fixture.pem);
+    const fromLegacy = await parseCertificateSigningRequest(fixture.legacyPem);
+    expect(fromStandard.subject).toEqual(clientSubject);
+    expect(fromLegacy.subject).toEqual(clientSubject);
+  });
+
+  it("returns false from POP verification when the signature is broken", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const fixture = await buildCsrFixture({ subject: clientSubject, keyPair });
+    const parsed = await parseCertificateSigningRequest(fixture.der);
+    // Flip a bit inside the certificationRequestInfo to invalidate the signature
+    // without breaking the DER framing.
+    const tampered: typeof parsed = {
+      ...parsed,
+      certificationRequestInfoDer: parsed.certificationRequestInfoDer.slice()
+    };
+    tampered.certificationRequestInfoDer[tampered.certificationRequestInfoDer.length - 1] ^= 0xff;
+    expect(await verifyCertificateSigningRequestSignature(tampered)).toBe(false);
+  });
+
+  it("rejects a CSR whose signatureAlgorithm is not ECDSA P-256/384/521", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const fixture = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      // RSA-SHA256 OID — out of scope for EdgCA.
+      signatureAlgorithmOid: "1.2.840.113549.1.1.11"
+    });
+    await expect(parseCertificateSigningRequest(fixture.der)).rejects.toThrow(
+      "Unsupported CSR signatureAlgorithm"
+    );
+  });
+
+  it("preserves non-extensionRequest attributes as raw values", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    // PKCS#9 challengePassword (1.2.840.113549.1.9.7), IA5String value.
+    const challengePasswordOid = "1.2.840.113549.1.9.7";
+    const challengeValue = ia5String("hunter2");
+    const fixture = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      extraAttributes: [{ oid: challengePasswordOid, valuesDer: [challengeValue] }]
+    });
+    const parsed = await parseCertificateSigningRequest(fixture.der);
+    expect(parsed.otherAttributes.length).toBe(1);
+    expect(parsed.otherAttributes[0]!.oid).toBe(challengePasswordOid);
+    expect(parsed.otherAttributes[0]!.valuesDer.length).toBe(1);
+    expect(Array.from(parsed.otherAttributes[0]!.valuesDer[0]!)).toEqual(Array.from(challengeValue));
+  });
+
+  it("decodes PrintableString and IA5String subject values", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const subject: Subject = [
+      { type: "C", value: "JP" },              // PrintableString
+      { type: "E", value: "user@example.com" } // IA5String
+    ];
+    const fixture = await buildCsrFixture({ subject, keyPair });
+    const parsed = await parseCertificateSigningRequest(fixture.der);
+    expect(parsed.subject).toEqual(subject);
+  });
+
+  it("rejects malformed CSR DER inputs", async () => {
+    await expect(parseCertificateSigningRequest(new Uint8Array([0x04, 0x00]))).rejects.toThrow("Invalid CSR DER");
+
+    // Outer SEQUENCE with trailing byte → length doesn't match.
+    const inner = sequence(integer(0));
+    const trailingExtra = new Uint8Array(inner.length + 1);
+    trailingExtra.set(inner);
+    trailingExtra[inner.length] = 0;
+    await expect(parseCertificateSigningRequest(trailingExtra)).rejects.toThrow();
+
+    // SEQUENCE with too few children.
+    await expect(parseCertificateSigningRequest(sequence(integer(0)))).rejects.toThrow("Invalid CSR structure");
+
+    // requestInfo is not a SEQUENCE.
+    const badReqInfo = sequence(integer(0), sequence(oid(OID.ecdsaWithSha256)), bitString(new Uint8Array([0x00])));
+    await expect(parseCertificateSigningRequest(badReqInfo)).rejects.toThrow(
+      "Invalid CSR certificationRequestInfo"
+    );
+
+    // signatureAlgorithm is not a SEQUENCE.
+    const badSigAlg = sequence(sequence(integer(0)), integer(0), bitString(new Uint8Array([0x00])));
+    await expect(parseCertificateSigningRequest(badSigAlg)).rejects.toThrow("Invalid CSR signatureAlgorithm");
+
+    // signatureValue is not a BIT STRING / has nonzero unused-bits.
+    const badSig = sequence(
+      sequence(integer(0)),
+      sequence(oid(OID.ecdsaWithSha256)),
+      // BIT STRING but leading byte is 1, not 0 (indicating unused bits ≠ 0).
+      new Uint8Array([0x03, 0x02, 0x01, 0x00])
+    );
+    await expect(parseCertificateSigningRequest(badSig)).rejects.toThrow("Invalid CSR signature value");
+  });
+
+  it("rejects unsupported CSR version and malformed CRI structure", async () => {
+    // CRI with no version field at all (missing CRI children).
+    const ecdsaSigAlg = sequence(oid(OID.ecdsaWithSha256));
+    const sig = bitString(new Uint8Array(70).fill(0x00));
+    const briefCri = sequence();
+    const csrBrief = sequence(briefCri, ecdsaSigAlg, sig);
+    await expect(parseCertificateSigningRequest(csrBrief)).rejects.toThrow(
+      "Invalid CSR certificationRequestInfo structure"
+    );
+
+    // CRI with version=1 (only v1 / INTEGER 0 is allowed).
+    const fakeName = sequence(); // empty
+    const fakeSpki = sequence(); // empty
+    const v2Cri = sequence(integer(1), fakeName, fakeSpki);
+    const csrV2 = sequence(v2Cri, ecdsaSigAlg, sig);
+    await expect(parseCertificateSigningRequest(csrV2)).rejects.toThrow(
+      "Unsupported CSR version"
+    );
+
+    // CRI where SPKI is not a SEQUENCE.
+    const badSpki = new Uint8Array([0x04, 0x01, 0x00]);
+    const badSpkiCri = sequence(integer(0), fakeName, badSpki);
+    const csrBadSpki = sequence(badSpkiCri, ecdsaSigAlg, sig);
+    await expect(parseCertificateSigningRequest(csrBadSpki)).rejects.toThrow(
+      "Invalid CSR subjectPublicKeyInfo"
+    );
+  });
+
+  it("rejects a CSR whose attributes field is not tagged with IMPLICIT [0]", async () => {
+    // Construct a CSR where the 4th CRI child has tag 0xa1 instead of 0xa0.
+    const ecdsaSigAlg = sequence(oid(OID.ecdsaWithSha256));
+    const sig = bitString(new Uint8Array(70).fill(0x00));
+    const validSpki = sequence(
+      sequence(oid(OID.ecPublicKey), oid(OID.secp256r1)),
+      bitString(new Uint8Array(65).fill(0x04))
+    );
+    const minimalName = sequence(set(sequence(oid("2.5.4.3"), new Uint8Array([0x0c, 0x01, 0x61]))));
+    const wrongTagAttributes = der(0xa1, new Uint8Array(0));
+    const cri = sequence(integer(0), minimalName, validSpki, wrongTagAttributes);
+    const csr = sequence(cri, ecdsaSigAlg, sig);
+    await expect(parseCertificateSigningRequest(csr)).rejects.toThrow(
+      "Invalid CSR attributes tag"
+    );
+  });
+
+  it("rejects CSR PEM with the wrong block label", async () => {
+    await expect(
+      parseCertificateSigningRequest("-----BEGIN PUBLIC KEY-----\nAA==\n-----END PUBLIC KEY-----")
+    ).rejects.toThrow("Invalid CSR PEM");
+  });
+
+  it("rejects an algorithm identifier whose first child is not an OID", async () => {
+    const ecdsaSigAlgWithBoolean = sequence(new Uint8Array([0x01, 0x01, 0xff]));
+    const fakeName = sequence();
+    const fakeSpki = sequence(sequence(oid(OID.ecPublicKey), oid(OID.secp256r1)), bitString(new Uint8Array([0x04])));
+    const cri = sequence(integer(0), fakeName, fakeSpki);
+    const csr = sequence(cri, ecdsaSigAlgWithBoolean, bitString(new Uint8Array([0x00])));
+    await expect(parseCertificateSigningRequest(csr)).rejects.toThrow("Invalid AlgorithmIdentifier OID");
+  });
+
+  it("rejects malformed Name structures inside the CSR", async () => {
+    const realKey = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const validSpki = await exportSpki(realKey.publicKey);
+    const ecdsaSigAlg = sequence(oid(OID.ecdsaWithSha256));
+    const sig = bitString(new Uint8Array(70).fill(0x00));
+
+    // Name where an RDN is not a SET.
+    const rdnNotSet = sequence(sequence(integer(0)));
+    const csrRdnNotSet = sequence(sequence(integer(0), rdnNotSet, validSpki), ecdsaSigAlg, sig);
+    await expect(parseCertificateSigningRequest(csrRdnNotSet)).rejects.toThrow("Invalid RDN");
+
+    // Multi-valued RDN.
+    const dummyAttr = sequence(oid(OID.basicConstraints), new Uint8Array([0x0c, 0x01, 0x61]));
+    const multiValuedRdn = sequence(set(dummyAttr, dummyAttr));
+    const csrMulti = sequence(sequence(integer(0), multiValuedRdn, validSpki), ecdsaSigAlg, sig);
+    await expect(parseCertificateSigningRequest(csrMulti)).rejects.toThrow(
+      "Multi-valued RDNs are not supported"
+    );
+
+    // Non-SEQUENCE AttributeTypeAndValue.
+    const notSeqAttr = new Uint8Array([0x04, 0x00]);
+    const badAttrRdn = sequence(set(notSeqAttr));
+    const csrBadAttr = sequence(sequence(integer(0), badAttrRdn, validSpki), ecdsaSigAlg, sig);
+    await expect(parseCertificateSigningRequest(csrBadAttr)).rejects.toThrow(
+      "Invalid AttributeTypeAndValue"
+    );
+
+    // AttributeTypeAndValue missing value.
+    const incompleteAttr = sequence(oid("2.5.4.3"));
+    const incompleteRdn = sequence(set(incompleteAttr));
+    const csrIncomplete = sequence(sequence(integer(0), incompleteRdn, validSpki), ecdsaSigAlg, sig);
+    await expect(parseCertificateSigningRequest(csrIncomplete)).rejects.toThrow(
+      "Invalid AttributeTypeAndValue contents"
+    );
+
+    // Unsupported attribute value string type (use INTEGER tag where a string is expected).
+    const unsupportedTypeAttr = sequence(oid("2.5.4.3"), integer(7));
+    const unsupportedTypeRdn = sequence(set(unsupportedTypeAttr));
+    const csrUnsupportedType = sequence(
+      sequence(integer(0), unsupportedTypeRdn, validSpki),
+      ecdsaSigAlg,
+      sig
+    );
+    await expect(parseCertificateSigningRequest(csrUnsupportedType)).rejects.toThrow(
+      "Unsupported AttributeValue string type"
+    );
+  });
+
+  it("rejects malformed CSR attributes/extensions", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+
+    // extensionRequest with two values (must be exactly one SEQUENCE OF Extension).
+    const dummyExtension = sequence(oid(OID.subjectAltName), octetString(sequence()));
+    const dummyExtensionsSeq = sequence(dummyExtension);
+    const fixtureMultiValues = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      extraAttributes: [
+        {
+          oid: OID.extensionRequest,
+          valuesDer: [dummyExtensionsSeq, dummyExtensionsSeq]
+        }
+      ]
+    });
+    await expect(parseCertificateSigningRequest(fixtureMultiValues.der)).rejects.toThrow(
+      "extensionRequest attribute must contain exactly one SEQUENCE OF Extension"
+    );
+
+    // extensionRequest value that is not a SEQUENCE.
+    const fixtureNotSequence = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      extraAttributes: [
+        {
+          oid: OID.extensionRequest,
+          valuesDer: [new Uint8Array([0x04, 0x00])]
+        }
+      ]
+    });
+    await expect(parseCertificateSigningRequest(fixtureNotSequence.der)).rejects.toThrow(
+      "extensionRequest value must be a SEQUENCE OF Extension"
+    );
+
+    // Extension that is not a SEQUENCE.
+    const fixtureBadExtension = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      extraAttributes: [
+        {
+          oid: OID.extensionRequest,
+          valuesDer: [sequence(new Uint8Array([0x04, 0x00]))]
+        }
+      ]
+    });
+    await expect(parseCertificateSigningRequest(fixtureBadExtension.der)).rejects.toThrow(
+      "Invalid Extension"
+    );
+
+    // Extension whose first child is not an OID.
+    const noOidExt = sequence(integer(0), octetString(sequence()));
+    const fixtureNoOid = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      extraAttributes: [
+        { oid: OID.extensionRequest, valuesDer: [sequence(noOidExt)] }
+      ]
+    });
+    await expect(parseCertificateSigningRequest(fixtureNoOid.der)).rejects.toThrow("Invalid Extension OID");
+
+    // Extension value not OCTET STRING.
+    const noOctetExt = sequence(oid(OID.subjectAltName), integer(0));
+    const fixtureNoOctet = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      extraAttributes: [
+        { oid: OID.extensionRequest, valuesDer: [sequence(noOctetExt)] }
+      ]
+    });
+    await expect(parseCertificateSigningRequest(fixtureNoOctet.der)).rejects.toThrow(
+      "Invalid Extension value"
+    );
+  });
+
+  it("rejects malformed top-level CSR attributes", async () => {
+    const realKey = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const realSpki = await exportSpki(realKey.publicKey);
+    const ecdsaSigAlg = sequence(oid(OID.ecdsaWithSha256));
+    const sig = bitString(new Uint8Array(70).fill(0x00));
+    const validSpki = realSpki;
+    const minimalName = sequence(set(sequence(oid("2.5.4.3"), new Uint8Array([0x0c, 0x01, 0x61]))));
+
+    // Attribute child not a SEQUENCE.
+    const notSeqAttr = new Uint8Array([0x04, 0x00]);
+    const badAttrs = der(0xa0, notSeqAttr);
+    const csrBadAttr = sequence(sequence(integer(0), minimalName, validSpki, badAttrs), ecdsaSigAlg, sig);
+    await expect(parseCertificateSigningRequest(csrBadAttr)).rejects.toThrow("Invalid CSR attribute");
+
+    // Attribute first child not an OID.
+    const noOidAttr = sequence(integer(0), set(integer(0)));
+    const badAttrs2 = der(0xa0, noOidAttr);
+    const csrNoOid = sequence(sequence(integer(0), minimalName, validSpki, badAttrs2), ecdsaSigAlg, sig);
+    await expect(parseCertificateSigningRequest(csrNoOid)).rejects.toThrow("Invalid CSR attribute OID");
+
+    // Attribute values not SET.
+    const wrongValuesAttr = sequence(oid("1.2.3.4"), integer(0));
+    const badAttrs3 = der(0xa0, wrongValuesAttr);
+    const csrWrongValues = sequence(
+      sequence(integer(0), minimalName, validSpki, badAttrs3),
+      ecdsaSigAlg,
+      sig
+    );
+    await expect(parseCertificateSigningRequest(csrWrongValues)).rejects.toThrow(
+      "Invalid CSR attribute values"
+    );
+  });
+
+  it("rejects malformed SAN inside extensionRequest", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+
+    // SAN extension whose value (after stripping OCTET STRING wrapper) is not a SEQUENCE.
+    const badSanExtension = sequence(
+      oid(OID.subjectAltName),
+      octetString(new Uint8Array([0x04, 0x00]))
+    );
+    const fixtureBadSan = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      extraAttributes: [
+        { oid: OID.extensionRequest, valuesDer: [sequence(badSanExtension)] }
+      ]
+    });
+    await expect(parseCertificateSigningRequest(fixtureBadSan.der)).rejects.toThrow(
+      "Invalid SubjectAltName extension"
+    );
+
+    // SAN dNSName containing a non-ASCII byte.
+    const badDnsName = der(0x82, new Uint8Array([0xff, 0x01]));
+    const sanWithBadDns = sequence(
+      oid(OID.subjectAltName),
+      octetString(sequence(badDnsName))
+    );
+    const fixtureBadDns = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      extraAttributes: [
+        { oid: OID.extensionRequest, valuesDer: [sequence(sanWithBadDns)] }
+      ]
+    });
+    await expect(parseCertificateSigningRequest(fixtureBadDns.der)).rejects.toThrow(
+      "non-ASCII byte"
+    );
+
+    // SAN iPAddress with invalid byte length (3 bytes — neither IPv4 nor IPv6).
+    const badIp = der(0x87, new Uint8Array([1, 2, 3]));
+    const sanWithBadIp = sequence(
+      oid(OID.subjectAltName),
+      octetString(sequence(badIp))
+    );
+    const fixtureBadIp = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      extraAttributes: [
+        { oid: OID.extensionRequest, valuesDer: [sequence(sanWithBadIp)] }
+      ]
+    });
+    await expect(parseCertificateSigningRequest(fixtureBadIp.der)).rejects.toThrow(
+      "Invalid SAN iPAddress length"
+    );
+  });
+
+  it("formats an IPv6 address with no compressible run as full eight groups", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    // 16 bytes that produce no run of two consecutive zero groups.
+    const noZeroRun = [
+      0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0x00, 0x02,
+      0x00, 0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x06
+    ];
+    const fixture = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      ipAddresses: [{ v6: noZeroRun }]
+    });
+    const parsed = await parseCertificateSigningRequest(fixture.der);
+    expect(parsed.requestedIpAddresses).toEqual(["2001:db8:1:2:3:4:5:6"]);
+  });
+
+  it("preserves the critical flag on requested extensions", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const fixture = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      extraExtensions: [
+        { oid: "2.5.29.19", critical: true, valueDer: sequence() } // basicConstraints with critical=true
+      ]
+    });
+    const parsed = await parseCertificateSigningRequest(fixture.der);
+    const basicConstraints = parsed.requestedExtensions.find((ext) => ext.oid === "2.5.29.19");
+    expect(basicConstraints?.critical).toBe(true);
+  });
+
+  it("rejects a CSR whose subject element is not a SEQUENCE", async () => {
+    const realKey = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const realSpki = await exportSpki(realKey.publicKey);
+    const ecdsaSigAlg = sequence(oid(OID.ecdsaWithSha256));
+    const sig = bitString(new Uint8Array(70).fill(0x00));
+    // subject is an INTEGER instead of a SEQUENCE.
+    const cri = sequence(integer(0), integer(0), realSpki);
+    const csr = sequence(cri, ecdsaSigAlg, sig);
+    await expect(parseCertificateSigningRequest(csr)).rejects.toThrow("Invalid Name structure");
+  });
+
+  it("rejects a forged CryptoKey whose namedCurve is not P-256/384/521", async () => {
+    const real = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const forged = Object.create(Object.getPrototypeOf(real.privateKey), {
+      algorithm: { value: { name: "ECDSA", namedCurve: "P-192" }, enumerable: true },
+      type: { value: "private", enumerable: true },
+      usages: { value: ["sign"], enumerable: true },
+      extractable: { value: false, enumerable: true }
+    }) as CryptoKey;
+    await expect(signDer(forged, new Uint8Array([1, 2, 3]))).rejects.toThrow(
+      "Unsupported ECDSA curve: P-192"
+    );
+  });
+
+  it("parses a CSR whose attributes field is absent entirely", async () => {
+    const realKey = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const realSpki = await exportSpki(realKey.publicKey);
+    const minimalName = encodeName(clientSubject);
+    // CRI without the [0] IMPLICIT Attributes field at all.
+    const cri = sequence(integer(0), minimalName, realSpki);
+    const rawSig = new Uint8Array(
+      await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, realKey.privateKey, cri)
+    );
+    const sigDer = ecdsaRawToDer(rawSig, 32);
+    const csr = sequence(cri, sequence(oid(OID.ecdsaWithSha256)), bitString(sigDer));
+    const parsed = await parseCertificateSigningRequest(csr);
+    expect(parsed.requestedExtensions).toEqual([]);
+    expect(parsed.otherAttributes).toEqual([]);
+    expect(await verifyCertificateSigningRequestSignature(parsed)).toBe(true);
+  });
+
+  it("preserves dotted-OID subject types in the parsed Subject", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const subject: Subject = [
+      { type: "CN", value: "alice" },
+      { type: "1.2.3.4.5", value: "custom-attr-value" }
+    ];
+    const fixture = await buildCsrFixture({ subject, keyPair });
+    const parsed = await parseCertificateSigningRequest(fixture.der);
+    expect(parsed.subject).toEqual(subject);
+  });
+
+  it("ignores SAN GeneralName tags other than dNSName and iPAddress", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    // GeneralName.uniformResourceIdentifier = [6] IA5String — should be silently skipped
+    // by the parser (only dNSName and iPAddress are surfaced).
+    const uri = der(0x86, asciiBytes("https://example.test"));
+    const dnsName = der(0x82, asciiBytes("client.example.test"));
+    const sanExtension = sequence(
+      oid(OID.subjectAltName),
+      octetString(sequence(uri, dnsName))
+    );
+    const fixture = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      extraAttributes: [
+        { oid: OID.extensionRequest, valuesDer: [sequence(sanExtension)] }
+      ]
+    });
+    const parsed = await parseCertificateSigningRequest(fixture.der);
+    expect(parsed.requestedDnsNames).toEqual(["client.example.test"]);
+    expect(parsed.requestedIpAddresses).toEqual([]);
+  });
+
+  it("compresses the longest zero run in IPv6 SAN even when a shorter run also exists", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    // 2001:0:0:abcd:0:0:0:1 → longest run is the second three-zero run.
+    const bytes = [
+      0x20, 0x01, 0x00, 0x00, 0x00, 0x00, 0xab, 0xcd,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
+    ];
+    const fixture = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      ipAddresses: [{ v6: bytes }]
+    });
+    const parsed = await parseCertificateSigningRequest(fixture.der);
+    expect(parsed.requestedIpAddresses).toEqual(["2001:0:0:abcd::1"]);
+  });
+
+  it("integrates: CSR is parsed, POP-verified, and re-issued via issueClientCertForPublicKey", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const subjectKeyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const fixture = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair: subjectKeyPair,
+      dnsNames: ["client.example.test"]
+    });
+    const csr = await parseCertificateSigningRequest(fixture.pem);
+    expect(await verifyCertificateSigningRequestSignature(csr)).toBe(true);
+
+    // Caller decides issuance fields independently from CSR contents.
+    const issued = await issueClientCertForPublicKey({
+      ca: root,
+      publicKey: csr.publicKey,
+      subject: csr.subject,
+      days: 30,
+      dnsNames: csr.requestedDnsNames as string[]
+    });
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: root, certPem: issued.certPem })
+    ).toBe(true);
   });
 });

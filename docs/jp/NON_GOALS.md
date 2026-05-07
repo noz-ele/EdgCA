@@ -36,9 +36,10 @@ EdgCA が**提供する**唯一の検証 API は `verifyClientCertificateIssuedB
 ## 4. 機能スコープ
 
 - **server certificate 発行なし**。client cert (mTLS) に専念。
-- **公開 certificate parsing API なし**。`parser.ts` は internal。
+- **公開 certificate parsing API なし**。`parser.ts` は internal — Cloudflare 側が `cf.tlsClientAuth.cert*` で parse 済み値を提供するため library で重複実装する意味がない。一方 **CSR parser は scope 内** (`parseCertificateSigningRequest`)。CSR は client から application layer 経由で来る入力で、Cloudflare 側に等価機能がない。
 - **3 段以上の CA 階層なし**。最大 `root → intermediate → client`。intermediate のさらに下に intermediate は作れない。
-- **RSA / Ed25519 / P-384 など他鍵種なし**。P-256 ECDSA 固定。
+- **RSA / Ed25519 / 非 NIST curve なし**。ECDSA NIST P-256 / P-384 / P-521 をサポート (それぞれ SHA-256 / SHA-384 / SHA-512 の標準ペアリング)。それ以外のアルゴリズム — CSR 内も含め — は reject。
+- **発行可否ポリシーなし**。CSR を parse して subject/SAN と POP を取り出すが、その CSR を honor するかは library が判断しない。発行 cert に何の subject/SAN を入れるかは caller が決める。
 - **暗号化された PKCS#8 PEM (encrypted private key) なし**。
 - **X.509 v1 / v2 の受け入れなし**。`importCertificateAuthority` は v3 (`[0] EXPLICIT INTEGER 2`) のみ accept。version field 不在 (v1) や `INTEGER 1` (v2) の cert は throw。EdgCA 自身は常に v3 を emit する。外部由来の旧 version cert を import するユースケースはサポートしない。
 

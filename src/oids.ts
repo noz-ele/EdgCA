@@ -1,14 +1,21 @@
 import type { ShortSubjectAttributeType } from "./types.js";
 
 export const OID = {
+  ecPublicKey: "1.2.840.10045.2.1",
+  secp256r1: "1.2.840.10045.3.1.7",
+  secp384r1: "1.3.132.0.34",
+  secp521r1: "1.3.132.0.35",
   ecdsaWithSha256: "1.2.840.10045.4.3.2",
+  ecdsaWithSha384: "1.2.840.10045.4.3.3",
+  ecdsaWithSha512: "1.2.840.10045.4.3.4",
   basicConstraints: "2.5.29.19",
   keyUsage: "2.5.29.15",
   extendedKeyUsage: "2.5.29.37",
   subjectAltName: "2.5.29.17",
   subjectKeyIdentifier: "2.5.29.14",
   authorityKeyIdentifier: "2.5.29.35",
-  clientAuth: "1.3.6.1.5.5.7.3.2"
+  clientAuth: "1.3.6.1.5.5.7.3.2",
+  extensionRequest: "1.2.840.113549.1.9.14"
 } as const;
 
 export const SUBJECT_ATTRIBUTE_OIDS: Record<ShortSubjectAttributeType, string> = {

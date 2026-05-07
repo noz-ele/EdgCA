@@ -36,9 +36,10 @@ Bad input should throw. Convenience features such as trim, dedup, and auto-compl
 ## 4. Functional scope
 
 - **No server certificate issuance.** Focused on client certs (mTLS).
-- **No public certificate parsing API.** `parser.ts` is internal.
+- **No public certificate parsing API.** `parser.ts` is internal — `cf.tlsClientAuth.cert*` already exposes parsed values from Cloudflare, so duplicating that here adds nothing. CSR parsing **is** in scope (`parseCertificateSigningRequest`) because no Cloudflare-side equivalent exists; CSRs come from the client over the application layer.
 - **No CA hierarchy beyond two levels.** At most `root → intermediate → client`. An intermediate cannot have an intermediate underneath it.
-- **No RSA / Ed25519 / P-384 or other key types.** P-256 ECDSA fixed.
+- **No RSA / Ed25519 / non-NIST curves.** ECDSA on NIST P-256 / P-384 / P-521 is supported (with their standard SHA-256 / SHA-384 / SHA-512 pairings). Other algorithms — including in CSRs — are rejected.
+- **No issuance policy.** When parsing a CSR, the library extracts the requested subject/SAN and verifies POP, but does not decide whether the CSR should be honored. The caller chooses what subject/SAN values go into the issued cert.
 - **No encrypted PKCS#8 PEM (encrypted private key).**
 - **No acceptance of X.509 v1 / v2.** `importCertificateAuthority` accepts only v3 (`[0] EXPLICIT INTEGER 2`). A cert with a missing version field (v1) or `INTEGER 1` (v2) throws. EdgCA itself always emits v3. Importing externally produced legacy-version certs is not a supported use case.
 

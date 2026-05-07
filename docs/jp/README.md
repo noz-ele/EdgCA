@@ -180,6 +180,38 @@ export default {
 - 「自 CA から発行されてない」「ウィンドウ外」は `false` 戻り値、入力 PEM/DER が壊れている等の不正入力は throw。エラー扱いを 2 段階に分けています。
 - `ca` には**直接の発行者 1 本**を渡してください。intermediate を介して発行した leaf を root に対して投げると `false` になります (chain 遡及はしません)。
 
+## CSR から発行する
+
+client が秘密鍵を自分で管理し PKCS#10 CSR を送ってくる場合、EdgCA は CSR を parse し、所持証明 (POP) 署名を検証し、CSR 内の公開鍵を埋めた証明書を発行できます。CSR が主張する subject / SAN は **library が自動採用しません** — 発行内容は呼び出し側が application 層のポリシーに従って明示的に渡します。
+
+```ts
+import {
+  issueClientCertForPublicKey,
+  parseCertificateSigningRequest,
+  verifyCertificateSigningRequestSignature
+} from "@noz-ele/edgca";
+
+const csr = await parseCertificateSigningRequest(csrPemFromClient);
+if (!await verifyCertificateSigningRequestSignature(csr)) {
+  return new Response("CSR proof-of-possession failed", { status: 400 });
+}
+
+// CSR の主張は csr.subject / csr.requestedDnsNames / csr.requestedIpAddresses
+// で参照できるが、それを発行値として採用するかは application 層のポリシー判断。
+const issued = await issueClientCertForPublicKey({
+  ca,
+  publicKey: csr.publicKey,
+  subject: policyDerivedSubject,
+  days: 30,
+  dnsNames: policyDerivedDnsNames
+});
+// issued には certPem / certDer / certChainPem のみが入る (privateKey は無い、client が保持しているため)。
+```
+
+`ecdsa-with-SHA256` / `ecdsa-with-SHA384` / `ecdsa-with-SHA512` 以外で署名された CSR は parse 時に明示エラーで reject されます。`extensionRequest` 以外の CSR-level attributes は raw DER として `csr.otherAttributes` に、SAN 以外の X.509 extensions は `csr.requestedExtensions` に `{ oid, critical, valueDer }` 形式で露出するので、必要なら呼び出し側で decode します。
+
+POP 検証は **「CSR を作った主体が対応する秘密鍵を持っている」しか証明しません**。発行可否 (subject/SAN の妥当性、enrollment の認可) は EdgCA の範囲外で、application 層と組み合わせて判断してください。
+
 ## Subject
 
 subject は構造化入力のみ受け付けます。`CN=dev-root,O=Example` のような DN 文字列は受け付けません。
@@ -205,13 +237,14 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 
 実装対象:
 
-- ECDSA P-256 + SHA-256。
+- ECDSA NIST P-256 / P-384 / P-521 (それぞれ SHA-256 / SHA-384 / SHA-512 と組み合わせ)。
 - WebCrypto による鍵生成、署名、digest、key import/export。
 - root CA 作成。
 - intermediate CA 発行。
-- mTLS client certificate 発行。
+- mTLS client certificate 発行 (内部鍵生成、または持ち込み公開鍵から発行)。
+- CSR (PKCS#10) の parse と所持証明 (POP) 署名検証。
 - 自己 CA からの発行かを判定する identity 確認 API (`verifyClientCertificateIssuedBy`、任意の時刻有効性 check 付き)。
-- PEM/DER helper。
+- PEM/DER helper (証明書のみ — 鍵は CryptoKey でやり取り)。
 - Basic Constraints、Key Usage、Extended Key Usage、Subject Alternative Name、SKI、AKI。
 
 意図的に対象外:
@@ -221,7 +254,9 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 - cert からの時刻 field の抽出。`verifyClientCertificateIssuedBy` の `validity` option は時刻 check 自体は提供するが、`notBefore` / `notAfter` 値は呼び出し側が `cf.tlsClientAuth` から渡す。
 - CRL、OCSP、失効 DB、失効確認。
 - 鍵の保管、暗号化保存、ローテーション永続化、KV/D1/R2/Secrets 連携。
-- RSA、EdDSA、別 elliptic curve。
+- RSA、EdDSA、別 elliptic curve (これらで署名された CSR は parse 時に reject)。
+- 一般的な certificate parsing API (Cloudflare が `cf.tlsClientAuth.cert*` で値を提供するので library で重複実装しない)。
+- 発行可否ポリシー判定 (CSR の主張 subject/SAN を採用するかなど) — caller の責務。
 - DN 文字列 parsing。
 - multi-valued RDN。
 

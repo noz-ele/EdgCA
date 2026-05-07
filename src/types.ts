@@ -73,6 +73,23 @@ export interface IssueClientCertOptions {
   ipAddresses?: string[];
 }
 
+export interface IssueClientCertForPublicKeyOptions {
+  ca: CertificateAuthority;
+  publicKey: CryptoKey;
+  subject: Subject;
+  days: number;
+  notBefore?: Date;
+  serialNumber?: SerialNumber;
+  dnsNames?: string[];
+  ipAddresses?: string[];
+}
+
+export interface IssuedClientCertificateForPublicKey {
+  certPem: string;
+  certDer: Uint8Array;
+  certChainPem: string;
+}
+
 export interface ImportCertificateAuthorityOptions {
   certPem: string;
   privateKey: CryptoKey;

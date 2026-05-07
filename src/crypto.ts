@@ -1,30 +1,81 @@
 import { arrayBufferFromBytes, concatBytes } from "./bytes.js";
-import { integer, readChildren, readElement, readSequenceChildren, sequence, TAG } from "./der.js";
+import { decodeOid, integer, readChildren, readElement, readSequenceChildren, sequence, TAG } from "./der.js";
+import { OID } from "./oids.js";
 
-const EC_ALGORITHM: EcKeyGenParams = {
-  name: "ECDSA",
-  namedCurve: "P-256"
+export type SupportedCurve = "P-256" | "P-384" | "P-521";
+
+const CURVE_PROFILE: Record<SupportedCurve, {
+  componentSize: number;
+  hash: "SHA-256" | "SHA-384" | "SHA-512";
+  signatureAlgorithmOid: string;
+  curveOid: string;
+}> = {
+  "P-256": {
+    componentSize: 32,
+    hash: "SHA-256",
+    signatureAlgorithmOid: OID.ecdsaWithSha256,
+    curveOid: OID.secp256r1
+  },
+  "P-384": {
+    componentSize: 48,
+    hash: "SHA-384",
+    signatureAlgorithmOid: OID.ecdsaWithSha384,
+    curveOid: OID.secp384r1
+  },
+  "P-521": {
+    componentSize: 66,
+    hash: "SHA-512",
+    signatureAlgorithmOid: OID.ecdsaWithSha512,
+    curveOid: OID.secp521r1
+  }
 };
 
-const ECDSA_SIGN_ALGORITHM: EcdsaParams = {
-  name: "ECDSA",
-  hash: "SHA-256"
+const CURVE_OID_TO_NAME: Record<string, SupportedCurve> = {
+  [OID.secp256r1]: "P-256",
+  [OID.secp384r1]: "P-384",
+  [OID.secp521r1]: "P-521"
 };
 
-export async function generateKeyPair(): Promise<CryptoKeyPair> {
-  return crypto.subtle.generateKey(EC_ALGORITHM, true, ["sign", "verify"]);
+export function curveOf(key: CryptoKey): SupportedCurve {
+  const algorithm = key.algorithm as { name?: string; namedCurve?: string };
+  if (algorithm.name !== "ECDSA") {
+    throw new Error(`Expected ECDSA key, got ${algorithm.name}`);
+  }
+  const curve = algorithm.namedCurve;
+  if (curve !== "P-256" && curve !== "P-384" && curve !== "P-521") {
+    throw new Error(`Unsupported ECDSA curve: ${curve}`);
+  }
+  return curve;
+}
+
+export function componentSizeForCurve(curve: SupportedCurve): number {
+  return CURVE_PROFILE[curve].componentSize;
+}
+
+export function signatureAlgorithmOidForCurve(curve: SupportedCurve): string {
+  return CURVE_PROFILE[curve].signatureAlgorithmOid;
+}
+
+export async function generateKeyPair(curve: SupportedCurve = "P-256"): Promise<CryptoKeyPair> {
+  return crypto.subtle.generateKey({ name: "ECDSA", namedCurve: curve }, true, ["sign", "verify"]);
 }
 
 export async function signDer(privateKey: CryptoKey, data: Uint8Array): Promise<Uint8Array> {
-  const raw = new Uint8Array(await crypto.subtle.sign(ECDSA_SIGN_ALGORITHM, privateKey, arrayBufferFromBytes(data)));
-  return ecdsaRawToDer(raw);
+  const curve = curveOf(privateKey);
+  const profile = CURVE_PROFILE[curve];
+  const raw = new Uint8Array(
+    await crypto.subtle.sign({ name: "ECDSA", hash: profile.hash }, privateKey, arrayBufferFromBytes(data))
+  );
+  return ecdsaRawToDer(raw, profile.componentSize);
 }
 
 export async function verifyDer(publicKey: CryptoKey, signatureDer: Uint8Array, data: Uint8Array): Promise<boolean> {
+  const curve = curveOf(publicKey);
+  const profile = CURVE_PROFILE[curve];
   return crypto.subtle.verify(
-    ECDSA_SIGN_ALGORITHM,
+    { name: "ECDSA", hash: profile.hash },
     publicKey,
-    arrayBufferFromBytes(ecdsaDerToRaw(signatureDer)),
+    arrayBufferFromBytes(ecdsaDerToRaw(signatureDer, profile.componentSize)),
     arrayBufferFromBytes(data)
   );
 }
@@ -57,7 +108,46 @@ export async function exportSpki(key: CryptoKey): Promise<Uint8Array> {
 }
 
 export async function importPublicKeySpki(spki: Uint8Array): Promise<CryptoKey> {
-  return crypto.subtle.importKey("spki", arrayBufferFromBytes(spki), EC_ALGORITHM, true, ["verify"]);
+  const curve = curveFromSpki(spki);
+  return crypto.subtle.importKey(
+    "spki",
+    arrayBufferFromBytes(spki),
+    { name: "ECDSA", namedCurve: curve },
+    true,
+    ["verify"]
+  );
+}
+
+// SubjectPublicKeyInfo ::= SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING }
+// AlgorithmIdentifier ::= SEQUENCE { algorithm OBJECT IDENTIFIER, parameters ANY }
+// For EC keys, parameters is the named-curve OID.
+function curveFromSpki(spki: Uint8Array): SupportedCurve {
+  const root = readElement(spki);
+  if (root.tag !== TAG.SEQUENCE) {
+    throw new Error("Invalid SubjectPublicKeyInfo");
+  }
+  const algorithm = readSequenceChildren(root)[0];
+  if (!algorithm || algorithm.tag !== TAG.SEQUENCE) {
+    throw new Error("Invalid SubjectPublicKeyInfo algorithm");
+  }
+  const algorithmChildren = readSequenceChildren(algorithm);
+  const algorithmOidElement = algorithmChildren[0];
+  const parametersElement = algorithmChildren[1];
+  if (!algorithmOidElement || algorithmOidElement.tag !== TAG.OBJECT_IDENTIFIER) {
+    throw new Error("Invalid SubjectPublicKeyInfo algorithm OID");
+  }
+  if (decodeOid(algorithmOidElement.value) !== OID.ecPublicKey) {
+    throw new Error("SubjectPublicKeyInfo is not an EC public key");
+  }
+  if (!parametersElement || parametersElement.tag !== TAG.OBJECT_IDENTIFIER) {
+    throw new Error("EC SubjectPublicKeyInfo parameters must be a named-curve OID");
+  }
+  const curveOid = decodeOid(parametersElement.value);
+  const curve = CURVE_OID_TO_NAME[curveOid];
+  if (!curve) {
+    throw new Error(`Unsupported EC named curve OID: ${curveOid}`);
+  }
+  return curve;
 }
 
 export async function assertKeyPairMatches(privateKey: CryptoKey, publicKey: CryptoKey): Promise<void> {
@@ -70,15 +160,15 @@ export async function assertKeyPairMatches(privateKey: CryptoKey, publicKey: Cry
   }
 }
 
-export function ecdsaRawToDer(raw: Uint8Array): Uint8Array {
-  if (raw.length !== 64) {
-    throw new Error("P-256 ECDSA raw signature must be 64 bytes");
+export function ecdsaRawToDer(raw: Uint8Array, componentSize: number): Uint8Array {
+  if (raw.length !== componentSize * 2) {
+    throw new Error(`ECDSA raw signature must be ${componentSize * 2} bytes`);
   }
 
-  return sequence(integer(raw.subarray(0, 32)), integer(raw.subarray(32)));
+  return sequence(integer(raw.subarray(0, componentSize)), integer(raw.subarray(componentSize)));
 }
 
-export function ecdsaDerToRaw(signature: Uint8Array): Uint8Array {
+export function ecdsaDerToRaw(signature: Uint8Array, componentSize: number): Uint8Array {
   const root = readElement(signature);
   if (root.tag !== TAG.SEQUENCE || root.end !== signature.length) {
     throw new Error("Invalid DER ECDSA signature");
@@ -89,21 +179,24 @@ export function ecdsaDerToRaw(signature: Uint8Array): Uint8Array {
     throw new Error("Invalid DER ECDSA signature integers");
   }
 
-  return concatBytes([integerToFixedWidth(r.value), integerToFixedWidth(s.value)]);
+  return concatBytes([
+    integerToFixedWidth(r.value, componentSize),
+    integerToFixedWidth(s.value, componentSize)
+  ]);
 }
 
-function integerToFixedWidth(value: Uint8Array): Uint8Array {
+function integerToFixedWidth(value: Uint8Array, size: number): Uint8Array {
   let start = 0;
   while (start < value.length - 1 && value[start] === 0) {
     start += 1;
   }
 
   const trimmed = value.subarray(start);
-  if (trimmed.length > 32) {
-    throw new Error("ECDSA integer is wider than P-256");
+  if (trimmed.length > size) {
+    throw new Error(`ECDSA integer is wider than ${size} bytes`);
   }
 
-  const out = new Uint8Array(32);
-  out.set(trimmed, 32 - trimmed.length);
+  const out = new Uint8Array(size);
+  out.set(trimmed, size - trimmed.length);
   return out;
 }

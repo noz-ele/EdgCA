@@ -9,9 +9,13 @@ The scope is intentionally narrow:
 - Create a self-signed root CA.
 - Issue an intermediate CA from a root CA.
 - Issue an mTLS client certificate and private key from an intermediate CA.
+- Issue an mTLS client certificate from a caller-provided public key (no private key returned). Pairs with the CSR helpers below.
+- Parse a PKCS#10 CSR (subject, requested SAN, public key, raw extensions/attributes) and verify its proof-of-possession signature.
 - Decide whether a received client certificate was issued by your own CA.
 - Encode/decode certificates as PEM/DER. Keys are exchanged as `CryptoKey` only — the library never returns or accepts string forms (PEM, JWK, etc.) of private keys.
 - Delegate all cryptographic operations to `globalThis.crypto.subtle`.
+
+ECDSA on **NIST P-256, P-384, and P-521** is supported throughout (signing, verification, CSR parsing). RSA, EdDSA, and other curves are intentionally out of scope.
 
 > ⚠ **Not a PKI runtime.** EdgCA is an issuance toolkit, not a general-purpose PKI library or runtime. It does **not** provide chain validation, revocation (CRL/OCSP), key storage, or rotation. `verifyClientCertificateIssuedBy` is **not** mTLS verification and does **not** authenticate the presenter — see [Verify](#verify-cloudflare-worker) below. Operating a CA safely is the caller's responsibility. Full list: [docs/en/NON_GOALS.md](https://github.com/noz-ele/EdgCA/blob/main/docs/en/NON_GOALS.md).
 
@@ -181,6 +185,42 @@ export default {
 - "Not issued by us" and "outside the validity window" return `false`; malformed PEM/DER throws. The two error categories are deliberately split.
 - Pass the **direct issuer (one cert)** as `ca`. Verifying a leaf issued via an intermediate against the root will return `false` — chain walking is not performed.
 
+## Issue from a CSR
+
+When a client manages its own private key and submits a PKCS#10 CSR, EdgCA parses the CSR, verifies its proof-of-possession signature, and issues a certificate that embeds the CSR's public key. The library does **not** auto-adopt the CSR's claimed subject / SAN — the caller passes those explicitly, derived from whatever policy applies in the application layer.
+
+```ts
+import {
+  importCertificateAuthority,
+  issueClientCertForPublicKey,
+  parseCertificateSigningRequest,
+  verifyCertificateSigningRequestSignature
+} from "@noz-ele/edgca";
+
+const csr = await parseCertificateSigningRequest(csrPemFromClient);
+if (!await verifyCertificateSigningRequestSignature(csr)) {
+  return new Response("CSR proof-of-possession failed", { status: 400 });
+}
+
+// Application decides what subject and SAN to issue with. The CSR's claimed
+// values are available on csr.subject / csr.requestedDnsNames /
+// csr.requestedIpAddresses, but treating them as authoritative is a policy
+// decision that lives outside EdgCA.
+const issued = await issueClientCertForPublicKey({
+  ca,
+  publicKey: csr.publicKey,
+  subject: policyDerivedSubject,
+  days: 30,
+  dnsNames: policyDerivedDnsNames
+});
+// issued has certPem / certDer / certChainPem only — no privateKey, because
+// the client owns it.
+```
+
+CSRs signed with anything other than `ecdsa-with-SHA256` / `ecdsa-with-SHA384` / `ecdsa-with-SHA512` are rejected at parse time with an explicit error. CSR-level attributes other than `extensionRequest` are surfaced as raw DER under `csr.otherAttributes` for callers that need them; X.509 extensions other than SAN are surfaced under `csr.requestedExtensions` as `{ oid, critical, valueDer }` for caller-side decoding.
+
+POP verification proves only that whoever produced the CSR holds the matching private key. **It is not authorization.** Combine it with whatever transport-level (mTLS) and application-level checks make sense for your enrollment flow.
+
 ## Subject
 
 Subject only accepts a structured input. DN strings such as `CN=dev-root,O=Example` are not accepted.
@@ -206,13 +246,14 @@ Dotted OID strings are also accepted. The ASN.1 string type for values is fixed 
 
 In scope:
 
-- ECDSA P-256 + SHA-256.
+- ECDSA on NIST P-256 / P-384 / P-521 (paired with SHA-256 / SHA-384 / SHA-512 respectively).
 - Key generation, signing, digest, and key import/export via WebCrypto.
 - Root CA creation.
 - Intermediate CA issuance.
-- mTLS client certificate issuance.
+- mTLS client certificate issuance (with internal key generation, or from a caller-provided public key).
+- CSR (PKCS#10) parsing and proof-of-possession signature verification.
 - Identity check that a cert was issued by your own CA (`verifyClientCertificateIssuedBy`, with optional time-validity check).
-- PEM/DER helpers.
+- PEM/DER helpers (certificates only — keys are exchanged as `CryptoKey`).
 - Basic Constraints, Key Usage, Extended Key Usage, Subject Alternative Name, SKI, AKI.
 
 Intentionally out of scope:
@@ -222,7 +263,9 @@ Intentionally out of scope:
 - Extracting time fields from a cert. `verifyClientCertificateIssuedBy`'s `validity` option performs the time check, but the `notBefore` / `notAfter` values are passed in by the caller from `cf.tlsClientAuth`.
 - CRL, OCSP, revocation databases, revocation checks.
 - Key storage, encryption-at-rest, rotation-state persistence, and integration with KV/D1/R2/Secrets.
-- RSA, EdDSA, other elliptic curves.
+- RSA, EdDSA, other elliptic curves (CSRs signed with these algorithms are rejected at parse time).
+- A general certificate parsing API (Cloudflare hands you parsed values via `cf.tlsClientAuth.cert*`; the library does not duplicate that).
+- Issuance policy decisions (whether to honor a CSR's claimed subject/SAN, deduplicate, etc.) — caller's responsibility.
 - DN string parsing.
 - Multi-valued RDNs.
 

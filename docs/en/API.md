@@ -9,12 +9,17 @@ import {
   createRootCA,
   issueIntermediateCA,
   issueClientCert,
+  issueClientCertForPublicKey,
   importCertificateAuthority,
+  parseCertificateSigningRequest,
+  verifyCertificateSigningRequestSignature,
   verifyClientCertificateIssuedBy,
   certificateToPem,
   pemToDer
 } from "@noz-ele/edgca";
 ```
+
+ECDSA on **NIST P-256, P-384, and P-521** is supported. The internal default for auto-generated keys is P-256; callers who want a different curve generate a `CryptoKeyPair` with WebCrypto and pass it via the `keyPair` option. The signature hash for each curve follows the standard pairing (P-256/SHA-256, P-384/SHA-384, P-521/SHA-512). A CA hierarchy may mix curves (e.g., P-256 root → P-384 intermediate → P-521 leaf); each cert's signatureAlgorithm reflects the **issuer**'s curve.
 
 ## Types
 
@@ -183,6 +188,78 @@ The issued certificate includes:
 - Subject Alternative Name only when `dnsNames` or `ipAddresses` is specified.
 
 SAN is optional for client certificates.
+
+### `issueClientCertForPublicKey(options)`
+
+Issues an mTLS client certificate against a caller-provided public key. Unlike `issueClientCert`, the library does not generate a key pair — only the certificate, its DER form, and the chain are returned. Used in CSR-style enrollment flows where the client manages its own private key.
+
+```ts
+function issueClientCertForPublicKey(options: {
+  ca: CertificateAuthority;
+  publicKey: CryptoKey;
+  subject: Subject;
+  days: number;
+  notBefore?: Date;
+  serialNumber?: SerialNumber;
+  dnsNames?: string[];
+  ipAddresses?: string[];
+}): Promise<{
+  certPem: string;
+  certDer: Uint8Array;
+  certChainPem: string;
+}>;
+```
+
+The issued certificate carries the same extension set as `issueClientCert` (`basicConstraints CA=false`, `keyUsage digitalSignature`, EKU `clientAuth`, SKI, AKI, optional SAN). The embedded `subjectPublicKeyInfo` is exported from `options.publicKey` via `subtle.exportKey("spki", …)`, so the caller's public key must be extractable. The CA's signing curve dictates the signature algorithm; the leaf's embedded curve is independent and can differ.
+
+This function never sees private-key material for the leaf. The caller is responsible for everything that happens to the corresponding private key on the client side, including proof-of-possession (see `verifyCertificateSigningRequestSignature` below) when accepting an enrollment request.
+
+### `parseCertificateSigningRequest(input)`
+
+Parses a PKCS#10 (RFC 2986) CSR provided as either DER bytes or a PEM string. The library extracts the structured fields needed for issuance and surfaces everything else as raw bytes for caller-side decoding.
+
+```ts
+function parseCertificateSigningRequest(
+  input: string | Uint8Array
+): Promise<ParsedCertificateSigningRequest>;
+
+interface ParsedCertificateSigningRequest {
+  subject: Subject;
+  publicKey: CryptoKey;
+  subjectPublicKeyInfoDer: Uint8Array;
+  requestedDnsNames: readonly string[];
+  requestedIpAddresses: readonly string[];
+  requestedExtensions: readonly { oid: string; critical: boolean; valueDer: Uint8Array }[];
+  otherAttributes: readonly { oid: string; valuesDer: ReadonlyArray<Uint8Array> }[];
+  signatureAlgorithmOid: string;
+  signatureDer: Uint8Array;
+  certificationRequestInfoDer: Uint8Array;
+}
+```
+
+Behavior:
+
+- **Algorithm scope**: only `ecdsa-with-SHA256` / `ecdsa-with-SHA384` / `ecdsa-with-SHA512` signatures are accepted. RSA, Ed25519, and other algorithms throw `Unsupported CSR signatureAlgorithm`.
+- **PEM labels**: both `CERTIFICATE REQUEST` (RFC 7468) and the legacy `NEW CERTIFICATE REQUEST` are accepted.
+- **Subject**: parsed back into the structured `Subject` array (single-valued RDNs only, matching the encoder's surface). String types `UTF8String`, `PrintableString`, and `IA5String` are decoded.
+- **SAN extraction**: `requestedDnsNames` and `requestedIpAddresses` are pulled from the `extensionRequest` attribute's SAN. IPv4 is formatted as dotted-quad; IPv6 follows RFC 5952 with `::` compression of the longest zero run.
+- **`requestedExtensions`**: every X.509 extension carried in the `extensionRequest` attribute, including SAN (so callers can also see SAN's `valueDer` directly). The `valueDer` is the inner extension value (post-OCTET-STRING unwrap).
+- **`otherAttributes`**: every CSR-level attribute whose OID is not `extensionRequest` (e.g., `challengePassword`). Values are surfaced as raw DER per attribute value entry.
+- **`certificationRequestInfoDer`**: the exact bytes of the inner `CertificationRequestInfo` SEQUENCE, used by the POP verifier.
+
+The library does **not** apply policy. Whether the CSR's claimed subject/SAN should be honored, whether the algorithm meets your minimum bar, and whether the requester is authorized to enroll are all decisions made outside EdgCA.
+
+### `verifyCertificateSigningRequestSignature(parsed)`
+
+Verifies the CSR's proof-of-possession signature using its own embedded public key.
+
+```ts
+function verifyCertificateSigningRequestSignature(
+  parsed: ParsedCertificateSigningRequest
+): Promise<boolean>;
+```
+
+Returns `true` only when the signature over `parsed.certificationRequestInfoDer` validates against `parsed.publicKey`. This proves that whoever produced the CSR holds the matching private key. It is **not** authorization: it does not establish identity, does not validate the requested subject/SAN, and does not check that the subject is allowed to enroll for those names. Pair this check with whatever transport-level (mTLS) and application-level checks make sense for your enrollment flow.
 
 ### `importCertificateAuthority(options)`
 
