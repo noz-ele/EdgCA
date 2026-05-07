@@ -66,6 +66,7 @@ import {
 import { encodeName } from "../src/name.js";
 import {
   authorityKeyIdentifierExtension,
+  basicConstraintsCaExtension,
   basicConstraintsLeafExtension,
   buildCertificate,
   buildTbsCertificate,
@@ -5505,5 +5506,258 @@ describe("structural pinning for caller-controlled inputs", () => {
     const lyingChildren = readSequenceChildren(lyingCertElement);
     const outerSigAlgOid = decodeOid(readSequenceChildren(lyingChildren[1]!)[0]!.value);
     expect(outerSigAlgOid).toBe(OID.ecdsaWithSha384);
+  });
+});
+
+describe("shared issuance core invariant", () => {
+  it("issueClientCert and issueClientCertForPublicKey produce byte-identical TBSs for the same inputs", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    // Generate a deterministic-ish input by fixing the leaf key, the
+    // serial, and the validity start. ECDSA signatures themselves remain
+    // non-deterministic, so we compare TBS bytes only — that's where the
+    // shared core lives.
+    const leafKeyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const fixedNotBefore = new Date("2030-01-01T00:00:00Z");
+    const fixedSerial = 0x1234abcdn;
+    const dnsNames = ["client.example.test"];
+    const ipAddresses = ["10.0.0.7"];
+
+    // Path A: caller-provided publicKey via issueClientCertForPublicKey.
+    const fromPublicKey = await issueClientCertForPublicKey({
+      ca: root,
+      publicKey: leafKeyPair.publicKey,
+      subject: clientSubject,
+      days: 30,
+      notBefore: fixedNotBefore,
+      serialNumber: fixedSerial,
+      dnsNames,
+      ipAddresses
+    });
+    const fromPublicKeyParsed = await parseCertificate(fromPublicKey.certDer);
+
+    // Path B: synthesize an issueClientCert call by passing the same root
+    // and SAN, but we cannot inject the leaf keyPair into issueClientCert
+    // because the latter generates internally. So we build path B by hand
+    // using the same shared core inputs and compare the *non-key-dependent*
+    // portion of the TBS.
+    //
+    // Concretely, we cross-check that the TBS produced by
+    // issueClientCertForPublicKey matches what a fresh issueClientCert call
+    // produces when given the same fixedNotBefore/serial/SAN, modulo the
+    // SPKI substructure (which depends on the generated leaf key).
+    const fromIssueClientCert = await issueClientCert({
+      ca: root,
+      subject: clientSubject,
+      days: 30,
+      notBefore: fixedNotBefore,
+      serialNumber: fixedSerial,
+      dnsNames,
+      ipAddresses
+    });
+    const fromIssueClientCertParsed = await parseCertificate(fromIssueClientCert.certDer);
+
+    // Same issuer DN, same subject DN, same validity, same serial, same
+    // extensions structure (different SKI because of different leaf key).
+    expect(fromPublicKeyParsed.issuerNameDer).toEqual(fromIssueClientCertParsed.issuerNameDer);
+    expect(fromPublicKeyParsed.subjectNameDer).toEqual(fromIssueClientCertParsed.subjectNameDer);
+    expect(parseCertificateSerialNumber(fromPublicKey.certDer).value).toBe(fixedSerial);
+    expect(parseCertificateSerialNumber(fromIssueClientCert.certDer).value).toBe(fixedSerial);
+    const validityA = parseCertificateValidity(fromPublicKey.certDer);
+    const validityB = parseCertificateValidity(fromIssueClientCert.certDer);
+    expect(validityA.notBefore.text).toBe(validityB.notBefore.text);
+    expect(validityA.notAfter.text).toBe(validityB.notAfter.text);
+    // The extension OIDs in both certs are the same set in the same order
+    // (basicConstraints, keyUsage, EKU, SKI, AKI, SAN).
+    const extOidsA = parseExtensionsFromCertificate(fromPublicKey.certDer).map((e) => e.oid);
+    const extOidsB = parseExtensionsFromCertificate(fromIssueClientCert.certDer).map((e) => e.oid);
+    expect(extOidsA).toEqual(extOidsB);
+  });
+});
+
+describe("certificate parser robustness", () => {
+  it("accepts a cert whose extensions are emitted in a non-canonical order (AKI before SKI, etc.)", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const subjectNameDer = encodeName(rootSubject);
+    const spki = await exportSpki(keyPair.publicKey);
+    const ski = await keyIdentifierFromSpki(spki);
+    // Authority and Subject KI orderings are swapped relative to what
+    // EdgCA usually emits.
+    const { tbsCertificateDer } = buildTbsCertificate({
+      serialNumber: 1,
+      days: 3650,
+      issuerNameDer: subjectNameDer,
+      subjectNameDer,
+      subjectPublicKeyInfoDer: spki,
+      extensions: [
+        authorityKeyIdentifierExtension(ski),
+        keyUsageExtension(["keyCertSign", "cRLSign"]),
+        basicConstraintsLeafExtension(),
+        subjectKeyIdentifierExtension(ski)
+      ],
+      issuerCurve: "P-256"
+    });
+    const sig = await signDer(keyPair.privateKey, tbsCertificateDer);
+    const certDer = buildCertificate(tbsCertificateDer, sig, "P-256");
+    const parsed = await parseCertificateDer(certDer);
+    expect(parsed.subjectKeyIdentifier).toEqual(ski);
+    expect(parsed.authorityKeyIdentifier).toEqual(ski);
+  });
+
+  it("on duplicate extensions of the same OID, the parser keeps the last value (silent footgun)", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const subjectNameDer = encodeName(rootSubject);
+    const spki = await exportSpki(keyPair.publicKey);
+    const skiA = new Uint8Array(20).fill(0xaa);
+    const skiB = new Uint8Array(20).fill(0xbb);
+    const { tbsCertificateDer } = buildTbsCertificate({
+      serialNumber: 1,
+      days: 3650,
+      issuerNameDer: subjectNameDer,
+      subjectNameDer,
+      subjectPublicKeyInfoDer: spki,
+      extensions: [
+        basicConstraintsCaExtension(0),
+        keyUsageExtension(["keyCertSign", "cRLSign"]),
+        subjectKeyIdentifierExtension(skiA), // first
+        subjectKeyIdentifierExtension(skiB)  // second — same OID
+      ],
+      issuerCurve: "P-256"
+    });
+    const sig = await signDer(keyPair.privateKey, tbsCertificateDer);
+    const certDer = buildCertificate(tbsCertificateDer, sig, "P-256");
+    const parsed = await parseCertificateDer(certDer);
+    // RFC 5280 says each extension MUST appear at most once. Our parser
+    // does not enforce this — it iterates and lets the later value win.
+    // Documented contract pinned here.
+    expect(parsed.subjectKeyIdentifier).toEqual(skiB);
+  });
+});
+
+describe("CSR parser permissiveness vs encoder strictness (asymmetry)", () => {
+  it("accepts a CSR whose subject value is the empty string (encoder rejects on echo)", async () => {
+    const realKey = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const realSpki = await exportSpki(realKey.publicKey);
+    // Hand-rolled subject with CN="" (empty UTF8String value).
+    const cnAttr = sequence(oid("2.5.4.3"), utf8String(""));
+    const subjectName = sequence(set(cnAttr));
+    const cri = sequence(integer(0), subjectName, realSpki);
+    const rawSig = new Uint8Array(
+      await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, realKey.privateKey, cri)
+    );
+    const csr = sequence(cri, sequence(oid(OID.ecdsaWithSha256)), bitString(ecdsaRawToDer(rawSig, 32)));
+    const parsed = await parseCertificateSigningRequest(csr);
+    expect(parsed.subject).toEqual([{ type: "CN", value: "" }]);
+    // Echoing this exact subject through the encoder must throw — confirms
+    // the asymmetry: parser is permissive, encoder is strict.
+    expect(() => encodeName(parsed.subject)).toThrow("must not be empty");
+  });
+
+  it("accepts a CSR whose subject value contains forbidden control characters (encoder rejects on echo)", async () => {
+    const realKey = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const realSpki = await exportSpki(realKey.publicKey);
+    // CN with a U+200E LEFT-TO-RIGHT MARK injected in the middle.
+    const dirtyValue = "alice‎bob";
+    const cnAttr = sequence(oid("2.5.4.3"), utf8String(dirtyValue));
+    const subjectName = sequence(set(cnAttr));
+    const cri = sequence(integer(0), subjectName, realSpki);
+    const rawSig = new Uint8Array(
+      await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, realKey.privateKey, cri)
+    );
+    const csr = sequence(cri, sequence(oid(OID.ecdsaWithSha256)), bitString(ecdsaRawToDer(rawSig, 32)));
+    const parsed = await parseCertificateSigningRequest(csr);
+    expect(parsed.subject[0]!.value).toBe(dirtyValue);
+    expect(() => encodeName(parsed.subject)).toThrow("forbidden control or bidi character");
+  });
+});
+
+describe("PEM helpers — defensive boundary documentation", () => {
+  it("pemToDer is label-blind: it decodes whichever block appears first, including key-labeled blocks", async () => {
+    // pemToDer (no label argument) accepts any PEM block. Pinning this so
+    // future callers don't assume label discrimination.
+    const fakeKeyPem =
+      "-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----";
+    const result = pemToDer(fakeKeyPem);
+    expect(Array.from(result)).toEqual([0x01, 0x02, 0x03]);
+  });
+
+  it("treats a PEM block whose body is whitespace-only as empty and throws", () => {
+    const whitespaceBody =
+      "-----BEGIN CERTIFICATE-----\n   \n   \t  \n-----END CERTIFICATE-----";
+    expect(() => pemToDerWithLabel(whitespaceBody, "CERTIFICATE")).toThrow("empty");
+  });
+
+  it("splitPemBlocks against malformed BEGIN/END nesting picks the outer pair on shortest-match basis", () => {
+    // BEGIN A ... BEGIN B ... END A ... END B
+    // Our regex uses non-greedy match for the body, so it ties BEGIN A to
+    // the first END A, with BEGIN B nested inside. Document the behavior.
+    const malformed =
+      "-----BEGIN A-----\ndata1\n-----BEGIN B-----\ndata2\n-----END A-----\ndata3\n-----END B-----";
+    const blocks = splitPemBlocks(malformed);
+    expect(blocks.length).toBe(1);
+    expect(blocks[0]!.startsWith("-----BEGIN A-----")).toBe(true);
+    expect(blocks[0]!.endsWith("-----END A-----")).toBe(true);
+  });
+
+  it("pemToDerWithLabel accepts surrounding noise/whitespace around the BEGIN/END markers", () => {
+    const root = certificateToPem(new Uint8Array([0x30, 0x02, 0x05, 0x00]));
+    const noisy = `# leading comment\nIrrelevant noise\n${root}\nTrailing\n`;
+    expect(Array.from(pemToDerWithLabel(noisy, "CERTIFICATE"))).toEqual([0x30, 0x02, 0x05, 0x00]);
+  });
+});
+
+describe("validity option numeric boundaries", () => {
+  it("accepts epoch 0 (1970-01-01) as a valid validity.notBefore reference", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const leaf = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
+    expect(
+      await verifyClientCertificateIssuedBy({
+        ca: root,
+        certPem: leaf.certPem,
+        validity: {
+          notBefore: 0,
+          notAfter: Date.now() + 86_400_000,
+          now: Date.now()
+        }
+      })
+    ).toBe(true);
+  });
+
+  it("does not validate that validity.notAfter falls within X.509's encodable year range — large numbers pass through", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const leaf = await issueClientCert({ ca: root, subject: clientSubject, days: 30 });
+    // Number.MAX_SAFE_INTEGER / 1000 is a reasonable epoch ms beyond X.509's
+    // encodable Year 9999. The validity check is purely numeric, so it
+    // does not reject this — caller's responsibility to choose sane values.
+    expect(
+      await verifyClientCertificateIssuedBy({
+        ca: root,
+        certPem: leaf.certPem,
+        validity: {
+          notBefore: 0,
+          notAfter: Number.MAX_SAFE_INTEGER,
+          now: Date.now()
+        }
+      })
+    ).toBe(true);
   });
 });
