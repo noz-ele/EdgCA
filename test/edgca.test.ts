@@ -4808,3 +4808,372 @@ describe("CSR parsing and POP verification", () => {
     ).toBe(true);
   });
 });
+
+describe("byte-level signatureAlgorithm and SPKI curve assertions", () => {
+  function readCertSigAlgOids(certDer: Uint8Array): { tbs: string; outer: string } {
+    const cert = readElement(certDer);
+    const certChildren = readSequenceChildren(cert);
+    const tbs = certChildren[0]!;
+    const outerSigAlg = certChildren[1]!;
+    const tbsChildren = readSequenceChildren(tbs);
+    // tbsChildren: version[0], serial, signatureAlgorithm, issuer, validity, subject, spki, [3] extensions
+    const tbsSigAlg = tbsChildren[2]!;
+    const tbsOidElement = readSequenceChildren(tbsSigAlg)[0]!;
+    const outerOidElement = readSequenceChildren(outerSigAlg)[0]!;
+    return {
+      tbs: decodeOid(tbsOidElement.value),
+      outer: decodeOid(outerOidElement.value)
+    };
+  }
+
+  function readSpkiCurveOid(certDer: Uint8Array): string {
+    const cert = readElement(certDer);
+    const tbs = readSequenceChildren(cert)[0]!;
+    const tbsChildren = readSequenceChildren(tbs);
+    const spki = tbsChildren[6]!;
+    const algorithm = readSequenceChildren(spki)[0]!;
+    const algorithmChildren = readSequenceChildren(algorithm);
+    return decodeOid(algorithmChildren[1]!.value);
+  }
+
+  for (const { curve, sigAlgOid, curveOid } of [
+    { curve: "P-256" as const, sigAlgOid: OID.ecdsaWithSha256, curveOid: OID.secp256r1 },
+    { curve: "P-384" as const, sigAlgOid: OID.ecdsaWithSha384, curveOid: OID.secp384r1 },
+    { curve: "P-521" as const, sigAlgOid: OID.ecdsaWithSha512, curveOid: OID.secp521r1 }
+  ]) {
+    it(`emits ecdsaWithSha* and SPKI ${curve} OID byte-for-byte for a self-signed root`, async () => {
+      const keyPair = await crypto.subtle.generateKey(
+        { name: "ECDSA", namedCurve: curve },
+        true,
+        ["sign", "verify"]
+      );
+      const root = await createRootCA({ subject: rootSubject, days: 3650, keyPair });
+      const oids = readCertSigAlgOids(root.certDer);
+      expect(oids.tbs).toBe(sigAlgOid);
+      expect(oids.outer).toBe(sigAlgOid);
+      expect(oids.tbs).toBe(oids.outer);
+      expect(readSpkiCurveOid(root.certDer)).toBe(curveOid);
+    });
+  }
+
+  it("a leaf cert's signatureAlgorithm reflects the issuer's curve while its SPKI reflects the leaf's own curve", async () => {
+    const intermediateKeyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-384" },
+      true,
+      ["sign", "verify"]
+    );
+    const root = await createRootCA({ subject: rootSubject, days: 3650 }); // P-256 default
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365,
+      keyPair: intermediateKeyPair
+    });
+    const leafPublicKeyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-521" },
+      true,
+      ["sign", "verify"]
+    );
+    const leaf = await issueClientCertForPublicKey({
+      ca: intermediate,
+      publicKey: leafPublicKeyPair.publicKey,
+      subject: clientSubject,
+      days: 30
+    });
+
+    const intermediateOids = readCertSigAlgOids(intermediate.certDer);
+    expect(intermediateOids.outer).toBe(OID.ecdsaWithSha256); // signed by P-256 root
+    expect(intermediateOids.tbs).toBe(OID.ecdsaWithSha256);
+    expect(readSpkiCurveOid(intermediate.certDer)).toBe(OID.secp384r1); // intermediate's own key
+
+    const leafOids = readCertSigAlgOids(leaf.certDer);
+    expect(leafOids.outer).toBe(OID.ecdsaWithSha384); // signed by P-384 intermediate
+    expect(leafOids.tbs).toBe(OID.ecdsaWithSha384);
+    expect(readSpkiCurveOid(leaf.certDer)).toBe(OID.secp521r1); // leaf's own embedded key
+  });
+
+  it("issues a complete P-521 → P-384 → P-256 hierarchy and verifies each link", async () => {
+    const rootKeyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-521" },
+      true,
+      ["sign", "verify"]
+    );
+    const intermediateKeyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-384" },
+      true,
+      ["sign", "verify"]
+    );
+    const root = await createRootCA({ subject: rootSubject, days: 3650, keyPair: rootKeyPair });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365,
+      keyPair: intermediateKeyPair
+    });
+    const leaf = await issueClientCert({
+      ca: intermediate,
+      subject: clientSubject,
+      days: 30
+    });
+
+    expect(readCertSigAlgOids(root.certDer).outer).toBe(OID.ecdsaWithSha512);
+    expect(readCertSigAlgOids(intermediate.certDer).outer).toBe(OID.ecdsaWithSha512);
+    expect(readCertSigAlgOids(leaf.certDer).outer).toBe(OID.ecdsaWithSha384);
+    expect(readSpkiCurveOid(leaf.certDer)).toBe(OID.secp256r1);
+
+    const parsedRoot = await parseCertificate(root.certDer);
+    const parsedIntermediate = await parseCertificate(intermediate.certDer);
+    const parsedLeaf = await parseCertificate(leaf.certDer);
+    await expect(expectSignatureValid(parsedRoot, parsedIntermediate)).resolves.toBe(true);
+    await expect(expectSignatureValid(parsedIntermediate, parsedLeaf)).resolves.toBe(true);
+  });
+});
+
+describe("issueClientCertForPublicKey return shape", () => {
+  it("returns no privateKey and no publicKey field", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const subjectKeyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const issued = await issueClientCertForPublicKey({
+      ca: root,
+      publicKey: subjectKeyPair.publicKey,
+      subject: clientSubject,
+      days: 30
+    });
+    const keys = Object.keys(issued).sort();
+    expect(keys).toEqual(["certChainPem", "certDer", "certPem"]);
+    expect((issued as Record<string, unknown>).privateKey).toBeUndefined();
+    expect((issued as Record<string, unknown>).publicKey).toBeUndefined();
+  });
+
+  for (const rootCurve of ["P-256", "P-384", "P-521"] as const) {
+    for (const leafCurve of ["P-256", "P-384", "P-521"] as const) {
+      it(`accepts a caller-provided ${leafCurve} public key under a ${rootCurve} root`, async () => {
+        const rootKeyPair = await crypto.subtle.generateKey(
+          { name: "ECDSA", namedCurve: rootCurve },
+          true,
+          ["sign", "verify"]
+        );
+        const root = await createRootCA({ subject: rootSubject, days: 3650, keyPair: rootKeyPair });
+        const leafKeyPair = await crypto.subtle.generateKey(
+          { name: "ECDSA", namedCurve: leafCurve },
+          true,
+          ["sign", "verify"]
+        );
+        const issued = await issueClientCertForPublicKey({
+          ca: root,
+          publicKey: leafKeyPair.publicKey,
+          subject: clientSubject,
+          days: 30
+        });
+        expect(
+          await verifyClientCertificateIssuedBy({ ca: root, certPem: issued.certPem })
+        ).toBe(true);
+      });
+    }
+  }
+
+  it("issues from an intermediate CA: chain has three blocks and signatures verify", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365
+    });
+    const subjectKeyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const issued = await issueClientCertForPublicKey({
+      ca: intermediate,
+      publicKey: subjectKeyPair.publicKey,
+      subject: clientSubject,
+      days: 30
+    });
+
+    expect(splitPemBlocks(issued.certChainPem)).toEqual([
+      issued.certPem.trim(),
+      intermediate.certPem.trim(),
+      root.certPem.trim()
+    ]);
+
+    const parsedIntermediate = await parseCertificate(intermediate.certDer);
+    const parsedLeaf = await parseCertificate(issued.certDer);
+    await expect(expectSignatureValid(parsedIntermediate, parsedLeaf)).resolves.toBe(true);
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: intermediate, certPem: issued.certPem })
+    ).toBe(true);
+  });
+});
+
+describe("importCertificateAuthority round-trip across curves", () => {
+  for (const curve of ["P-256", "P-384", "P-521"] as const) {
+    it(`exports and re-imports a ${curve} CA preserving the public key`, async () => {
+      const keyPair = await crypto.subtle.generateKey(
+        { name: "ECDSA", namedCurve: curve },
+        true,
+        ["sign", "verify"]
+      );
+      const root = await createRootCA({ subject: rootSubject, days: 3650, keyPair });
+      const reimported = await importCertificateAuthority({
+        certPem: root.certPem,
+        privateKey: root.privateKey
+      });
+      const originalSpki = await exportSpki(root.publicKey);
+      const reimportedSpki = await exportSpki(reimported.publicKey);
+      expect(bytesEqual(originalSpki, reimportedSpki)).toBe(true);
+      expect((reimported.publicKey.algorithm as EcKeyAlgorithm).namedCurve).toBe(curve);
+      const leaf = await issueClientCert({ ca: reimported, subject: clientSubject, days: 30 });
+      expect(
+        await verifyClientCertificateIssuedBy({ ca: reimported, certPem: leaf.certPem })
+      ).toBe(true);
+    });
+  }
+});
+
+describe("CSR additional edge cases and contracts", () => {
+  it("decodes a CSR whose subject is an empty SEQUENCE OF RDN", async () => {
+    const realKey = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const realSpki = await exportSpki(realKey.publicKey);
+    const emptyName = sequence(); // SEQUENCE OF RDN with zero RDNs
+    const cri = sequence(integer(0), emptyName, realSpki);
+    const rawSig = new Uint8Array(
+      await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, realKey.privateKey, cri)
+    );
+    const csr = sequence(cri, sequence(oid(OID.ecdsaWithSha256)), bitString(ecdsaRawToDer(rawSig, 32)));
+    const parsed = await parseCertificateSigningRequest(csr);
+    expect(parsed.subject).toEqual([]);
+    expect(await verifyCertificateSigningRequestSignature(parsed)).toBe(true);
+  });
+
+  it("rejects a subject whose AttributeValue uses BMPString (unsupported tag 0x1e)", async () => {
+    const realKey = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const realSpki = await exportSpki(realKey.publicKey);
+    // Subject DN with a single CN attribute whose value is BMPString instead of UTF8String.
+    const bmpStringValue = der(0x1e, new Uint8Array([0x00, 0x61])); // BMPString "a"
+    const cnAttr = sequence(oid("2.5.4.3"), bmpStringValue);
+    const subjectName = sequence(set(cnAttr));
+    const cri = sequence(integer(0), subjectName, realSpki);
+    const rawSig = new Uint8Array(
+      await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, realKey.privateKey, cri)
+    );
+    const csr = sequence(cri, sequence(oid(OID.ecdsaWithSha256)), bitString(ecdsaRawToDer(rawSig, 32)));
+    await expect(parseCertificateSigningRequest(csr)).rejects.toThrow(
+      "Unsupported AttributeValue string type"
+    );
+  });
+
+  it("round-trips rare short-name subject attributes (POSTALCODE, GIVENNAME, SERIALNUMBER, STREET)", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const subject: Subject = [
+      { type: "CN", value: "edge-case" },
+      { type: "POSTALCODE", value: "100-0001" },
+      { type: "GIVENNAME", value: "Alice" },
+      { type: "SERIALNUMBER", value: "S-12345" },
+      { type: "STREET", value: "1-2-3 Example" }
+    ];
+    const fixture = await buildCsrFixture({ subject, keyPair });
+    const parsed = await parseCertificateSigningRequest(fixture.der);
+    expect(parsed.subject).toEqual(subject);
+  });
+
+  it("picks the CSR block when the PEM also contains an unrelated CERTIFICATE block", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const fixture = await buildCsrFixture({ subject: clientSubject, keyPair });
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const noisyPem = `${root.certPem}\n${fixture.pem}\n`;
+    const parsed = await parseCertificateSigningRequest(noisyPem);
+    expect(parsed.subject).toEqual(clientSubject);
+    expect(await verifyCertificateSigningRequestSignature(parsed)).toBe(true);
+  });
+
+  it("decodes a CSR whose extensionRequest carries an empty SEQUENCE of extensions", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const fixture = await buildCsrFixture({
+      subject: clientSubject,
+      keyPair,
+      extraAttributes: [{ oid: OID.extensionRequest, valuesDer: [sequence()] }]
+    });
+    const parsed = await parseCertificateSigningRequest(fixture.der);
+    expect(parsed.requestedExtensions).toEqual([]);
+    expect(parsed.requestedDnsNames).toEqual([]);
+    expect(parsed.requestedIpAddresses).toEqual([]);
+    expect(parsed.otherAttributes).toEqual([]);
+    expect(await verifyCertificateSigningRequestSignature(parsed)).toBe(true);
+  });
+
+  it("propagates ecdsaDerToRaw's framing error when POP verification meets a malformed signature", () => {
+    // verifyCertificateSigningRequestSignature delegates to verifyDer, which calls
+    // ecdsaDerToRaw on the signature bytes before invoking subtle.verify. A bad
+    // outer SEQUENCE here causes ecdsaDerToRaw to throw synchronously, and that
+    // synchronous throw becomes the rejection callers will observe. We pin the
+    // error message at the lower-level boundary so the contract is locked in
+    // without entangling vitest's async-rejection bookkeeping.
+    expect(() => ecdsaDerToRaw(new Uint8Array([0x04, 0x00]), 32)).toThrow(
+      "Invalid DER ECDSA signature"
+    );
+  });
+
+  it("returns false from POP when the embedded public key does not match the signing key", async () => {
+    const realKeyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const otherKeyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    // Build a CSR whose subjectPKInfo is realKeyPair.publicKey but whose
+    // signature is computed with otherKeyPair.privateKey. The framing is
+    // valid; only the key/signature relationship is broken.
+    const subjectName = encodeName(clientSubject);
+    const realSpki = await exportSpki(realKeyPair.publicKey);
+    const cri = sequence(integer(0), subjectName, realSpki, der(0xa0, new Uint8Array(0)));
+    const rawSig = new Uint8Array(
+      await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, otherKeyPair.privateKey, cri)
+    );
+    const csr = sequence(cri, sequence(oid(OID.ecdsaWithSha256)), bitString(ecdsaRawToDer(rawSig, 32)));
+    const parsed = await parseCertificateSigningRequest(csr);
+    expect(await verifyCertificateSigningRequestSignature(parsed)).toBe(false);
+  });
+
+  it("exposes subjectPublicKeyInfoDer that matches exportSpki(publicKey) byte-for-byte", async () => {
+    for (const curve of ["P-256", "P-384", "P-521"] as const) {
+      const keyPair = await crypto.subtle.generateKey(
+        { name: "ECDSA", namedCurve: curve },
+        true,
+        ["sign", "verify"]
+      );
+      const fixture = await buildCsrFixture({ subject: clientSubject, keyPair });
+      const parsed = await parseCertificateSigningRequest(fixture.der);
+      const exported = await exportSpki(parsed.publicKey);
+      expect(bytesEqual(parsed.subjectPublicKeyInfoDer, exported)).toBe(true);
+    }
+  });
+});
