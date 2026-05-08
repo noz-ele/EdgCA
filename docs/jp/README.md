@@ -11,6 +11,7 @@ EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理�
 - intermediate CA から mTLS 用 client certificate と秘密鍵を発行する。
 - 受け取った client certificate が自分の CA から発行されたかを判定する。
 - 証明書と鍵を PEM/DER で入出力する。
+- 発行済み証明書 + 秘密鍵を password 付き PFX (PKCS#12) として OS 証明書ストア取り込み用に出力する (Win11+、macOS 15+、iOS/iPadOS 18+、modern Linux consumer 向け)。
 - 暗号演算は `globalThis.crypto.subtle` に委譲する。
 
 > ⚠ **PKI runtime ではありません。** EdgCA は発行 toolkit であり、汎用 PKI library や runtime ではありません。chain validation、失効確認 (CRL/OCSP)、鍵保管、ローテーションは**提供しません**。`verifyClientCertificateIssuedBy` は **mTLS 検証ではなく**、提示者の認証も**しません** — 詳細は下の [Verify](#verify-cloudflare-worker) 参照。CA を安全に運用するのは caller の責任です。完全な対象外 list は [NON_GOALS.md](NON_GOALS.md)。
@@ -82,6 +83,30 @@ issuer chain
 ```
 
 EdgCA で作成した intermediate から client certificate を発行した場合は、`client + intermediate + root` の順になります。
+
+### 発行済み証明書 + 鍵を PFX (PKCS#12) として束ねる
+
+OS の証明書ストア (Windows、macOS、iOS) は password 付きの単一の `.pfx` (= `.p12`) ファイルで「leaf cert + 任意の chain + 暗号化された秘密鍵」を取り込みます。`exportPkcs12` は `IssuedClientCertificate` からその形式を組み立てます。
+
+```ts
+import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
+
+const pfxBytes = await exportPkcs12({
+  certDer: client.certDer,
+  chainDer: [intermediate.certDer, root.certDer],   // 任意
+  privateKey: client.privateKey,                     // CryptoKey、extractable 必須
+  password: new TextEncoder().encode(passwordString),
+  friendlyName: new TextEncoder().encode("worker-client") // 任意、BMPString として埋め込まれる
+});
+// pfxBytes は Uint8Array — disk に書き出す、download trigger に渡す、または
+// tls.createSecureContext({ pfx: Buffer.from(pfxBytes), passphrase: passwordString }) に渡す。
+```
+
+password は UTF-8 の `Uint8Array` で受け取ります (`string` 不可)。秘密のバイト列を JS の immutable な string heap に置かずに済ませるための設計です。PBKDF2 反復回数の default は 600 000、MAC KDF の default は 100 000 で、OWASP と OpenSSL 3 の推奨値に合わせていますが、引数で上書きできます。
+
+実装は環境依存なし (WebCrypto のみ、Node 固有 API なし) なので、PFX の組み立ては **サーバ側、Cloudflare Worker、ブラウザのいずれでも同じコードで動きます**。よくある構成は CA をサーバに置き、ブラウザでは鍵ペアをローカル生成 → CSR をサーバに送って cert をもらう → ブラウザ側で PFX に組み立てる、というもの。秘密鍵と password が通信路に乗りません。
+
+`@noz-ele/edgca/pkcs12` という subpath が用意されているので、PFX 組み立てだけ使いたい consumer は CA / CSR / verify モジュールを引き込まずに import できます。
 
 ## Verify (Cloudflare Worker)
 
@@ -245,6 +270,7 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 - CSR (PKCS#10) の parse と所持証明 (POP) 署名検証。
 - 自己 CA からの発行かを判定する identity 確認 API (`verifyClientCertificateIssuedBy`、任意の時刻有効性 check 付き)。
 - PEM/DER helper (証明書のみ — 鍵は CryptoKey でやり取り)。
+- 発行済み証明書 + 秘密鍵の PFX (PKCS#12) export。PBES2 (PBKDF2-HMAC-SHA-256 + AES-256-CBC) と HMAC-SHA-256 MAC で構成し、対象は Win11+ / Server 2019+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux consumer。
 - Basic Constraints、Key Usage、Extended Key Usage、Subject Alternative Name、SKI、AKI。
 
 意図的に対象外:
@@ -255,6 +281,7 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 - CRL、OCSP、失効 DB、失効確認。
 - 鍵の保管、暗号化保存、ローテーション永続化、KV/D1/R2/Secrets 連携。
 - RSA、EdDSA、別 elliptic curve (これらで署名された CSR は parse 時に reject)。
+- 旧式 PKCS#12 アルゴリズム (3DES、RC2、SHA-1 PBE)、PBMAC1、空 password、crlBag / secretBag / 入れ子 safeContents、上記より古い consumer は意図的に `exportPkcs12` の対象外。
 - 一般的な certificate parsing API (Cloudflare が `cf.tlsClientAuth.cert*` で値を提供するので library で重複実装しない)。
 - 発行可否ポリシー判定 (CSR の主張 subject/SAN を採用するかなど) — caller の責務。
 - DN 文字列 parsing。
@@ -322,7 +349,7 @@ npm run test
 npm audit
 ```
 
-テストは `@cloudflare/vitest-pool-workers` を使い、Workers 互換 runtime 上で WebCrypto の挙動を確認します。
+主要 suite (`vitest.config.ts`) は `@cloudflare/vitest-pool-workers` で Workers 互換 runtime 上の WebCrypto 挙動を確認します。もう一つの suite (`vitest.node.config.ts`、ファイルパターン `*.node.test.ts`) は Node 環境で動かし、生成した PFX を `node:tls` の `createSecureContext` で end-to-end 検証します。`npm run test` は両者を逐次実行します。
 
 ### Property-based tests
 

@@ -40,7 +40,8 @@ Bad input should throw. Convenience features such as trim, dedup, and auto-compl
 - **No CA hierarchy beyond two levels.** At most `root → intermediate → client`. An intermediate cannot have an intermediate underneath it.
 - **No RSA / Ed25519 / non-NIST curves.** ECDSA on NIST P-256 / P-384 / P-521 is supported (with their standard SHA-256 / SHA-384 / SHA-512 pairings). Other algorithms — including in CSRs — are rejected.
 - **No issuance policy.** When parsing a CSR, the library extracts the requested subject/SAN and verifies POP, but does not decide whether the CSR should be honored. The caller chooses what subject/SAN values go into the issued cert.
-- **No encrypted PKCS#8 PEM (encrypted private key).**
+- **No encrypted PKCS#8 PEM (encrypted private key).** PFX (PKCS#12) bundling the encrypted private key is a separate and supported format — see `exportPkcs12` — but standalone `BEGIN ENCRYPTED PRIVATE KEY` PEM is not.
+- **No legacy PKCS#12 algorithms or non-modern consumers.** `exportPkcs12` emits PBES2 + PBKDF2-HMAC-SHA-256 + AES-256-CBC for both bags and HMAC-SHA-256 for the outer MAC, and targets Win11+ / Server 2019+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux PKCS#12 consumers. 3DES / RC2 / SHA-1 PBE algorithms, PBMAC1, crlBag, secretBag, nested safeContents, envelopedData, empty passwords, and Windows 10 (and older) are intentionally out of scope.
 - **No acceptance of X.509 v1 / v2.** `importCertificateAuthority` accepts only v3 (`[0] EXPLICIT INTEGER 2`). A cert with a missing version field (v1) or `INTEGER 1` (v2) throws. EdgCA itself always emits v3. Importing externally produced legacy-version certs is not a supported use case.
 
 ## 5. Conditions for changing these policies

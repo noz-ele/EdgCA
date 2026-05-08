@@ -15,9 +15,12 @@ import {
   verifyCertificateSigningRequestSignature,
   verifyClientCertificateIssuedBy,
   certificateToPem,
-  pemToDer
+  pemToDer,
+  exportPkcs12
 } from "@noz-ele/edgca";
 ```
+
+PFX 専用 surface だけ取り込みたい場合は `import { exportPkcs12 } from "@noz-ele/edgca/pkcs12"` で CA / CSR / verify モジュールを引き込まずに利用できます。
 
 ECDSA は **NIST P-256 / P-384 / P-521** をサポートします。内部生成のデフォルト curve は P-256 で、それ以外を使う場合は WebCrypto で `CryptoKeyPair` を生成し `keyPair` option で渡します。各 curve に対応する hash は標準ペアリング (P-256/SHA-256、P-384/SHA-384、P-521/SHA-512) です。CA hierarchy 内で curve を混在できます (例: P-256 root → P-384 intermediate → P-521 leaf)。各 cert の signatureAlgorithm は **issuer** の curve を反映します。
 
@@ -100,6 +103,22 @@ type SerialNumber = bigint | number | string | Uint8Array;
 省略時は、正のランダムな 16-byte serial number を生成します。
 
 決定的な serial number が必要な場合は、`bigint`、`number`、または `Uint8Array` の利用を推奨します。`string` は decimal digits または hexadecimal text として扱われます。
+
+### `ExportPkcs12Input`
+
+```ts
+interface ExportPkcs12Input {
+  certDer: Uint8Array;
+  chainDer?: Uint8Array[];
+  privateKey: CryptoKey;          // ECDSA、extractable=true 必須
+  password: Uint8Array;           // UTF-8 bytes、空 NG
+  friendlyName?: Uint8Array;      // UTF-8 bytes、内部で BMPString に変換
+  iterations?: number;            // PBKDF2、default 600_000
+  macIterations?: number;         // PKCS#12 v1 KDF、default 100_000
+}
+```
+
+`password` は UTF-8 の `Uint8Array` で受け取ります (`string` 不可)。秘密の bytes を JS の immutable な string heap に置かない設計のためです。`friendlyName` を渡した場合は byte stream で UTF-8 → UTF-16BE 変換を行い (string を経由しません) BMPString として埋め込みます。password 由来の中間 buffer は使用後 `fill(0)` で wipe します。
 
 ## Functions
 
@@ -379,6 +398,39 @@ function certificateToPem(der: Uint8Array): string;
 function pemToDer(pem: string): Uint8Array;
 ```
 
+### `exportPkcs12(input)`
+
+leaf 証明書、任意の issuer chain、対応する ECDSA 秘密鍵をひとまとめにした password 付き PFX (PKCS#12) を組み立てます。出力は DER bytes の `Uint8Array` で、そのまま `.pfx` / `.p12` として書き出したり、`tls.createSecureContext({ pfx, passphrase })` に渡したり、Win11+ / Server 2019+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux PKCS#12 consumer に取り込めます。
+
+```ts
+function exportPkcs12(input: ExportPkcs12Input): Promise<Uint8Array>;
+```
+
+algorithm は固定です:
+
+- 証明書 bag: PBES2 + PBKDF2-HMAC-SHA-256 + AES-256-CBC。
+- 秘密鍵 bag (`pkcs8ShroudedKeyBag`): PBES2 + PBKDF2-HMAC-SHA-256 + AES-256-CBC。
+- 外側 MAC: HMAC-SHA-256、鍵は PKCS#12 v1 KDF (RFC 7292 App. B、ID = 3、u = 32、v = 64) で導出。
+- PBKDF2 の prf は `hmacWithSha256` + `NULL` parameters を**明示**して emit します。仕様 default に頼ると HMAC-SHA-1 にサイレント縮退する罠があるため意図的に避けています。
+
+反復回数の default は PBKDF2 が `600_000`、MAC KDF が `100_000` で、OWASP の現代的推奨と OpenSSL 3 の default と揃えています。両方とも引数で上書きできます (リソース制約のある環境向けに小さい値を渡せる)。空 password、`Uint8Array` 以外の password / friendlyName、非 extractable な秘密鍵、ECDSA 以外の鍵、非正の反復回数は API 境界で reject します。
+
+対象外 (出力しない、scope consumer での再 import も対象外): 旧式 3DES / RC2 / SHA-1 PBE algorithm、PBMAC1、crlBag、secretBag、入れ子 safeContents、envelopedData、Windows 10 (以前)。詳細は [`docs/jp/NON_GOALS.md`](NON_GOALS.md)。
+
+同一コードが Cloudflare Workers / Node 20+ / modern browser のいずれでも変更なく動きます。`exportPkcs12` は `globalThis.crypto.subtle` のみに依存します。ブラウザ用途では `import { exportPkcs12 } from "@noz-ele/edgca/pkcs12"` という subpath 経由で CA / CSR / verify モジュールを静的 import せずに取り込めます。
+
+```ts
+import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
+
+const pfx = await exportPkcs12({
+  certDer: client.certDer,
+  chainDer: [intermediate.certDer],
+  privateKey: client.privateKey,
+  password: new TextEncoder().encode(passwordString),
+  friendlyName: new TextEncoder().encode("worker-client")
+});
+```
+
 ## Errors
 
 EdgCA は invalid input や対象外操作に対して `Error` を投げます。
@@ -397,6 +449,10 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 - root CA 以外から intermediate CA を発行しようとした。
 - `pathLenConstraint=0` の root CA から intermediate CA を発行しようとした。
 - 最大 2 段の CA 階層を超える `pathLenConstraint` を指定した。
+- `password` が空 / `Uint8Array` ではない / 不正な UTF-8 sequence を含む (`exportPkcs12`)。
+- `friendlyName` を渡したが `Uint8Array` ではない (`exportPkcs12`)。
+- `privateKey` が extractable ではない、または algorithm が ECDSA ではない (`exportPkcs12`)。
+- `iterations` または `macIterations` が正の整数ではない (`exportPkcs12`)。
 
 `verifyClientCertificateIssuedBy` は CA 局判定の `boolean` を返します。それ以外の検証 (時刻、chain、revocation) を表す result type は提供しません。
 

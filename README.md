@@ -13,6 +13,7 @@ The scope is intentionally narrow:
 - Parse a PKCS#10 CSR (subject, requested SAN, public key, raw extensions/attributes) and verify its proof-of-possession signature.
 - Decide whether a received client certificate was issued by your own CA.
 - Encode/decode certificates as PEM/DER. Keys are exchanged as `CryptoKey` only — the library never returns or accepts string forms (PEM, JWK, etc.) of private keys.
+- Bundle an issued cert + private key into a password-protected PFX (PKCS#12) file for OS keystore import (Win11+, macOS 15+, iOS/iPadOS 18+, modern Linux consumers).
 - Delegate all cryptographic operations to `globalThis.crypto.subtle`.
 
 ECDSA on **NIST P-256, P-384, and P-521** is supported throughout (signing, verification, CSR parsing). RSA, EdDSA, and other curves are intentionally out of scope.
@@ -86,6 +87,30 @@ issuer chain
 ```
 
 For a client certificate issued by an EdgCA-built intermediate, the result is `client + intermediate + root`.
+
+### Bundling an issued cert + key as a PFX (PKCS#12)
+
+OS certificate stores (Windows, macOS, iOS) accept a single password-protected `.pfx` (also `.p12`) file containing the leaf cert, optional chain, and the encrypted private key. `exportPkcs12` builds that file from an `IssuedClientCertificate`:
+
+```ts
+import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
+
+const pfxBytes = await exportPkcs12({
+  certDer: client.certDer,
+  chainDer: [intermediate.certDer, root.certDer],   // optional
+  privateKey: client.privateKey,                     // CryptoKey, must be extractable
+  password: new TextEncoder().encode(passwordString),
+  friendlyName: new TextEncoder().encode("worker-client") // optional, BMPString
+});
+// pfxBytes is a Uint8Array — write it to disk, send it to a download trigger,
+// or hand it to tls.createSecureContext({ pfx: Buffer.from(pfxBytes), passphrase: passwordString }).
+```
+
+The password is taken as a UTF-8 `Uint8Array` (not a `string`) so that callers can keep secret bytes off the immutable JS string heap. PBKDF2 iterations default to 600 000 and the MAC KDF iterations to 100 000 — these match OWASP and OpenSSL 3 defaults but are caller-overridable.
+
+The implementation is environment-agnostic (WebCrypto only, no Node-specific APIs), so PFX assembly can run **server-side, in a Cloudflare Worker, or directly in a browser**. A common architecture is to keep the CA on a server while having the browser generate its keypair locally, send a CSR, receive the cert, and assemble the PFX client-side — keeping the private key and password off the wire.
+
+The `@noz-ele/edgca/pkcs12` subpath is provided so consumers that only need PFX assembly can import it without pulling in the CA / CSR / verify modules.
 
 ## Verify (Cloudflare Worker)
 
@@ -254,6 +279,7 @@ In scope:
 - CSR (PKCS#10) parsing and proof-of-possession signature verification.
 - Identity check that a cert was issued by your own CA (`verifyClientCertificateIssuedBy`, with optional time-validity check).
 - PEM/DER helpers (certificates only — keys are exchanged as `CryptoKey`).
+- PFX (PKCS#12) export of an issued cert + private key with PBES2 (PBKDF2-HMAC-SHA-256 + AES-256-CBC) and HMAC-SHA-256 MAC, scoped to modern consumers (Win11+, Server 2019+, macOS 15+, iOS/iPadOS 18+).
 - Basic Constraints, Key Usage, Extended Key Usage, Subject Alternative Name, SKI, AKI.
 
 Intentionally out of scope:
@@ -264,6 +290,7 @@ Intentionally out of scope:
 - CRL, OCSP, revocation databases, revocation checks.
 - Key storage, encryption-at-rest, rotation-state persistence, and integration with KV/D1/R2/Secrets.
 - RSA, EdDSA, other elliptic curves (CSRs signed with these algorithms are rejected at parse time).
+- Legacy PKCS#12 algorithms (3DES, RC2, SHA-1 PBE), PBMAC1, empty passwords, crlBag / secretBag / nested safeContents, and consumers older than the modern targets above are intentionally not produced or supported by `exportPkcs12`.
 - A general certificate parsing API (Cloudflare hands you parsed values via `cf.tlsClientAuth.cert*`; the library does not duplicate that).
 - Issuance policy decisions (whether to honor a CSR's claimed subject/SAN, deduplicate, etc.) — caller's responsibility.
 - DN string parsing.
@@ -331,7 +358,7 @@ npm run test
 npm audit
 ```
 
-Tests use `@cloudflare/vitest-pool-workers` to verify WebCrypto behavior on the Workers-compatible runtime.
+The main suite (`vitest.config.ts`) runs on `@cloudflare/vitest-pool-workers` to verify WebCrypto behavior on the Workers-compatible runtime. A second suite (`vitest.node.config.ts`, file pattern `*.node.test.ts`) runs under Node so the produced PFX can be validated end-to-end against `node:tls`'s `createSecureContext`. `npm run test` runs both in sequence.
 
 ### Property-based tests
 
