@@ -73,3 +73,9 @@ export function arrayBufferFromBytes(bytes: Uint8Array): ArrayBuffer {
   copy.set(bytes);
   return copy.buffer;
 }
+
+export function randomBytes(length: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+  return bytes;
+}

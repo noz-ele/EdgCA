@@ -40,7 +40,8 @@ EdgCA が**提供する**唯一の検証 API は `verifyClientCertificateIssuedB
 - **3 段以上の CA 階層なし**。最大 `root → intermediate → client`。intermediate のさらに下に intermediate は作れない。
 - **RSA / Ed25519 / 非 NIST curve なし**。ECDSA NIST P-256 / P-384 / P-521 をサポート (それぞれ SHA-256 / SHA-384 / SHA-512 の標準ペアリング)。それ以外のアルゴリズム — CSR 内も含め — は reject。
 - **発行可否ポリシーなし**。CSR を parse して subject/SAN と POP を取り出すが、その CSR を honor するかは library が判断しない。発行 cert に何の subject/SAN を入れるかは caller が決める。
-- **暗号化された PKCS#8 PEM (encrypted private key) なし**。
+- **暗号化された PKCS#8 PEM (encrypted private key) なし**。秘密鍵を含めて password 暗号化して取り出す形式は PFX (PKCS#12) を `exportPkcs12` で提供する。単独の `BEGIN ENCRYPTED PRIVATE KEY` PEM は提供しない。
+- **旧式 PKCS#12 algorithm / 非 modern consumer なし**。`exportPkcs12` は両 bag を PBES2 + PBKDF2-HMAC-SHA-256 + AES-256-CBC、外側 MAC は HMAC-SHA-256 で emit し、対象は Win11+ / Server 2019+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux PKCS#12 consumer。3DES / RC2 / SHA-1 PBE algorithm、PBMAC1、crlBag、secretBag、入れ子 safeContents、envelopedData、空 password、Windows 10 (以前) は意図的に scope 外。
 - **X.509 v1 / v2 の受け入れなし**。`importCertificateAuthority` は v3 (`[0] EXPLICIT INTEGER 2`) のみ accept。version field 不在 (v1) や `INTEGER 1` (v2) の cert は throw。EdgCA 自身は常に v3 を emit する。外部由来の旧 version cert を import するユースケースはサポートしない。
 
 ## 5. これらの方針が変わる条件

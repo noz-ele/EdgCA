@@ -42,6 +42,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./pkcs12": {
+      "types": "./dist/pkcs12.d.ts",
+      "import": "./dist/pkcs12.js"
     }
   },
   "types": "./dist/index.d.ts",
@@ -49,7 +53,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pretest": "npm run build",
-    "test": "vitest run",
+    "test": "vitest run && vitest run --config vitest.node.config.ts",
     "pretest:workers": "npm run build",
     "prepack": "npm run build",
     "prepublishOnly": "npm run typecheck && npm test",

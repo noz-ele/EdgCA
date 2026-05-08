@@ -15,7 +15,19 @@ export const OID = {
   subjectKeyIdentifier: "2.5.29.14",
   authorityKeyIdentifier: "2.5.29.35",
   clientAuth: "1.3.6.1.5.5.7.3.2",
-  extensionRequest: "1.2.840.113549.1.9.14"
+  extensionRequest: "1.2.840.113549.1.9.14",
+  data: "1.2.840.113549.1.7.1",
+  encryptedData: "1.2.840.113549.1.7.6",
+  friendlyName: "1.2.840.113549.1.9.20",
+  localKeyId: "1.2.840.113549.1.9.21",
+  x509Certificate: "1.2.840.113549.1.9.22.1",
+  certBag: "1.2.840.113549.1.12.10.1.3",
+  pkcs8ShroudedKeyBag: "1.2.840.113549.1.12.10.1.2",
+  pbes2: "1.2.840.113549.1.5.13",
+  pbkdf2: "1.2.840.113549.1.5.12",
+  hmacWithSha256: "1.2.840.113549.2.9",
+  aes256Cbc: "2.16.840.1.101.3.4.1.42",
+  sha256: "2.16.840.1.101.3.4.2.1"
 } as const;
 
 export const SUBJECT_ATTRIBUTE_OIDS: Record<ShortSubjectAttributeType, string> = {
