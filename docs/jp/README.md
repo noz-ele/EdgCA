@@ -2,7 +2,7 @@
 
 > 日本語 | [English](../../README.md)
 
-EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理する自己 CA から mTLS 用 client certificate を発行するための小さな TypeScript ライブラリです。
+EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理する自己 CA から mTLS 用 client certificate を発行するための小さな TypeScript ライブラリです。内部での鍵生成、CSR ベースの enrollment (PKCS#10 + 所持証明)、OS 証明書ストア取り込み用の PFX (PKCS#12) export に対応します。
 
 目的は明確に絞っています。
 
@@ -16,9 +16,16 @@ EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理�
 
 > ⚠ **PKI runtime ではありません。** EdgCA は発行 toolkit であり、汎用 PKI library や runtime ではありません。chain validation、失効確認 (CRL/OCSP)、鍵保管、ローテーションは**提供しません**。`verifyClientCertificateIssuedBy` は **mTLS 検証ではなく**、提示者の認証も**しません** — 詳細は下の [Verify](#verify-cloudflare-worker) 参照。CA を安全に運用するのは caller の責任です。完全な対象外 list は [NON_GOALS.md](NON_GOALS.md)。
 
+## Contents
+
+- [Quick Start](#quick-start) — root → intermediate → client cert を発行 (PFX 束ね手順も含む)
+- [Verify (Cloudflare Worker)](#verify-cloudflare-worker) — 自 CA から発行されたかを判定
+- [CSR から発行する](#csr-から発行する) — client が秘密鍵を保持する構成 (PKCS#10 + POP)
+- [Subject](#subject) · [Scope](#scope) · [Key Handling](#key-handling) · [Development](#development) · [API Documentation](#api-documentation)
+
 ## Status
 
-EdgCA は **v0.2.x の初期安定化フェーズ**です。作者が実際の Cloudflare Workers 環境で検証している最中で、API が変わる可能性があります。検証に集中するため、**外部からの Issue と PR は一時的に制限**しており、API が落ち着いた後に再開します。read / clone / fork / `npm install` は通常通り可能です。
+EdgCA は **v0.3.x の初期安定化フェーズ**です。作者が実際の Cloudflare Workers 環境で検証している最中で、API が変わる可能性があります。検証に集中するため、**外部からの Issue と PR は一時的に制限**しており、API が落ち着いた後に再開します。read / clone / fork / `npm install` は通常通り可能です。
 
 ## Install
 

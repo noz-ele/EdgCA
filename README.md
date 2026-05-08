@@ -2,7 +2,7 @@
 
 > [日本語](https://github.com/noz-ele/EdgCA/blob/main/docs/jp/README.md) | English
 
-EdgCA is a small TypeScript library that issues mTLS client certificates from a self-managed CA on Cloudflare Workers-compatible runtimes.
+EdgCA is a small TypeScript library that issues mTLS client certificates from a self-managed CA on Cloudflare Workers-compatible runtimes. It supports internal keygen, CSR-based enrollment (PKCS#10 + proof-of-possession), and PFX (PKCS#12) export for OS keystore import.
 
 The scope is intentionally narrow:
 
@@ -20,9 +20,16 @@ ECDSA on **NIST P-256, P-384, and P-521** is supported throughout (signing, veri
 
 > ⚠ **Not a PKI runtime.** EdgCA is an issuance toolkit, not a general-purpose PKI library or runtime. It does **not** provide chain validation, revocation (CRL/OCSP), key storage, or rotation. `verifyClientCertificateIssuedBy` is **not** mTLS verification and does **not** authenticate the presenter — see [Verify](#verify-cloudflare-worker) below. Operating a CA safely is the caller's responsibility. Full list: [docs/en/NON_GOALS.md](https://github.com/noz-ele/EdgCA/blob/main/docs/en/NON_GOALS.md).
 
+## Contents
+
+- [Quick Start](#quick-start) — root → intermediate → client cert (incl. PFX bundling)
+- [Verify on Cloudflare Worker](#verify-cloudflare-worker) — confirm a cert was issued by your CA
+- [Issue from a CSR](#issue-from-a-csr) — accept a caller-managed key via PKCS#10 + POP
+- [Subject](#subject) · [Scope](#scope) · [Key Handling](#key-handling) · [Development](#development) · [API Documentation](#api-documentation)
+
 ## Status
 
-EdgCA is in **v0.2.x — early stabilization**. The author is currently validating the library against real Cloudflare Workers deployments, and the API surface may still shift. To keep that validation focused, **external Issues and PRs are temporarily restricted** and will be re-opened once the API settles. Reading, cloning, forking, and `npm install` are unaffected.
+EdgCA is in **v0.3.x — early stabilization**. The author is currently validating the library against real Cloudflare Workers deployments, and the API surface may still shift. To keep that validation focused, **external Issues and PRs are temporarily restricted** and will be re-opened once the API settles. Reading, cloning, forking, and `npm install` are unaffected.
 
 ## Install
 
