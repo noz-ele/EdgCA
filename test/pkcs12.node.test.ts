@@ -8,7 +8,7 @@ import {
   issueClientCertForPublicKey,
   issueIntermediateCA
 } from "../src/index.js";
-import { arrayBufferFromBytes, bytesEqual } from "../src/bytes.js";
+import { arrayBufferFromBytes, bytesEqual, concatBytes } from "../src/bytes.js";
 import { generateKeyPair, type SupportedCurve } from "../src/crypto.js";
 import {
   decodeInteger,
@@ -484,6 +484,130 @@ describe("exportPkcs12", () => {
     ).not.toThrow();
     expect(await signRoundTripsViaPfx(issued.certDer, password, pfx)).toBe(true);
   });
+
+  it("round-trips with a P-521 key", async () => {
+    const root = await createRootCA({
+      subject: [{ type: "CN", value: "EdgCA P-521 Root" }],
+      days: 30
+    });
+    const leafKp = await generateKeyPair("P-521");
+    const issued = await issueClientCertForPublicKey({
+      ca: root,
+      publicKey: leafKp.publicKey,
+      subject: [{ type: "CN", value: "p521-client" }],
+      days: 7
+    });
+    const password = utf8("p521");
+    const pfx = await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: leafKp.privateKey,
+      password,
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+
+    expect(() =>
+      tls.createSecureContext({ pfx: Buffer.from(pfx), passphrase: "p521" })
+    ).not.toThrow();
+    expect(await signRoundTripsViaPfx(issued.certDer, password, pfx)).toBe(true);
+  });
+
+  it("works with iterations=1 and macIterations=1 (minimum boundary)", async () => {
+    const { issued } = await makeRootAndLeaf();
+    const passphrase = "min";
+    const pfx = await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: issued.privateKey,
+      password: utf8(passphrase),
+      iterations: 1,
+      macIterations: 1
+    });
+    expect(() =>
+      tls.createSecureContext({ pfx: Buffer.from(pfx), passphrase })
+    ).not.toThrow();
+  });
+
+  it("handles a password whose UTF-16BE form spans multiple PKCS#12 v-blocks", async () => {
+    // 50 ASCII chars → 100 B UTF-16BE + 2 B terminator = 102 B.
+    // ceil(102 / 64) * 64 = 128 B → P2 spans two v-blocks (not one).
+    const { issued } = await makeRootAndLeaf();
+    const passphrase = "x".repeat(50);
+    const pfx = await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: issued.privateKey,
+      password: utf8(passphrase),
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+    expect(() =>
+      tls.createSecureContext({ pfx: Buffer.from(pfx), passphrase })
+    ).not.toThrow();
+  });
+
+  it("emits PBES2 with explicit hmacWithSha256 + NULL prf parameters (defends against default-prf trap)", async () => {
+    const { issued } = await makeRootAndLeaf();
+    const password = utf8("prf");
+    const pfx = await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: issued.privateKey,
+      password,
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+
+    // Both the cert bag and the key bag carry their own PBES2 algorithm
+    // identifier; check both — a default-prf bug could affect just one.
+    for (const algoDer of extractAllPbes2Algorithms(pfx)) {
+      const prf = readPrfElements(algoDer);
+      expect(prf.length).toBe(2);
+      expect(decodeOid(prf[0]!.value)).toBe(OID.hmacWithSha256);
+      expect(prf[1]!.tag).toBe(TAG.NULL);
+      expect(prf[1]!.length).toBe(0);
+    }
+  });
+
+  it("computes the MAC over the authSafe OCTET STRING value, not its TLV header", async () => {
+    const { issued } = await makeRootAndLeaf();
+    const passphrase = "mac-range";
+    const password = utf8(passphrase);
+    const pfx = await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: issued.privateKey,
+      password,
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+
+    const info = extractMacInfo(pfx);
+
+    // Independently derive the MAC key with a separate KDF implementation.
+    const passwordUtf16Term = utf16BeWithNullTerminator(passphrase);
+    const macKeyBytes = await independentPkcs12MacKey(
+      passwordUtf16Term,
+      info.macSalt,
+      info.macIterations
+    );
+    const macKey = await crypto.subtle.importKey(
+      "raw",
+      arrayBufferFromBytes(macKeyBytes),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+
+    const valueMac = new Uint8Array(
+      await crypto.subtle.sign("HMAC", macKey, arrayBufferFromBytes(info.authSafeOctetValue))
+    );
+    const rawMac = new Uint8Array(
+      await crypto.subtle.sign("HMAC", macKey, arrayBufferFromBytes(info.authSafeOctetRaw))
+    );
+
+    // The OCTET STRING *value* must reproduce the stored MAC.
+    expect(bytesEqual(valueMac, info.mac)).toBe(true);
+    // The OCTET STRING *with* its TLV header must NOT — proves the MAC range
+    // is the inside of the OCTET STRING, not the OCTET STRING as a whole.
+    expect(bytesEqual(rawMac, info.mac)).toBe(false);
+  });
 });
 
 // --- helpers --------------------------------------------------------------
@@ -495,6 +619,121 @@ function utf16Be(s: string): Uint8Array {
     out.push((code >> 8) & 0xff, code & 0xff);
   }
   return new Uint8Array(out);
+}
+
+function utf16BeWithNullTerminator(s: string): Uint8Array {
+  const out = new Uint8Array(s.length * 2 + 2);
+  for (let i = 0; i < s.length; i += 1) {
+    const code = s.charCodeAt(i);
+    out[i * 2] = (code >> 8) & 0xff;
+    out[i * 2 + 1] = code & 0xff;
+  }
+  return out;
+}
+
+// Independent re-implementation of PKCS#12 v1 KDF (RFC 7292 App.B) with
+// ID=3, u=32, v=64, used to verify the MAC range against a second source.
+async function independentPkcs12MacKey(
+  passwordUtf16Term: Uint8Array,
+  salt: Uint8Array,
+  iterations: number
+): Promise<Uint8Array> {
+  const v = 64;
+  const D = new Uint8Array(v).fill(3);
+  const sLen = Math.ceil(salt.length / v) * v;
+  const S2 = new Uint8Array(sLen);
+  for (let i = 0; i < sLen; i += 1) S2[i] = salt[i % salt.length]!;
+  const pLen = Math.ceil(passwordUtf16Term.length / v) * v;
+  const P2 = new Uint8Array(pLen);
+  for (let i = 0; i < pLen; i += 1) P2[i] = passwordUtf16Term[i % passwordUtf16Term.length]!;
+
+  let T = concatBytes([D, S2, P2]);
+  for (let j = 0; j < iterations; j += 1) {
+    T = new Uint8Array(await crypto.subtle.digest("SHA-256", arrayBufferFromBytes(T)));
+  }
+  return T.slice(0, 32);
+}
+
+// Walk the PFX top-level to expose macData fields and the authSafe OCTET
+// STRING boundaries. Used by the MAC-range test.
+function extractMacInfo(pfx: Uint8Array): {
+  mac: Uint8Array;
+  macSalt: Uint8Array;
+  macIterations: number;
+  authSafeOctetValue: Uint8Array;
+  authSafeOctetRaw: Uint8Array;
+} {
+  const root = readElement(pfx);
+  const children = readSequenceChildren(root);
+  const authSafeContentInfo = children[1]!;
+  const macData = children[2]!;
+  if (macData.tag !== TAG.SEQUENCE) throw new Error("missing macData");
+
+  const [, authSafeContent] = readSequenceChildren(authSafeContentInfo);
+  if (!authSafeContent || authSafeContent.tag !== 0xa0) throw new Error("missing authSafe content [0]");
+  const authSafeOctet = readElement(authSafeContent.value);
+  if (authSafeOctet.tag !== TAG.OCTET_STRING) throw new Error("authSafe must be OCTET STRING");
+
+  const macDataChildren = readSequenceChildren(macData);
+  const digestInfo = macDataChildren[0]!;
+  const macSalt = macDataChildren[1]!.value;
+  const macIterations = Number(decodeInteger(macDataChildren[2]!.value));
+  const digestInfoChildren = readSequenceChildren(digestInfo);
+  const mac = digestInfoChildren[1]!.value;
+
+  return {
+    mac,
+    macSalt,
+    macIterations,
+    authSafeOctetValue: authSafeOctet.value,
+    authSafeOctetRaw: authSafeOctet.raw
+  };
+}
+
+// Find every PBES2 AlgorithmIdentifier inside the PFX (cert bag + key bag).
+function extractAllPbes2Algorithms(pfx: Uint8Array): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  const root = readElement(pfx);
+  const [, authSafeContentInfo] = readSequenceChildren(root);
+  const [, authSafeContent] = readSequenceChildren(authSafeContentInfo!);
+  const authSafe = readElement(readElement(authSafeContent!.value).value);
+
+  for (const contentInfo of readSequenceChildren(authSafe)) {
+    const ciChildren = readSequenceChildren(contentInfo);
+    const ciOid = decodeOid(ciChildren[0]!.value);
+    const ciContent = ciChildren[1]!;
+    if (ciOid === OID.encryptedData) {
+      const enc = readElement(ciContent.value);
+      const encChildren = readSequenceChildren(enc);
+      const eci = readSequenceChildren(encChildren[1]!);
+      out.push(eci[1]!.raw);
+    } else if (ciOid === OID.data) {
+      const inner = readElement(ciContent.value);
+      const safeContents = readElement(inner.value);
+      for (const safeBag of readSequenceChildren(safeContents)) {
+        const sbChildren = readChildren(safeBag.value);
+        if (decodeOid(sbChildren[0]!.value) === OID.pkcs8ShroudedKeyBag) {
+          const epki = readElement(sbChildren[1]!.value);
+          const epkiChildren = readSequenceChildren(epki);
+          out.push(epkiChildren[0]!.raw);
+        }
+      }
+    }
+  }
+  if (out.length === 0) throw new Error("no PBES2 algorithm identifier found");
+  return out;
+}
+
+// Read prf children from a PBES2 AlgorithmIdentifier DER:
+//   PBES2-AlgId SEQ { pbes2 OID, PBES2-params SEQ { kdf, encScheme } }
+//   kdf SEQ { pbkdf2 OID, PBKDF2-params SEQ { salt, iters, prf SEQ { OID, params } } }
+function readPrfElements(pbes2AlgorithmDer: Uint8Array) {
+  const algo = readElement(pbes2AlgorithmDer);
+  const algoChildren = readSequenceChildren(algo);
+  const params = readSequenceChildren(algoChildren[1]!);
+  const kdf = readSequenceChildren(params[0]!);
+  const kdfParams = readSequenceChildren(kdf[1]!);
+  return readSequenceChildren(kdfParams[2]!);
 }
 
 // --- minimal PKCS#12 parser (test helper, not under test) ------------------

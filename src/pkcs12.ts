@@ -55,7 +55,19 @@ export async function exportPkcs12(input: ExportPkcs12Input): Promise<Uint8Array
   }
   const certSafeContents = sequence(...certBags);
 
-  const certEncrypted = await pbes2EncryptAesCbc(certSafeContents, input.password, iterations);
+  // Import the password into a non-extractable PBKDF2 baseKey once and reuse
+  // it across both cert-bag and key-bag encryption. This halves the number of
+  // password-byte ArrayBuffer copies handed to WebCrypto (which we cannot
+  // wipe) from two to one.
+  const pbkdf2BaseKey = await crypto.subtle.importKey(
+    "raw",
+    arrayBufferFromBytes(input.password),
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+
+  const certEncrypted = await pbes2EncryptAesCbc(certSafeContents, pbkdf2BaseKey, iterations);
   const certContentInfo = sequence(
     oid(OID.encryptedData),
     explicit(0, sequence(
@@ -69,7 +81,7 @@ export async function exportPkcs12(input: ExportPkcs12Input): Promise<Uint8Array
   );
 
   const pkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", input.privateKey));
-  const keyEncrypted = await pbes2EncryptAesCbc(pkcs8, input.password, iterations);
+  const keyEncrypted = await pbes2EncryptAesCbc(pkcs8, pbkdf2BaseKey, iterations);
   wipe(pkcs8);
 
   const epki = sequence(keyEncrypted.algorithm, octetString(keyEncrypted.ciphertext));
@@ -190,22 +202,15 @@ function bmpString(utf8: Uint8Array): Uint8Array {
 
 async function pbes2EncryptAesCbc(
   plaintext: Uint8Array,
-  password: Uint8Array,
+  pbkdf2BaseKey: CryptoKey,
   iterations: number
 ): Promise<{ algorithm: Uint8Array; ciphertext: Uint8Array }> {
   const salt = randomBytes(SALT_LENGTH);
   const iv = randomBytes(IV_LENGTH);
 
-  const baseKey = await crypto.subtle.importKey(
-    "raw",
-    arrayBufferFromBytes(password),
-    "PBKDF2",
-    false,
-    ["deriveKey"]
-  );
   const aesKey = await crypto.subtle.deriveKey(
     { name: "PBKDF2", salt: arrayBufferFromBytes(salt), iterations, hash: "SHA-256" },
-    baseKey,
+    pbkdf2BaseKey,
     { name: "AES-CBC", length: 256 },
     false,
     ["encrypt"]
@@ -260,9 +265,17 @@ async function pkcs12V1KdfMacKey(
 
   const I = concatBytes([S2, P2]);
 
+  // T_0 holds D || S2 || P2 (raw password bytes embedded in P2).
+  // Each digestSha256 returns a fresh 32-byte buffer; the previous T's buffer
+  // becomes unreachable but, without an explicit wipe, would sit on the JS
+  // heap until GC. Zero it before reassigning. Successive Ts are H^j(D||I)
+  // values, which let an attacker reach H^c(D||I) = MAC key by continuing the
+  // chain — they're as sensitive as the MAC key itself.
   let T = concatBytes([D, I]);
   for (let j = 0; j < iterations; j += 1) {
-    T = await digestSha256(T);
+    const next = await digestSha256(T);
+    T.fill(0);
+    T = next;
   }
 
   wipe(D, S2, P2, I);
