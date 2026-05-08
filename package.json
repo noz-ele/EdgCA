@@ -49,7 +49,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pretest": "npm run build",
-    "test": "vitest run",
+    "test": "vitest run && vitest run --config vitest.node.config.ts",
     "pretest:workers": "npm run build",
     "prepack": "npm run build",
     "prepublishOnly": "npm run typecheck && npm test",

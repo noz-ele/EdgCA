@@ -13,6 +13,7 @@ export {
   type CertificateSigningRequestAttribute
 } from "./csr.js";
 export { pemToDer, certificateToPem } from "./pem.js";
+export { exportPkcs12, type ExportPkcs12Input } from "./pkcs12.js";
 export {
   verifyClientCertificateIssuedBy,
   type VerifyClientCertificateIssuedByOptions,

@@ -1,4 +1,4 @@
-import { asciiBytes, concatBytes } from "./bytes.js";
+import { asciiBytes, concatBytes, randomBytes } from "./bytes.js";
 import { signatureAlgorithmOidForCurve, type SupportedCurve } from "./crypto.js";
 import {
   bitString,
@@ -183,8 +183,7 @@ function encodeSerialNumber(serialNumber?: SerialNumber): Uint8Array {
 
 function encodeSerialNumberDer(serialNumber?: SerialNumber): Uint8Array {
   if (serialNumber === undefined) {
-    const bytes = new Uint8Array(16);
-    crypto.getRandomValues(bytes);
+    const bytes = randomBytes(16);
     bytes[0] = bytes[0]! & 0x7f;
     if (bytes.every((byte) => byte === 0)) {
       bytes[15] = 1;

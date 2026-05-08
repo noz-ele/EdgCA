@@ -109,6 +109,10 @@ export function octetString(bytes: Uint8Array): Uint8Array {
   return der(TAG.OCTET_STRING, bytes);
 }
 
+export function nullValue(): Uint8Array {
+  return new Uint8Array([TAG.NULL, 0x00]);
+}
+
 export function utf8String(value: string): Uint8Array {
   return der(TAG.UTF8_STRING, utf8Bytes(value));
 }
