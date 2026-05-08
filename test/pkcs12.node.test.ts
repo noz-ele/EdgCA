@@ -566,6 +566,98 @@ describe("exportPkcs12", () => {
     }
   });
 
+  it("does not mutate the caller's password buffer", async () => {
+    const { issued } = await makeRootAndLeaf();
+    const password = utf8("immutable-password");
+    const snapshot = new Uint8Array(password);
+    await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: issued.privateKey,
+      password,
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+    expect(bytesEqual(password, snapshot)).toBe(true);
+  });
+
+  it("does not mutate the caller's friendlyName buffer", async () => {
+    const { issued } = await makeRootAndLeaf();
+    const friendlyName = utf8("Stable Name");
+    const snapshot = new Uint8Array(friendlyName);
+    await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: issued.privateKey,
+      password: utf8("p"),
+      friendlyName,
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+    expect(bytesEqual(friendlyName, snapshot)).toBe(true);
+  });
+
+  it("does not mutate the caller's certDer buffer", async () => {
+    const { issued } = await makeRootAndLeaf();
+    const snapshot = new Uint8Array(issued.certDer);
+    await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: issued.privateKey,
+      password: utf8("p"),
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+    expect(bytesEqual(issued.certDer, snapshot)).toBe(true);
+  });
+
+  it("does not mutate the caller's chainDer entries", async () => {
+    const root = await createRootCA({
+      subject: [{ type: "CN", value: "Imm Root" }],
+      days: 30,
+      pathLenConstraint: 1
+    });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: [{ type: "CN", value: "Imm Intermediate" }],
+      days: 14
+    });
+    const leaf = await issueClientCert({
+      ca: intermediate,
+      subject: [{ type: "CN", value: "imm-client" }],
+      days: 7
+    });
+    const chainEntry = intermediate.certDer;
+    const snapshot = new Uint8Array(chainEntry);
+    await exportPkcs12({
+      certDer: leaf.certDer,
+      chainDer: [chainEntry],
+      privateKey: leaf.privateKey,
+      password: utf8("p"),
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+    expect(bytesEqual(chainEntry, snapshot)).toBe(true);
+  });
+
+  it("uses distinct salt and IV between cert-bag and key-bag PBES2 (no shared randomness)", async () => {
+    // Defends against a regression where the salt/IV were inadvertently
+    // shared between the two PBES2 invocations (e.g. a future caching of
+    // randomBytes() output for "performance"). Node would still accept the
+    // PFX, so behavioural tests cannot catch this.
+    const { issued } = await makeRootAndLeaf();
+    const pfx = await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: issued.privateKey,
+      password: utf8("salt-uniqueness"),
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+
+    const algos = extractAllPbes2Algorithms(pfx);
+    expect(algos.length).toBe(2);
+    const [cert, key] = algos.map(extractSaltAndIv);
+    expect(bytesEqual(cert!.salt, key!.salt)).toBe(false);
+    expect(bytesEqual(cert!.iv, key!.iv)).toBe(false);
+  });
+
   it("computes the MAC over the authSafe OCTET STRING value, not its TLV header", async () => {
     const { issued } = await makeRootAndLeaf();
     const passphrase = "mac-range";
@@ -722,6 +814,19 @@ function extractAllPbes2Algorithms(pfx: Uint8Array): Uint8Array[] {
   }
   if (out.length === 0) throw new Error("no PBES2 algorithm identifier found");
   return out;
+}
+
+// Read the PBKDF2 salt and AES-CBC IV from a PBES2 AlgorithmIdentifier DER.
+function extractSaltAndIv(pbes2AlgorithmDer: Uint8Array): { salt: Uint8Array; iv: Uint8Array } {
+  const algo = readElement(pbes2AlgorithmDer);
+  const algoChildren = readSequenceChildren(algo);
+  const params = readSequenceChildren(algoChildren[1]!);
+  const kdf = readSequenceChildren(params[0]!);
+  const kdfParams = readSequenceChildren(kdf[1]!);
+  const salt = kdfParams[0]!.value;
+  const enc = readSequenceChildren(params[1]!);
+  const iv = enc[1]!.value;
+  return { salt, iv };
 }
 
 // Read prf children from a PBES2 AlgorithmIdentifier DER:
