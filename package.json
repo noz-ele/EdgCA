@@ -42,6 +42,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./pkcs12": {
+      "types": "./dist/pkcs12.d.ts",
+      "import": "./dist/pkcs12.js"
     }
   },
   "types": "./dist/index.d.ts",
