@@ -152,9 +152,27 @@ function buildKeySafeBag(encryptedPrivateKeyInfo: Uint8Array, attrs: Uint8Array[
 function safeBag(bagOid: string, bagValue: Uint8Array, attrs: Uint8Array[]): Uint8Array {
   const parts: Uint8Array[] = [oid(bagOid), explicit(0, bagValue)];
   if (attrs.length > 0) {
-    parts.push(set(...attrs));
+    parts.push(canonicalSetOf(attrs));
   }
   return sequence(...parts);
+}
+
+// X.690 §11.6: SET OF components are encoded in ascending order of their
+// encoded octet strings, with the shorter component padded with trailing
+// 0-octets for the comparison. Used for bagAttributes.
+function canonicalSetOf(children: Uint8Array[]): Uint8Array {
+  const sorted = [...children].sort(derSetCompare);
+  return set(...sorted);
+}
+
+function derSetCompare(a: Uint8Array, b: Uint8Array): number {
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i += 1) {
+    const av = i < a.length ? a[i]! : 0;
+    const bv = i < b.length ? b[i]! : 0;
+    if (av !== bv) return av - bv;
+  }
+  return 0;
 }
 
 function buildLocalKeyIdAttr(localKeyId: Uint8Array): Uint8Array {
@@ -261,41 +279,69 @@ function utf8ToUtf16BeWithTerminator(utf8: Uint8Array): Uint8Array {
   return out;
 }
 
+// Two-pass to avoid an intermediate `number[]` that would retain
+// password-derived bytes on the JS heap until GC. Pass 1 sizes the output;
+// pass 2 writes directly into a tight Uint8Array. Both passes share the same
+// boundary checks so an invalid leader byte fails fast in pass 1.
 function utf8ToUtf16Be(utf8: Uint8Array): Uint8Array {
-  const out: number[] = [];
+  let outLen = 0;
   let i = 0;
+  while (i < utf8.length) {
+    const b1 = utf8[i]!;
+    if (b1 < 0x80) {
+      outLen += 2;
+      i += 1;
+    } else if ((b1 & 0xe0) === 0xc0 && i + 1 < utf8.length) {
+      outLen += 2;
+      i += 2;
+    } else if ((b1 & 0xf0) === 0xe0 && i + 2 < utf8.length) {
+      outLen += 2;
+      i += 3;
+    } else if ((b1 & 0xf8) === 0xf0 && i + 3 < utf8.length) {
+      outLen += 4;
+      i += 4;
+    } else {
+      throw new Error("Invalid UTF-8 sequence");
+    }
+  }
+
+  const out = new Uint8Array(outLen);
+  let oi = 0;
+  i = 0;
   while (i < utf8.length) {
     const b1 = utf8[i]!;
     let cp: number;
     if (b1 < 0x80) {
       cp = b1;
       i += 1;
-    } else if ((b1 & 0xe0) === 0xc0 && i + 1 < utf8.length) {
+    } else if ((b1 & 0xe0) === 0xc0) {
       cp = ((b1 & 0x1f) << 6) | (utf8[i + 1]! & 0x3f);
       i += 2;
-    } else if ((b1 & 0xf0) === 0xe0 && i + 2 < utf8.length) {
+    } else if ((b1 & 0xf0) === 0xe0) {
       cp = ((b1 & 0x0f) << 12) | ((utf8[i + 1]! & 0x3f) << 6) | (utf8[i + 2]! & 0x3f);
       i += 3;
-    } else if ((b1 & 0xf8) === 0xf0 && i + 3 < utf8.length) {
+    } else {
       cp = ((b1 & 0x07) << 18)
         | ((utf8[i + 1]! & 0x3f) << 12)
         | ((utf8[i + 2]! & 0x3f) << 6)
         | (utf8[i + 3]! & 0x3f);
       i += 4;
-    } else {
-      throw new Error("Invalid UTF-8 sequence");
     }
 
     if (cp < 0x10000) {
-      out.push((cp >> 8) & 0xff, cp & 0xff);
+      out[oi++] = (cp >> 8) & 0xff;
+      out[oi++] = cp & 0xff;
     } else {
       const adj = cp - 0x10000;
       const high = 0xd800 + ((adj >> 10) & 0x3ff);
       const low = 0xdc00 + (adj & 0x3ff);
-      out.push((high >> 8) & 0xff, high & 0xff, (low >> 8) & 0xff, low & 0xff);
+      out[oi++] = (high >> 8) & 0xff;
+      out[oi++] = high & 0xff;
+      out[oi++] = (low >> 8) & 0xff;
+      out[oi++] = low & 0xff;
     }
   }
-  return new Uint8Array(out);
+  return out;
 }
 
 function wipe(...bufs: Uint8Array[]): void {

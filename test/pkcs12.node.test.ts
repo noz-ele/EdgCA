@@ -5,9 +5,11 @@ import {
   createRootCA,
   exportPkcs12,
   issueClientCert,
+  issueClientCertForPublicKey,
   issueIntermediateCA
 } from "../src/index.js";
 import { arrayBufferFromBytes, bytesEqual } from "../src/bytes.js";
+import { generateKeyPair, type SupportedCurve } from "../src/crypto.js";
 import {
   decodeInteger,
   decodeOid,
@@ -21,6 +23,12 @@ import { parseCertificateDer } from "../src/parser.js";
 
 const TEST_ITERATIONS = 2048;
 const TEST_MAC_ITERATIONS = 2048;
+
+const HASH_BY_CURVE: Record<SupportedCurve, "SHA-256" | "SHA-384" | "SHA-512"> = {
+  "P-256": "SHA-256",
+  "P-384": "SHA-384",
+  "P-521": "SHA-512"
+};
 
 async function makeRootAndLeaf() {
   const ca = await createRootCA({
@@ -37,6 +45,35 @@ async function makeRootAndLeaf() {
 
 function utf8(s: string): Uint8Array {
   return new TextEncoder().encode(s);
+}
+
+async function signRoundTripsViaPfx(
+  certDer: Uint8Array,
+  password: Uint8Array,
+  pfx: Uint8Array
+): Promise<boolean> {
+  const parsed = await parsePfx(pfx, password);
+  const cert = await parseCertificateDer(certDer);
+  const namedCurve = (cert.publicKey.algorithm as { namedCurve?: SupportedCurve }).namedCurve;
+  if (!namedCurve) throw new Error("cert has no namedCurve");
+  const hash = HASH_BY_CURVE[namedCurve];
+  const importedKey = await crypto.subtle.importKey(
+    "pkcs8",
+    arrayBufferFromBytes(parsed.keyPkcs8),
+    { name: "ECDSA", namedCurve },
+    false,
+    ["sign"]
+  );
+  const data = utf8("hello");
+  const sig = new Uint8Array(
+    await crypto.subtle.sign({ name: "ECDSA", hash }, importedKey, arrayBufferFromBytes(data))
+  );
+  return crypto.subtle.verify(
+    { name: "ECDSA", hash },
+    cert.publicKey,
+    arrayBufferFromBytes(sig),
+    arrayBufferFromBytes(data)
+  );
 }
 
 describe("exportPkcs12", () => {
@@ -71,7 +108,7 @@ describe("exportPkcs12", () => {
     ).toThrow();
   });
 
-  it("round-trips: extracted private key signs, cert public key verifies", async () => {
+  it("round-trips: extracted private key signs, cert public key verifies (P-256)", async () => {
     const { issued } = await makeRootAndLeaf();
     const password = utf8("round-trip");
     const pfx = await exportPkcs12({
@@ -82,26 +119,7 @@ describe("exportPkcs12", () => {
       macIterations: TEST_MAC_ITERATIONS
     });
 
-    const parsed = await parsePfx(pfx, password);
-    const importedKey = await crypto.subtle.importKey(
-      "pkcs8",
-      arrayBufferFromBytes(parsed.keyPkcs8),
-      { name: "ECDSA", namedCurve: "P-256" },
-      false,
-      ["sign"]
-    );
-    const data = utf8("hello");
-    const sig = new Uint8Array(
-      await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, importedKey, arrayBufferFromBytes(data))
-    );
-    const cert = await parseCertificateDer(issued.certDer);
-    const ok = await crypto.subtle.verify(
-      { name: "ECDSA", hash: "SHA-256" },
-      cert.publicKey,
-      arrayBufferFromBytes(sig),
-      arrayBufferFromBytes(data)
-    );
-    expect(ok).toBe(true);
+    expect(await signRoundTripsViaPfx(issued.certDer, password, pfx)).toBe(true);
   });
 
   it("emits matching localKeyID on cert bag and key bag", async () => {
@@ -130,6 +148,20 @@ describe("exportPkcs12", () => {
         certDer: issued.certDer,
         privateKey: issued.privateKey,
         password: new Uint8Array(0),
+        iterations: TEST_ITERATIONS,
+        macIterations: TEST_MAC_ITERATIONS
+      })
+    ).rejects.toThrow(/password/);
+  });
+
+  it("rejects a non-Uint8Array password (caller passed a string)", async () => {
+    const { issued } = await makeRootAndLeaf();
+    await expect(
+      exportPkcs12({
+        certDer: issued.certDer,
+        privateKey: issued.privateKey,
+        // intentionally wrong runtime type
+        password: "raw-string" as unknown as Uint8Array,
         iterations: TEST_ITERATIONS,
         macIterations: TEST_MAC_ITERATIONS
       })
@@ -177,6 +209,53 @@ describe("exportPkcs12", () => {
     ).rejects.toThrow(/ECDSA/);
   });
 
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects iterations=%s",
+    async (bad) => {
+      const { issued } = await makeRootAndLeaf();
+      await expect(
+        exportPkcs12({
+          certDer: issued.certDer,
+          privateKey: issued.privateKey,
+          password: utf8("p"),
+          iterations: bad,
+          macIterations: TEST_MAC_ITERATIONS
+        })
+      ).rejects.toThrow(/iterations/);
+    }
+  );
+
+  it.each([0, -1, 1.5, Number.NaN])(
+    "rejects macIterations=%s",
+    async (bad) => {
+      const { issued } = await makeRootAndLeaf();
+      await expect(
+        exportPkcs12({
+          certDer: issued.certDer,
+          privateKey: issued.privateKey,
+          password: utf8("p"),
+          iterations: TEST_ITERATIONS,
+          macIterations: bad
+        })
+      ).rejects.toThrow(/macIterations/);
+    }
+  );
+
+  it("rejects a non-Uint8Array friendlyName", async () => {
+    const { issued } = await makeRootAndLeaf();
+    await expect(
+      exportPkcs12({
+        certDer: issued.certDer,
+        privateKey: issued.privateKey,
+        password: utf8("p"),
+        // intentionally wrong runtime type
+        friendlyName: "label" as unknown as Uint8Array,
+        iterations: TEST_ITERATIONS,
+        macIterations: TEST_MAC_ITERATIONS
+      })
+    ).rejects.toThrow(/friendlyName/);
+  });
+
   it("includes chain certificates and Node accepts the chained PFX", async () => {
     const root = await createRootCA({
       subject: [{ type: "CN", value: "EdgCA Test Root" }],
@@ -215,6 +294,63 @@ describe("exportPkcs12", () => {
     expect(parsed.certBags[1]!.friendlyName).toBeUndefined();
   });
 
+  it("emits 3 cert bags when chainDer has 2 entries (intermediate + root)", async () => {
+    // EdgCA only permits pathLenConstraint 0 or 1 on a root, so we cannot
+    // produce a real 3-level chain here. exportPkcs12 doesn't validate the
+    // chain anyway — it just emits one CertBag per DER. Including the root
+    // alongside the intermediate is realistic ("export the whole chain")
+    // and exercises the chainDer.length >= 2 path.
+    const root = await createRootCA({
+      subject: [{ type: "CN", value: "Multi Root" }],
+      days: 30,
+      pathLenConstraint: 1
+    });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: [{ type: "CN", value: "Multi Intermediate" }],
+      days: 14
+    });
+    const leaf = await issueClientCert({
+      ca: intermediate,
+      subject: [{ type: "CN", value: "multi-leaf" }],
+      days: 7
+    });
+
+    const password = utf8("multi");
+    const pfx = await exportPkcs12({
+      certDer: leaf.certDer,
+      chainDer: [intermediate.certDer, root.certDer],
+      privateKey: leaf.privateKey,
+      password,
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+
+    const parsed = await parsePfx(pfx, password);
+    expect(parsed.certBags.length).toBe(3);
+    expect(parsed.certBags[0]!.localKeyId).toBeDefined();
+    expect(parsed.certBags[1]!.localKeyId).toBeUndefined();
+    expect(parsed.certBags[2]!.localKeyId).toBeUndefined();
+    expect(parsed.certBags[1]!.friendlyName).toBeUndefined();
+    expect(parsed.certBags[2]!.friendlyName).toBeUndefined();
+  });
+
+  it("treats chainDer=[] as no chain", async () => {
+    const { issued } = await makeRootAndLeaf();
+    const password = utf8("empty-chain");
+    const pfx = await exportPkcs12({
+      certDer: issued.certDer,
+      chainDer: [],
+      privateKey: issued.privateKey,
+      password,
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+
+    const parsed = await parsePfx(pfx, password);
+    expect(parsed.certBags.length).toBe(1);
+  });
+
   it("emits friendlyName as BMPString on leaf cert bag and key bag only", async () => {
     const { issued } = await makeRootAndLeaf();
     const password = utf8("name");
@@ -232,15 +368,64 @@ describe("exportPkcs12", () => {
     expect(parsed.certBags[0]!.friendlyName).toBeDefined();
     expect(parsed.keyBag.friendlyName).toBeDefined();
 
-    // Re-encode the input as UTF-16BE (without terminator) and compare.
     const expected = utf16Be("EdgCA Test Client");
     expect(bytesEqual(parsed.certBags[0]!.friendlyName!, expected)).toBe(true);
     expect(bytesEqual(parsed.keyBag.friendlyName!, expected)).toBe(true);
   });
 
+  it("treats friendlyName=Uint8Array(0) as no friendlyName", async () => {
+    const { issued } = await makeRootAndLeaf();
+    const password = utf8("blank-name");
+    const pfx = await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: issued.privateKey,
+      password,
+      friendlyName: new Uint8Array(0),
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+
+    const parsed = await parsePfx(pfx, password);
+    expect(parsed.certBags[0]!.friendlyName).toBeUndefined();
+    expect(parsed.keyBag.friendlyName).toBeUndefined();
+  });
+
+  it("emits bagAttributes in canonical DER SET OF order (short friendlyName comes first)", async () => {
+    // Encoded sizes: Attribute(friendlyName="x") = 19 bytes total, attr(localKeyID 20B SHA-1) = 37 bytes.
+    // X.690 §11.6 picks the lex-smaller (and 0-padded shorter) component first → friendlyName precedes localKeyID.
+    const { issued } = await makeRootAndLeaf();
+    const password = utf8("canon");
+    const pfx = await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: issued.privateKey,
+      password,
+      friendlyName: utf8("x"),
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+
+    const parsed = await parsePfx(pfx, password);
+    expect(parsed.certBags[0]!.attrOidsInOrder).toEqual([OID.friendlyName, OID.localKeyId]);
+    expect(parsed.keyBag.attrOidsInOrder).toEqual([OID.friendlyName, OID.localKeyId]);
+  });
+
+  it("handles a 2-byte UTF-8 password (e.g. café)", async () => {
+    const { issued } = await makeRootAndLeaf();
+    const passphrase = "café";
+    const pfx = await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: issued.privateKey,
+      password: utf8(passphrase),
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+    expect(() =>
+      tls.createSecureContext({ pfx: Buffer.from(pfx), passphrase })
+    ).not.toThrow();
+  });
+
   it("handles a password whose UTF-8 produces a UTF-16 surrogate pair", async () => {
     const { issued } = await makeRootAndLeaf();
-    // U+1F510 (🔐) is 4 bytes in UTF-8 and a surrogate pair in UTF-16BE.
     const passphrase = "lock-🔐";
     const password = utf8(passphrase);
     const pfx = await exportPkcs12({
@@ -250,28 +435,60 @@ describe("exportPkcs12", () => {
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
     });
-
-    // Node uses the PKCS#12 v1 KDF on the BMPString-encoded password, which
-    // is exactly what our exporter feeds to the MAC. Acceptance proves that
-    // both the PBES2 (UTF-8) and the MAC (UTF-16BE with surrogate pair) paths
-    // round-trip correctly.
     expect(() =>
       tls.createSecureContext({ pfx: Buffer.from(pfx), passphrase })
     ).not.toThrow();
-
-    // Wrong-password path with the same surrogate-bearing exporter still
-    // rejects, proving the MAC is not silently degenerate.
     expect(() =>
       tls.createSecureContext({ pfx: Buffer.from(pfx), passphrase: "lock-🔐 " })
     ).toThrow();
+  });
+
+  it("rejects a password containing an invalid UTF-8 sequence", async () => {
+    const { issued } = await makeRootAndLeaf();
+    // 0xc2 is a 2-byte UTF-8 leader with no continuation byte.
+    const password = new Uint8Array([0x70, 0xc2]);
+    await expect(
+      exportPkcs12({
+        certDer: issued.certDer,
+        privateKey: issued.privateKey,
+        password,
+        iterations: TEST_ITERATIONS,
+        macIterations: TEST_MAC_ITERATIONS
+      })
+    ).rejects.toThrow(/UTF-8/);
+  });
+
+  it("round-trips with a P-384 key", async () => {
+    const root = await createRootCA({
+      subject: [{ type: "CN", value: "EdgCA P-384 Root" }],
+      days: 30
+    });
+    const leafKp = await generateKeyPair("P-384");
+    const issued = await issueClientCertForPublicKey({
+      ca: root,
+      publicKey: leafKp.publicKey,
+      subject: [{ type: "CN", value: "p384-client" }],
+      days: 7
+    });
+    const password = utf8("p384");
+    const pfx = await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: leafKp.privateKey,
+      password,
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+
+    expect(() =>
+      tls.createSecureContext({ pfx: Buffer.from(pfx), passphrase: "p384" })
+    ).not.toThrow();
+    expect(await signRoundTripsViaPfx(issued.certDer, password, pfx)).toBe(true);
   });
 });
 
 // --- helpers --------------------------------------------------------------
 
 function utf16Be(s: string): Uint8Array {
-  // Build UTF-16BE bytes (no terminator) for comparison with the BMPString
-  // payload extracted from the PFX. Test-only — uses JS string indexing.
   const out: number[] = [];
   for (let i = 0; i < s.length; i += 1) {
     const code = s.charCodeAt(i);
@@ -287,6 +504,7 @@ interface ParsedSafeBag {
   bagValue: Uint8Array;
   localKeyId: Uint8Array | undefined;
   friendlyName: Uint8Array | undefined;
+  attrOidsInOrder: string[];
 }
 
 interface PfxParsed {
@@ -363,10 +581,12 @@ function readSafeBag(safeBag: { value: Uint8Array; tag: number }): ParsedSafeBag
   const bagValue = children[1]!.value;
   let localKeyId: Uint8Array | undefined;
   let friendlyName: Uint8Array | undefined;
+  const attrOidsInOrder: string[] = [];
   if (children[2] && children[2].tag === TAG.SET) {
     for (const attr of readChildren(children[2].value)) {
       const ac = readSequenceChildren(attr);
       const attrOid = decodeOid(ac[0]!.value);
+      attrOidsInOrder.push(attrOid);
       const attrSet = readChildren(ac[1]!.value)[0];
       if (!attrSet) continue;
       if (attrOid === OID.localKeyId) {
@@ -376,7 +596,7 @@ function readSafeBag(safeBag: { value: Uint8Array; tag: number }): ParsedSafeBag
       }
     }
   }
-  return { bagId, bagValue, localKeyId, friendlyName };
+  return { bagId, bagValue, localKeyId, friendlyName, attrOidsInOrder };
 }
 
 async function pbes2Decrypt(
