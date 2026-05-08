@@ -6,6 +6,9 @@ dist/
 coverage/
 .nyc_output/
 
+# npm pack output
+*.tgz
+
 # TypeScript
 *.tsbuildinfo
 
