@@ -5,6 +5,7 @@ import {
   importCertificateAuthority,
   issueClientCert,
   issueClientCertForPublicKey,
+  issueDocumentSigningCert,
   issueIntermediateCA,
   parseCertificateSigningRequest,
   pemToDer,
@@ -528,6 +529,201 @@ describe("EdgCA issuing API", () => {
   });
 });
 
+describe("issueDocumentSigningCert", () => {
+  const signerSubject: Subject = [
+    { type: "CN", value: "Alice (Document Signer)" },
+    { type: "O", value: "Example" }
+  ];
+
+  it("issues a document-signing leaf with the documentSigning EKU profile", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650, serialNumber: 1 });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365,
+      serialNumber: 2
+    });
+    const signer = await issueDocumentSigningCert({
+      ca: intermediate,
+      subject: signerSubject,
+      days: 365,
+      serialNumber: 3
+    });
+
+    expect(splitPemBlocks(signer.certChainPem)).toEqual([
+      signer.certPem.trim(),
+      intermediate.certPem.trim(),
+      root.certPem.trim()
+    ]);
+
+    const parsedRoot = await parseCertificate(root.certDer);
+    const parsedIntermediate = await parseCertificate(intermediate.certDer);
+    const parsedSigner = await parseCertificate(signer.certDer);
+
+    assertSingleValuedRdns(parsedSigner.subjectNameDer);
+    expect(parsedSigner.isCA).toBe(false);
+    expect(parsedSigner.keyCertSign).toBe(false);
+    expect(namesEqual(parsedSigner.issuerNameDer, parsedIntermediate.subjectNameDer)).toBe(true);
+
+    await expect(expectSignatureValid(parsedRoot, parsedRoot)).resolves.toBe(true);
+    await expect(expectSignatureValid(parsedRoot, parsedIntermediate)).resolves.toBe(true);
+    await expect(expectSignatureValid(parsedIntermediate, parsedSigner)).resolves.toBe(true);
+
+    const intermediateSki = parseSubjectKeyIdentifier(getExtension(intermediate.certDer, OID.subjectKeyIdentifier).value);
+    const signerSki = parseSubjectKeyIdentifier(getExtension(signer.certDer, OID.subjectKeyIdentifier).value);
+    const signerAki = parseAuthorityKeyIdentifier(getExtension(signer.certDer, OID.authorityKeyIdentifier).value);
+    expect(signerAki.tag).toBe(0x80);
+    expect(signerAki.keyIdentifier).toEqual(intermediateSki);
+    expect(signerSki.length).toBe(20);
+    await expect(digestSha1(subjectPublicKeyBits(parsedSigner.subjectPublicKeyInfoDer))).resolves.toEqual(signerSki);
+
+    const signerKeyUsage = parseKeyUsage(getExtension(signer.certDer, OID.keyUsage).value);
+    expect(signerKeyUsage).toMatchObject({
+      unusedBits: 6,
+      digitalSignature: true,
+      contentCommitment: true,
+      keyCertSign: false,
+      cRLSign: false
+    });
+    expect(Array.from(signerKeyUsage.bytes)).toEqual([0xc0]);
+
+    const ekuExtension = getExtension(signer.certDer, OID.extendedKeyUsage);
+    expect(ekuExtension.critical).toBe(false);
+    const ekuRoot = readElement(ekuExtension.value);
+    const ekuPurposes = readSequenceChildren(ekuRoot).map((element) => {
+      expect(element.tag).toBe(TAG.OBJECT_IDENTIFIER);
+      return decodeOid(element.value);
+    });
+    // Assert the RFC 9336 OID literally — a typo in OID.documentSigning
+    // would still match `[OID.documentSigning]` and silently pass.
+    expect(ekuPurposes).toEqual(["1.3.6.1.5.5.7.3.36"]);
+    expect(OID.documentSigning).toBe("1.3.6.1.5.5.7.3.36");
+    expect(ekuPurposes).not.toContain(OID.clientAuth);
+
+    const bcExtension = getExtension(signer.certDer, OID.basicConstraints);
+    expect(bcExtension.critical).toBe(true);
+    const bcInner = readElement(bcExtension.value);
+    expect(bcInner.tag).toBe(TAG.SEQUENCE);
+    expect(bcInner.length).toBe(0);
+
+    expect(findExtension(signer.certDer, OID.subjectAltName)).toBeUndefined();
+
+    expect(parseExtensionsFromCertificate(signer.certDer)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ oid: OID.basicConstraints, critical: true }),
+        expect.objectContaining({ oid: OID.keyUsage, critical: true }),
+        expect.objectContaining({ oid: OID.extendedKeyUsage, critical: false }),
+        expect.objectContaining({ oid: OID.subjectKeyIdentifier, critical: false }),
+        expect.objectContaining({ oid: OID.authorityKeyIdentifier, critical: false })
+      ])
+    );
+  });
+
+  it("issues a document-signing leaf directly from a root CA", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const signer = await issueDocumentSigningCert({
+      ca: root,
+      subject: signerSubject,
+      days: 30
+    });
+
+    expect(splitPemBlocks(signer.certChainPem)).toEqual([
+      signer.certPem.trim(),
+      root.certPem.trim()
+    ]);
+
+    const parsedRoot = await parseCertificate(root.certDer);
+    const parsedSigner = await parseCertificate(signer.certDer);
+    expect(namesEqual(parsedSigner.issuerNameDer, parsedRoot.subjectNameDer)).toBe(true);
+    await expect(expectSignatureValid(parsedRoot, parsedSigner)).resolves.toBe(true);
+  });
+
+  it("rejects issuance when the supplied CA is a leaf certificate", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const client = await issueClientCert({
+      ca: root,
+      subject: clientSubject,
+      days: 30
+    });
+    const importedLeaf = await importCertificateAuthority({
+      certPem: client.certPem,
+      privateKey: client.privateKey,
+      issuerChainPem: root.certPem
+    });
+
+    await expect(
+      issueDocumentSigningCert({
+        ca: importedLeaf,
+        subject: signerSubject,
+        days: 30
+      })
+    ).rejects.toThrow("Issuer certificate is not a CA");
+  });
+
+  it("passes verifyClientCertificateIssuedBy against its issuer (EKU is not checked)", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650, serialNumber: 1 });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365,
+      serialNumber: 2
+    });
+    const signer = await issueDocumentSigningCert({
+      ca: intermediate,
+      subject: signerSubject,
+      days: 365,
+      serialNumber: 3
+    });
+
+    // verifyClientCertificateIssuedBy is an issuer-identity check (DN match +
+    // AKI/SKI + signature); it does not consult EKU, so it should accept a
+    // document-signing leaf as long as the direct issuer is the one given.
+    await expect(
+      verifyClientCertificateIssuedBy({ ca: intermediate, certPem: signer.certPem })
+    ).resolves.toBe(true);
+
+    // Chain walking is not performed: a doc-signing leaf issued via the
+    // intermediate must NOT verify against the root.
+    await expect(
+      verifyClientCertificateIssuedBy({ ca: root, certPem: signer.certPem })
+    ).resolves.toBe(false);
+  });
+
+  it("issues a document-signing leaf from a re-imported intermediate CA", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650, serialNumber: 1 });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365,
+      serialNumber: 2
+    });
+    const reimportedIntermediate = await importCertificateAuthority({
+      certPem: intermediate.certPem,
+      privateKey: intermediate.privateKey,
+      issuerChainPem: intermediate.issuerChainPem
+    });
+
+    const signer = await issueDocumentSigningCert({
+      ca: reimportedIntermediate,
+      subject: signerSubject,
+      days: 365,
+      serialNumber: 3
+    });
+
+    expect(reimportedIntermediate.issuerChainPem).toBe(root.certPem);
+    expect(splitPemBlocks(signer.certChainPem)).toEqual([
+      signer.certPem.trim(),
+      intermediate.certPem.trim(),
+      root.certPem.trim()
+    ]);
+
+    const parsedIntermediate = await parseCertificate(intermediate.certDer);
+    const parsedSigner = await parseCertificate(signer.certDer);
+    expect(namesEqual(parsedSigner.issuerNameDer, parsedIntermediate.subjectNameDer)).toBe(true);
+    await expect(expectSignatureValid(parsedIntermediate, parsedSigner)).resolves.toBe(true);
+  });
+});
+
 describe("subject encoding", () => {
   it("encodes structured subject input in order with fixed string types", async () => {
     const subject: Subject = [
@@ -1003,6 +1199,21 @@ describe("serial numbers and validity", () => {
             days: 30
           });
         }
+      },
+      {
+        name: "document-signing certificate",
+        issue: async () => {
+          const root = await createRootCA({
+            subject: rootSubject,
+            days: 3650,
+            serialNumber: 1
+          });
+          return issueDocumentSigningCert({
+            ca: root,
+            subject: [{ type: "CN", value: "signer" }],
+            days: 30
+          });
+        }
       }
     ];
 
@@ -1067,6 +1278,24 @@ describe("serial numbers and validity", () => {
           return issueClientCert({
             ca: root,
             subject: clientSubject,
+            days,
+            notBefore,
+            serialNumber: 2
+          });
+        }
+      },
+      {
+        name: "document-signing certificate",
+        issue: async ({ notBefore, days }) => {
+          const root = await createRootCA({
+            subject: rootSubject,
+            days: 3650,
+            notBefore: issuerNotBefore,
+            serialNumber: 1
+          });
+          return issueDocumentSigningCert({
+            ca: root,
+            subject: [{ type: "CN", value: "signer" }],
             days,
             notBefore,
             serialNumber: 2
@@ -1235,6 +1464,25 @@ describe("low-level encoders", () => {
     const [clientAuth] = readSequenceChildren(rootElement);
     expect(clientAuth?.tag).toBe(TAG.OBJECT_IDENTIFIER);
     expect(decodeOid(clientAuth!.value)).toBe(OID.clientAuth);
+  });
+
+  it("encodes documentSigning EKU as an OID sequence with the RFC 9336 OID", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    const signer = await issueDocumentSigningCert({
+      ca: root,
+      subject: [{ type: "CN", value: "signer" }],
+      days: 30
+    });
+    const eku = parseExtensionsFromCertificate(signer.certDer).find((extension) => extension.oid === OID.extendedKeyUsage);
+    expect(eku).toBeDefined();
+
+    const rootElement = readElement(eku!.value);
+    const purposes = readSequenceChildren(rootElement);
+    expect(purposes).toHaveLength(1);
+    const [documentSigning] = purposes;
+    expect(documentSigning?.tag).toBe(TAG.OBJECT_IDENTIFIER);
+    // RFC 9336 §3 id-kp-documentSigning OBJECT IDENTIFIER ::= { 1.3.6.1.5.5.7.3.36 }
+    expect(decodeOid(documentSigning!.value)).toBe("1.3.6.1.5.5.7.3.36");
   });
 });
 

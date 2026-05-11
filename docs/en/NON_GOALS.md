@@ -35,7 +35,10 @@ Bad input should throw. Convenience features such as trim, dedup, and auto-compl
 
 ## 4. Functional scope
 
-- **No server certificate issuance.** Focused on client certs (mTLS).
+- **No server certificate issuance.** Leaf scope is mTLS client certs (`issueClientCert` / `issueClientCertForPublicKey`) and document-signing certs (`issueDocumentSigningCert`, RFC 9336 `id-kp-documentSigning`). TLS server certs are out of scope.
+- **No SAN on document-signing leaves.** `issueDocumentSigningCert` does not accept `dnsNames` / `ipAddresses` / `emailAddresses`. Document-signing certs identify the signer through the Subject DN, not through SAN. If a downstream profile requires SAN, the caller adds it after extending the library; v1 does not.
+- **No CSR-based document-signing variant in v1.** There is no `issueDocumentSigningCertForPublicKey`. Internal-keygen-only. The mTLS counterpart exists because client-managed key flows are common for mTLS; document-signing leaves are typically CA-issued with the key staying on the CA host or HSM, so the parity is not yet justified.
+- **No CAdES / CMS / PAdES / XAdES / ASiC building or verification.** EdgCA only issues the document-signing certificate. Wrapping a document and signing it (CAdES detached, ASiC-E container, etc.) is a separate concern and lives outside this package.
 - **No public certificate parsing API.** `parser.ts` is internal — `cf.tlsClientAuth.cert*` already exposes parsed values from Cloudflare, so duplicating that here adds nothing. CSR parsing **is** in scope (`parseCertificateSigningRequest`) because no Cloudflare-side equivalent exists; CSRs come from the client over the application layer.
 - **No CA hierarchy beyond two levels.** At most `root → intermediate → client`. An intermediate cannot have an intermediate underneath it.
 - **No RSA / Ed25519 / non-NIST curves.** ECDSA on NIST P-256 / P-384 / P-521 is supported (with their standard SHA-256 / SHA-384 / SHA-512 pairings). Other algorithms — including in CSRs — are rejected.

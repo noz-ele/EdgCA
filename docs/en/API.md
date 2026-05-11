@@ -10,6 +10,7 @@ import {
   issueIntermediateCA,
   issueClientCert,
   issueClientCertForPublicKey,
+  issueDocumentSigningCert,
   importCertificateAuthority,
   parseCertificateSigningRequest,
   verifyCertificateSigningRequestSignature,
@@ -93,6 +94,20 @@ interface IssuedClientCertificate {
 ```
 
 `certChainPem` is concatenated as `leaf + issuer + issuerChain`. For a client certificate issued by an intermediate that was issued from a root, the result is `client + intermediate + root`.
+
+### `IssuedDocumentSigningCertificate`
+
+```ts
+interface IssuedDocumentSigningCertificate {
+  certPem: string;
+  certDer: Uint8Array;
+  privateKey: CryptoKey;
+  publicKey: CryptoKey;
+  certChainPem: string;
+}
+```
+
+The return shape of `issueDocumentSigningCert`. Structurally identical to `IssuedClientCertificate`; the distinct name documents the embedded EKU profile (`id-kp-documentSigning`, RFC 9336) rather than the runtime shape. `certChainPem` is concatenated as `leaf + issuer + issuerChain`.
 
 ### `SerialNumber`
 
@@ -232,6 +247,36 @@ function issueClientCertForPublicKey(options: {
 The issued certificate carries the same extension set as `issueClientCert` (`basicConstraints CA=false`, `keyUsage digitalSignature`, EKU `clientAuth`, SKI, AKI, optional SAN). The embedded `subjectPublicKeyInfo` is exported from `options.publicKey` via `subtle.exportKey("spki", …)`, so the caller's public key must be extractable. The CA's signing curve dictates the signature algorithm; the leaf's embedded curve is independent and can differ.
 
 This function never sees private-key material for the leaf. The caller is responsible for everything that happens to the corresponding private key on the client side, including proof-of-possession (see `verifyCertificateSigningRequestSignature` below) when accepting an enrollment request.
+
+### `issueDocumentSigningCert(options)`
+
+Issues a document-signing certificate and private key from a CA. The leaf is *not* an mTLS client certificate; it is intended for signing arbitrary documents (CAdES, CMS detached, ASiC-E, etc., all of which are out of scope for this library and produced by separate tooling).
+
+```ts
+function issueDocumentSigningCert(options: {
+  ca: CertificateAuthority;
+  subject: Subject;
+  days: number;
+  notBefore?: Date;
+  serialNumber?: SerialNumber;
+}): Promise<IssuedDocumentSigningCertificate>;
+```
+
+The issued certificate includes:
+
+- `basicConstraints CA=false`, critical.
+- `keyUsage digitalSignature, contentCommitment`, critical. `contentCommitment` (formerly *non-repudiation*, RFC 5280 §4.2.1.3) is the bit conventionally asserted on signing keys whose signatures are intended to bind the signer to the content.
+- Extended Key Usage `id-kp-documentSigning` (OID `1.3.6.1.5.5.7.3.36`, RFC 9336), non-critical. Per RFC 9336 §3, this KeyPurposeId asserts that the public key may be used to verify signatures on documents other than X.509 PKIX structures (so it is intentionally distinct from `clientAuth` / `serverAuth` / `codeSigning`).
+- Subject Key Identifier.
+- Authority Key Identifier.
+
+Notable absences (vs. `issueClientCert`):
+
+- No Subject Alternative Name. `dnsNames` / `ipAddresses` / `emailAddresses` are not accepted. Document-signing leaves identify the signer via the Subject DN. See [`docs/en/NON_GOALS.md`](https://github.com/noz-ele/EdgCA/blob/main/docs/en/NON_GOALS.md) §4.
+- No CSR-based variant (`issueDocumentSigningCertForPublicKey` does not exist in v1). Document-signing keys are typically generated and held by the CA host or HSM rather than by an enrolling client. See `NON_GOALS.md` §4 for the rationale.
+- No CAdES / CMS / ASiC builder. EdgCA only emits the certificate. Producing a signed container from documents + this certificate is left to a separate package.
+
+Either a root or an intermediate may be passed as `ca`. The returned `certChainPem` is concatenated as `leaf + issuer + issuerChain` (e.g., `signing-leaf + intermediate + root`). The leaf key is always generated internally as P-256 ECDSA (`extractable: true`, `["sign", "verify"]`); persistence and key-handling are the caller's responsibility, exactly as for `issueClientCert`.
 
 ### `parseCertificateSigningRequest(input)`
 
@@ -511,6 +556,18 @@ The argument to `issueClientCert`. The input set for issuing a single mTLS clien
 
 `issueClientCert` **always** generates the client cert key internally, so there is no `keyPair` option. Client cert keys are assumed to be ephemeral.
 
+#### `IssueDocumentSigningCertOptions`
+
+The argument to `issueDocumentSigningCert`. The input set for issuing a single document-signing certificate. Compared to `IssueClientCertOptions`, SAN-related fields (`dnsNames`, `ipAddresses`) are absent: document-signing leaves identify the signer through the Subject DN only. As with `IssueClientCertOptions`, there is no `keyPair` option; the leaf key is always generated internally.
+
+| field | type | required | default | meaning and constraints |
+| --- | --- | --- | --- | --- |
+| `ca` | `CertificateAuthority` | ✅ | — | The issuer. Either a root or an intermediate is fine. Passing a cert with `isCA=false` or no `keyCertSign` throws. |
+| `subject` | `Subject` | ✅ | — | The subject DN of the document-signing leaf being issued. Identifies the signer. |
+| `days` | `number` | ✅ | — | Same as `CreateRootCAOptions.days`. |
+| `notBefore` | `Date` | — | call time | Same as `CreateRootCAOptions.notBefore`. |
+| `serialNumber` | `SerialNumber` | — | CSPRNG-derived 16-byte random | Same as `CreateRootCAOptions.serialNumber`. |
+
 #### `ImportCertificateAuthorityOptions`
 
 The argument to `importCertificateAuthority`. The input for reconstructing a `CertificateAuthority` instance from persisted CA material (cert PEM + private `CryptoKey`, plus the parent chain when applicable). Used not for creating a new CA but for loading a stored CA at Worker startup so it can be used for subsequent issuance.
@@ -547,6 +604,18 @@ The return value of `issueClientCert`. A type that returns the issued client cer
 | `publicKey` | `CryptoKey` | A WebCrypto `CryptoKey` for `["verify"]`. |
 | `certChainPem` | `string` | leaf + issuer + issuerChain joined by newlines, forming the complete chain. When issued via an intermediate, the order is `client + intermediate + root`. |
 
+#### `IssuedDocumentSigningCertificate`
+
+The return value of `issueDocumentSigningCert`. Structurally identical to `IssuedClientCertificate` (same five fields), but the distinct interface name documents that the embedded EKU is `id-kp-documentSigning` (RFC 9336) rather than `clientAuth`. The leaf is for signing arbitrary documents (CAdES, CMS, ASiC-E, etc., produced outside this library) and is not intended to be presented during a TLS handshake.
+
+| field | type | meaning |
+| --- | --- | --- |
+| `certPem` | `string` | The PEM of the document-signing certificate. |
+| `certDer` | `Uint8Array` | The DER bytes of the document-signing certificate. |
+| `privateKey` | `CryptoKey` | A WebCrypto `CryptoKey` for `["sign"]`. |
+| `publicKey` | `CryptoKey` | A WebCrypto `CryptoKey` for `["verify"]`. |
+| `certChainPem` | `string` | leaf + issuer + issuerChain joined by newlines. When issued via an intermediate, the order is `signing-leaf + intermediate + root`. |
+
 ### `SubjectAttribute`
 
 A single entry that makes up a `Subject`. The Subject DN (Distinguished Name) of an X.509 cert is a structure of multiple attributes in order; one such attribute is represented as `{ type, value }`. EdgCA does not accept DN string input like `CN=foo,O=Example` — the structured array form is required by design. Multi-valued RDNs (multiple attributes within a single RDN) are also unsupported; one entry equals one RDN.
@@ -573,7 +642,10 @@ A single entry that makes up a `Subject`. The Subject DN (Distinguished Name) of
 
 EdgCA does not provide:
 
-- Server certificate issuance.
+- Server certificate issuance. Leaf scope is mTLS client certs and document-signing certs only.
+- A CSR-based document-signing variant (`issueDocumentSigningCertForPublicKey` does not exist in v1).
+- SAN (`dnsNames` / `ipAddresses` / `emailAddresses`) on document-signing leaves.
+- CAdES / CMS / PAdES / XAdES / ASiC building or verification. EdgCA emits the document-signing certificate only; producing a signed container from documents + this certificate is a separate concern.
 - A public certificate parsing API.
 - Certificate chain validation (chain walking / PKI path building). `verifyClientCertificateIssuedBy` is limited to identity confirmation against a single direct issuer.
 - Extraction of time fields from a cert. `verifyClientCertificateIssuedBy`'s `validity` option provides a time check, but `notBefore` / `notAfter` are passed in by the caller (it is the application's job to convert `cf.tlsClientAuth.certNotBefore` / `certNotAfter` to `Date`).

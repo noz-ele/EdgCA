@@ -16,9 +16,11 @@ import type {
   ImportCertificateAuthorityOptions,
   IssueClientCertForPublicKeyOptions,
   IssueClientCertOptions,
+  IssueDocumentSigningCertOptions,
   IssueIntermediateCAOptions,
   IssuedClientCertificate,
   IssuedClientCertificateForPublicKey,
+  IssuedDocumentSigningCertificate,
   Subject
 } from "./types.js";
 import {
@@ -28,6 +30,7 @@ import {
   buildCertificate,
   buildTbsCertificate,
   extendedKeyUsageClientAuthExtension,
+  extendedKeyUsageDocumentSigningExtension,
   keyUsageExtension,
   subjectAltNameExtension,
   subjectKeyIdentifierExtension
@@ -97,17 +100,16 @@ export async function issueIntermediateCA(options: IssueIntermediateCAOptions): 
 
 export async function issueClientCert(options: IssueClientCertOptions): Promise<IssuedClientCertificate> {
   const keyPair = await generateKeyPair();
-  const built = await buildClientCertificate(
+  const built = await buildLeafCertificate(
     options.ca,
     keyPair.publicKey,
     {
       subject: options.subject,
       days: options.days,
       notBefore: options.notBefore,
-      serialNumber: options.serialNumber,
-      dnsNames: options.dnsNames,
-      ipAddresses: options.ipAddresses
-    }
+      serialNumber: options.serialNumber
+    },
+    clientCertProfileExtensions(options.dnsNames, options.ipAddresses)
   );
   return {
     certPem: built.certPem,
@@ -121,17 +123,16 @@ export async function issueClientCert(options: IssueClientCertOptions): Promise<
 export async function issueClientCertForPublicKey(
   options: IssueClientCertForPublicKeyOptions
 ): Promise<IssuedClientCertificateForPublicKey> {
-  const built = await buildClientCertificate(
+  const built = await buildLeafCertificate(
     options.ca,
     options.publicKey,
     {
       subject: options.subject,
       days: options.days,
       notBefore: options.notBefore,
-      serialNumber: options.serialNumber,
-      dnsNames: options.dnsNames,
-      ipAddresses: options.ipAddresses
-    }
+      serialNumber: options.serialNumber
+    },
+    clientCertProfileExtensions(options.dnsNames, options.ipAddresses)
   );
   return {
     certPem: built.certPem,
@@ -140,42 +141,37 @@ export async function issueClientCertForPublicKey(
   };
 }
 
-interface ClientCertContent {
+interface LeafCertIdentity {
   subject: Subject;
   days: number;
   notBefore?: Date | undefined;
   serialNumber?: IssueClientCertOptions["serialNumber"];
-  dnsNames?: readonly string[] | undefined;
-  ipAddresses?: readonly string[] | undefined;
 }
 
-async function buildClientCertificate(
+async function buildLeafCertificate(
   ca: CertificateAuthority,
   subjectPublicKey: CryptoKey,
-  content: ClientCertContent
+  identity: LeafCertIdentity,
+  profileExtensions: readonly Uint8Array[]
 ): Promise<{ certPem: string; certDer: Uint8Array; certChainPem: string }> {
   const issuer = await parseIssuer(ca);
   const issuerChainPem = ca.issuerChainPem;
   assertCanIssueCertificate(issuer);
 
   const issuerCurve = curveOf(ca.privateKey);
-  const subjectNameDer = encodeName(content.subject);
+  const subjectNameDer = encodeName(identity.subject);
   const spki = await exportSpki(subjectPublicKey);
   const subjectKeyIdentifier = await keyIdentifierFromSpki(spki);
   const authorityKeyIdentifier = issuer.subjectKeyIdentifier ?? await keyIdentifierFromSpki(issuer.subjectPublicKeyInfoDer);
-  const san = subjectAltNameExtension(content.dnsNames, content.ipAddresses);
   const extensions = [
-    basicConstraintsLeafExtension(),
-    keyUsageExtension(["digitalSignature"]),
-    extendedKeyUsageClientAuthExtension(),
+    ...profileExtensions,
     subjectKeyIdentifierExtension(subjectKeyIdentifier),
-    authorityKeyIdentifierExtension(authorityKeyIdentifier),
-    ...(san ? [san] : [])
+    authorityKeyIdentifierExtension(authorityKeyIdentifier)
   ];
   const { tbsCertificateDer } = buildTbsCertificate({
-    serialNumber: content.serialNumber,
-    notBefore: content.notBefore,
-    days: content.days,
+    serialNumber: identity.serialNumber,
+    notBefore: identity.notBefore,
+    days: identity.days,
     issuerNameDer: issuer.subjectNameDer,
     subjectNameDer,
     subjectPublicKeyInfoDer: spki,
@@ -190,6 +186,51 @@ async function buildClientCertificate(
     certPem,
     certDer: cloneBytes(certDer),
     certChainPem: joinPemChain([certPem, ca.certPem, issuerChainPem])
+  };
+}
+
+function clientCertProfileExtensions(
+  dnsNames?: readonly string[] | undefined,
+  ipAddresses?: readonly string[] | undefined
+): Uint8Array[] {
+  const san = subjectAltNameExtension(dnsNames, ipAddresses);
+  return [
+    basicConstraintsLeafExtension(),
+    keyUsageExtension(["digitalSignature"]),
+    extendedKeyUsageClientAuthExtension(),
+    ...(san ? [san] : [])
+  ];
+}
+
+function documentSigningProfileExtensions(): Uint8Array[] {
+  return [
+    basicConstraintsLeafExtension(),
+    keyUsageExtension(["digitalSignature", "contentCommitment"]),
+    extendedKeyUsageDocumentSigningExtension()
+  ];
+}
+
+export async function issueDocumentSigningCert(
+  options: IssueDocumentSigningCertOptions
+): Promise<IssuedDocumentSigningCertificate> {
+  const keyPair = await generateKeyPair();
+  const built = await buildLeafCertificate(
+    options.ca,
+    keyPair.publicKey,
+    {
+      subject: options.subject,
+      days: options.days,
+      notBefore: options.notBefore,
+      serialNumber: options.serialNumber
+    },
+    documentSigningProfileExtensions()
+  );
+  return {
+    certPem: built.certPem,
+    certDer: built.certDer,
+    privateKey: keyPair.privateKey,
+    publicKey: keyPair.publicKey,
+    certChainPem: built.certChainPem
   };
 }
 

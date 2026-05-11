@@ -3,6 +3,7 @@ export {
   importCertificateAuthority,
   issueClientCert,
   issueClientCertForPublicKey,
+  issueDocumentSigningCert,
   issueIntermediateCA
 } from "./ca.js";
 export {
@@ -25,9 +26,11 @@ export type {
   ImportCertificateAuthorityOptions,
   IssueClientCertForPublicKeyOptions,
   IssueClientCertOptions,
+  IssueDocumentSigningCertOptions,
   IssueIntermediateCAOptions,
   IssuedClientCertificate,
   IssuedClientCertificateForPublicKey,
+  IssuedDocumentSigningCertificate,
   SerialNumber,
   ShortSubjectAttributeType,
   Subject,

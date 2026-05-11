@@ -2,7 +2,7 @@
 
 > [日本語](https://github.com/noz-ele/EdgCA/blob/main/docs/jp/README.md) | English
 
-EdgCA is a small TypeScript library that issues mTLS client certificates from a self-managed CA on Cloudflare Workers-compatible runtimes. It supports internal keygen, CSR-based enrollment (PKCS#10 + proof-of-possession), and PFX (PKCS#12) export for OS keystore import.
+EdgCA is a small TypeScript library that issues mTLS client certificates and document-signing certificates from a self-managed CA on Cloudflare Workers-compatible runtimes. It supports internal keygen, CSR-based enrollment for mTLS leaves (PKCS#10 + proof-of-possession), and PFX (PKCS#12) export for OS keystore import.
 
 The scope is intentionally narrow:
 
@@ -10,6 +10,7 @@ The scope is intentionally narrow:
 - Issue an intermediate CA from a root CA.
 - Issue an mTLS client certificate and private key from an intermediate CA.
 - Issue an mTLS client certificate from a caller-provided public key (no private key returned). Pairs with the CSR helpers below.
+- Issue a document-signing certificate (RFC 9336 `id-kp-documentSigning`) and private key from a CA. Used as the signer cert for CAdES / CMS / ASiC-style document signatures, which are produced by separate tooling.
 - Parse a PKCS#10 CSR (subject, requested SAN, public key, raw extensions/attributes) and verify its proof-of-possession signature.
 - Decide whether a received client certificate was issued by your own CA.
 - Encode/decode certificates as PEM/DER. Keys are exchanged as `CryptoKey` only — the library never returns or accepts string forms (PEM, JWK, etc.) of private keys.
@@ -23,6 +24,7 @@ ECDSA on **NIST P-256, P-384, and P-521** is supported throughout (signing, veri
 ## Contents
 
 - [Quick Start](#quick-start) — root → intermediate → client cert (incl. PFX bundling)
+- [Issue a document-signing certificate](#issue-a-document-signing-certificate) — RFC 9336 `id-kp-documentSigning` leaf
 - [Verify on Cloudflare Worker](#verify-cloudflare-worker) — confirm a cert was issued by your CA
 - [Issue from a CSR](#issue-from-a-csr) — accept a caller-managed key via PKCS#10 + POP
 - [Subject](#subject) · [Scope](#scope) · [Key Handling](#key-handling) · [Development](#development) · [API Documentation](#api-documentation)
@@ -118,6 +120,46 @@ The password is taken as a UTF-8 `Uint8Array` (not a `string`) so that callers c
 The implementation is environment-agnostic (WebCrypto only, no Node-specific APIs), so PFX assembly can run **server-side, in a Cloudflare Worker, or directly in a browser**. A common architecture is to keep the CA on a server while having the browser generate its keypair locally, send a CSR, receive the cert, and assemble the PFX client-side — keeping the private key and password off the wire.
 
 The `@noz-ele/edgca/pkcs12` subpath is provided so consumers that only need PFX assembly can import it without pulling in the CA / CSR / verify modules.
+
+## Issue a document-signing certificate
+
+`issueDocumentSigningCert` issues a leaf intended for signing arbitrary documents (CAdES detached, CMS, ASiC-E containers, etc., which are produced by separate tooling — not by EdgCA). It is **not** an mTLS client certificate: the EKU is `id-kp-documentSigning` (RFC 9336), and `keyUsage` carries `digitalSignature, contentCommitment` instead of just `digitalSignature`. SAN is intentionally not accepted; the signer is identified by Subject DN.
+
+```ts
+import {
+  createRootCA,
+  issueIntermediateCA,
+  issueDocumentSigningCert
+} from "@noz-ele/edgca";
+
+const root = await createRootCA({
+  subject: [{ type: "CN", value: "dev-root" }],
+  days: 3650
+});
+
+const intermediate = await issueIntermediateCA({
+  ca: root,
+  subject: [{ type: "CN", value: "dev-intermediate" }],
+  days: 365
+});
+
+const signer = await issueDocumentSigningCert({
+  ca: intermediate,
+  subject: [
+    { type: "CN", value: "Alice (Document Signer)" },
+    { type: "O", value: "Example" }
+  ],
+  days: 365
+});
+
+// signer.certPem        — the signing certificate
+// signer.certChainPem   — full chain to embed alongside the signature (signer + intermediate + root)
+// signer.privateKey     — secret CryptoKey, used by the document-signing tool to produce the signature
+```
+
+The returned shape is `IssuedDocumentSigningCertificate` (structurally identical to `IssuedClientCertificate`; the distinct name flags the EKU profile). The same `exportPkcs12` flow used for mTLS leaves works here too if you need to bundle the signer cert + key into a PFX for tools that consume PKCS#12.
+
+There is no `issueDocumentSigningCertForPublicKey` (CSR variant) in v1, and EdgCA does not produce CAdES / CMS / ASiC containers itself — see [docs/en/NON_GOALS.md](https://github.com/noz-ele/EdgCA/blob/main/docs/en/NON_GOALS.md) for the rationale.
 
 ## Verify (Cloudflare Worker)
 
@@ -283,6 +325,7 @@ In scope:
 - Root CA creation.
 - Intermediate CA issuance.
 - mTLS client certificate issuance (with internal key generation, or from a caller-provided public key).
+- Document-signing certificate issuance with EKU `id-kp-documentSigning` (RFC 9336) and `keyUsage digitalSignature, contentCommitment` — internal key generation only, no SAN.
 - CSR (PKCS#10) parsing and proof-of-possession signature verification.
 - Identity check that a cert was issued by your own CA (`verifyClientCertificateIssuedBy`, with optional time-validity check).
 - PEM/DER helpers (certificates only — keys are exchanged as `CryptoKey`).
@@ -291,7 +334,10 @@ In scope:
 
 Intentionally out of scope:
 
-- Server certificate issuance.
+- Server certificate issuance. Leaf scope is mTLS client certs and document-signing certs only.
+- Document-signing certificate issuance from a caller-provided public key (`issueDocumentSigningCertForPublicKey`) — not in v1.
+- SAN (`dnsNames` / `ipAddresses` / `emailAddresses`) on document-signing leaves.
+- CAdES / CMS / PAdES / XAdES / ASiC document signing or container building. EdgCA only issues the signing certificate; producing a signed document or container is a separate concern.
 - Public chain-validation APIs.
 - Extracting time fields from a cert. `verifyClientCertificateIssuedBy`'s `validity` option performs the time check, but the `notBefore` / `notAfter` values are passed in by the caller from `cf.tlsClientAuth`.
 - CRL, OCSP, revocation databases, revocation checks.

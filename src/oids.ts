@@ -15,6 +15,7 @@ export const OID = {
   subjectKeyIdentifier: "2.5.29.14",
   authorityKeyIdentifier: "2.5.29.35",
   clientAuth: "1.3.6.1.5.5.7.3.2",
+  documentSigning: "1.3.6.1.5.5.7.3.36",
   extensionRequest: "1.2.840.113549.1.9.14",
   data: "1.2.840.113549.1.7.1",
   encryptedData: "1.2.840.113549.1.7.6",

@@ -2,13 +2,14 @@
 
 > 日本語 | [English](../../README.md)
 
-EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理する自己 CA から mTLS 用 client certificate を発行するための小さな TypeScript ライブラリです。内部での鍵生成、CSR ベースの enrollment (PKCS#10 + 所持証明)、OS 証明書ストア取り込み用の PFX (PKCS#12) export に対応します。
+EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理する自己 CA から mTLS 用 client certificate と文書署名用 certificate を発行するための小さな TypeScript ライブラリです。内部での鍵生成、mTLS leaf 向けの CSR ベース enrollment (PKCS#10 + 所持証明)、OS 証明書ストア取り込み用の PFX (PKCS#12) export に対応します。
 
 目的は明確に絞っています。
 
 - 自己署名 root CA を作る。
 - root CA から intermediate CA を発行する。
 - intermediate CA から mTLS 用 client certificate と秘密鍵を発行する。
+- 文書署名用 certificate (RFC 9336 `id-kp-documentSigning`) と秘密鍵を CA から発行する。CAdES / CMS / ASiC など文書署名 container 自体の生成は別 tooling の責務で、EdgCA は signer cert を作るだけ。
 - 受け取った client certificate が自分の CA から発行されたかを判定する。
 - 証明書と鍵を PEM/DER で入出力する。
 - 発行済み証明書 + 秘密鍵を password 付き PFX (PKCS#12) として OS 証明書ストア取り込み用に出力する (Win11+、macOS 15+、iOS/iPadOS 18+、modern Linux consumer 向け)。
@@ -19,6 +20,7 @@ EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理�
 ## Contents
 
 - [Quick Start](#quick-start) — root → intermediate → client cert を発行 (PFX 束ね手順も含む)
+- [文書署名用 certificate を発行する](#文書署名用-certificate-を発行する) — RFC 9336 `id-kp-documentSigning` の leaf を発行
 - [Verify (Cloudflare Worker)](#verify-cloudflare-worker) — 自 CA から発行されたかを判定
 - [CSR から発行する](#csr-から発行する) — client が秘密鍵を保持する構成 (PKCS#10 + POP)
 - [Subject](#subject) · [Scope](#scope) · [Key Handling](#key-handling) · [Development](#development) · [API Documentation](#api-documentation)
@@ -114,6 +116,46 @@ password は UTF-8 の `Uint8Array` で受け取ります (`string` 不可)。�
 実装は環境依存なし (WebCrypto のみ、Node 固有 API なし) なので、PFX の組み立ては **サーバ側、Cloudflare Worker、ブラウザのいずれでも同じコードで動きます**。よくある構成は CA をサーバに置き、ブラウザでは鍵ペアをローカル生成 → CSR をサーバに送って cert をもらう → ブラウザ側で PFX に組み立てる、というもの。秘密鍵と password が通信路に乗りません。
 
 `@noz-ele/edgca/pkcs12` という subpath が用意されているので、PFX 組み立てだけ使いたい consumer は CA / CSR / verify モジュールを引き込まずに import できます。
+
+## 文書署名用 certificate を発行する
+
+`issueDocumentSigningCert` は、任意 document への署名 (CAdES detached、CMS、ASiC-E container 等。これらの container 生成は EdgCA の対象外で別 tooling で行う) に使う leaf を発行します。**mTLS client certificate ではありません**。EKU は `id-kp-documentSigning` (RFC 9336)、`keyUsage` は `digitalSignature, contentCommitment` (mTLS leaf の `digitalSignature` のみと違う)。SAN は意図的に受け取りません。署名者の identity は Subject DN で示します。
+
+```ts
+import {
+  createRootCA,
+  issueIntermediateCA,
+  issueDocumentSigningCert
+} from "@noz-ele/edgca";
+
+const root = await createRootCA({
+  subject: [{ type: "CN", value: "dev-root" }],
+  days: 3650
+});
+
+const intermediate = await issueIntermediateCA({
+  ca: root,
+  subject: [{ type: "CN", value: "dev-intermediate" }],
+  days: 365
+});
+
+const signer = await issueDocumentSigningCert({
+  ca: intermediate,
+  subject: [
+    { type: "CN", value: "Alice (Document Signer)" },
+    { type: "O", value: "Example" }
+  ],
+  days: 365
+});
+
+// signer.certPem        — 署名用 certificate
+// signer.certChainPem   — 署名と一緒に埋める完全 chain (signer + intermediate + root)
+// signer.privateKey     — 秘密 CryptoKey。文書署名 tool が使う
+```
+
+戻り値は `IssuedDocumentSigningCertificate` (構造は `IssuedClientCertificate` と同一だが、interface 名で EKU profile を区別)。signer cert + 鍵を PKCS#12 として束ねたい場合は、mTLS leaf と同じく `exportPkcs12` flow がそのまま使えます。
+
+`issueDocumentSigningCertForPublicKey` (CSR variant) は v1 では提供しません。CAdES / CMS / ASiC container の生成も EdgCA は行いません — 詳細は [docs/jp/NON_GOALS.md](NON_GOALS.md) を参照してください。
 
 ## Verify (Cloudflare Worker)
 
@@ -274,6 +316,7 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 - root CA 作成。
 - intermediate CA 発行。
 - mTLS client certificate 発行 (内部鍵生成、または持ち込み公開鍵から発行)。
+- 文書署名用 certificate 発行。EKU `id-kp-documentSigning` (RFC 9336)、`keyUsage digitalSignature, contentCommitment`、内部鍵生成のみ、SAN なし。
 - CSR (PKCS#10) の parse と所持証明 (POP) 署名検証。
 - 自己 CA からの発行かを判定する identity 確認 API (`verifyClientCertificateIssuedBy`、任意の時刻有効性 check 付き)。
 - PEM/DER helper (証明書のみ — 鍵は CryptoKey でやり取り)。
@@ -282,7 +325,10 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 
 意図的に対象外:
 
-- server certificate 発行。
+- server certificate 発行。leaf scope は mTLS client cert と文書署名 cert のみ。
+- 文書署名 cert を持ち込み公開鍵から発行する API (`issueDocumentSigningCertForPublicKey`) — v1 では提供しない。
+- 文書署名 leaf への SAN (`dnsNames` / `ipAddresses` / `emailAddresses`)。
+- CAdES / CMS / PAdES / XAdES / ASiC の文書署名や container 生成。EdgCA は signer cert を発行するだけで、文書署名 container の生成は別の関心事。
 - 公開 chain validation API。
 - cert からの時刻 field の抽出。`verifyClientCertificateIssuedBy` の `validity` option は時刻 check 自体は提供するが、`notBefore` / `notAfter` 値は呼び出し側が `cf.tlsClientAuth` から渡す。
 - CRL、OCSP、失効 DB、失効確認。

@@ -90,6 +90,22 @@ export interface IssuedClientCertificateForPublicKey {
   certChainPem: string;
 }
 
+export interface IssueDocumentSigningCertOptions {
+  ca: CertificateAuthority;
+  subject: Subject;
+  days: number;
+  notBefore?: Date;
+  serialNumber?: SerialNumber;
+}
+
+export interface IssuedDocumentSigningCertificate {
+  certPem: string;
+  certDer: Uint8Array;
+  privateKey: CryptoKey;
+  publicKey: CryptoKey;
+  certChainPem: string;
+}
+
 export interface ImportCertificateAuthorityOptions {
   certPem: string;
   privateKey: CryptoKey;

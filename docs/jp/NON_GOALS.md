@@ -35,7 +35,10 @@ EdgCA が**提供する**唯一の検証 API は `verifyClientCertificateIssuedB
 
 ## 4. 機能スコープ
 
-- **server certificate 発行なし**。client cert (mTLS) に専念。
+- **server certificate 発行なし**。leaf は mTLS client cert (`issueClientCert` / `issueClientCertForPublicKey`) と文書署名用 cert (`issueDocumentSigningCert`、RFC 9336 `id-kp-documentSigning`) を対象とし、TLS server cert は対象外。
+- **文書署名 leaf に SAN なし**。`issueDocumentSigningCert` は `dnsNames` / `ipAddresses` / `emailAddresses` を受け取らない。文書署名 cert における署名者の identity は Subject DN で示すという方針。下流 profile が SAN を要求する場合は library を拡張する側の責任で、v1 では持たない。
+- **文書署名の CSR 経由発行なし (v1)**。`issueDocumentSigningCertForPublicKey` は提供しない。内部鍵生成のみ。mTLS 側に CSR 版があるのは「client が自分の秘密鍵を保持する flow」が一般的だからで、文書署名 leaf は CA host / HSM 側で鍵保管したまま発行する flow が一般的なため、対称性は v1 では入れない。
+- **CAdES / CMS / PAdES / XAdES / ASiC の builder や verifier なし**。EdgCA は文書署名用 cert を発行するだけ。文書を包んで署名する (CAdES detached、ASiC-E container 等) のは別の関心事で、本 package の外。
 - **公開 certificate parsing API なし**。`parser.ts` は internal — Cloudflare 側が `cf.tlsClientAuth.cert*` で parse 済み値を提供するため library で重複実装する意味がない。一方 **CSR parser は scope 内** (`parseCertificateSigningRequest`)。CSR は client から application layer 経由で来る入力で、Cloudflare 側に等価機能がない。
 - **3 段以上の CA 階層なし**。最大 `root → intermediate → client`。intermediate のさらに下に intermediate は作れない。
 - **RSA / Ed25519 / 非 NIST curve なし**。ECDSA NIST P-256 / P-384 / P-521 をサポート (それぞれ SHA-256 / SHA-384 / SHA-512 の標準ペアリング)。それ以外のアルゴリズム — CSR 内も含め — は reject。

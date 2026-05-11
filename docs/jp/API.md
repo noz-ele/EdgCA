@@ -10,6 +10,7 @@ import {
   issueIntermediateCA,
   issueClientCert,
   issueClientCertForPublicKey,
+  issueDocumentSigningCert,
   importCertificateAuthority,
   parseCertificateSigningRequest,
   verifyCertificateSigningRequestSignature,
@@ -93,6 +94,20 @@ interface IssuedClientCertificate {
 ```
 
 `certChainPem` は `leaf + issuer + issuerChain` の順で出力されます。root から作成した intermediate で client certificate を発行した場合は、`client + intermediate + root` になります。
+
+### `IssuedDocumentSigningCertificate`
+
+```ts
+interface IssuedDocumentSigningCertificate {
+  certPem: string;
+  certDer: Uint8Array;
+  privateKey: CryptoKey;
+  publicKey: CryptoKey;
+  certChainPem: string;
+}
+```
+
+`issueDocumentSigningCert` の戻り値です。構造は `IssuedClientCertificate` と完全に同一ですが、interface 名を分けることで「この cert に埋め込まれている EKU は `id-kp-documentSigning` (RFC 9336) であって `clientAuth` ではない」という意味論を読者に明示します。`certChainPem` の連結順序は `leaf + issuer + issuerChain`。
 
 ### `SerialNumber`
 
@@ -232,6 +247,36 @@ function issueClientCertForPublicKey(options: {
 発行 cert の extension は `issueClientCert` と同じ (`basicConstraints CA=false`、`keyUsage digitalSignature`、EKU `clientAuth`、SKI、AKI、optional SAN)。埋め込まれる `subjectPublicKeyInfo` は `options.publicKey` を `subtle.exportKey("spki", …)` で export して入れるため、caller の公開鍵は extractable である必要があります。CA の署名 curve が signature algorithm を決め、leaf の埋め込み curve はそれと独立で良い。
 
 この関数は leaf の秘密鍵を一切扱いません。client 側の秘密鍵管理 (POP 検証など、後述の `verifyCertificateSigningRequestSignature` を参照) は呼び出し側の責務です。
+
+### `issueDocumentSigningCert(options)`
+
+文書署名用 certificate と秘密鍵を CA から発行します。発行される leaf は **mTLS client certificate ではなく**、任意 document への署名 (CAdES、CMS detached、ASiC-E など。これらの container 生成は本 library の対象外で、別 tooling で行う) を意図した cert です。
+
+```ts
+function issueDocumentSigningCert(options: {
+  ca: CertificateAuthority;
+  subject: Subject;
+  days: number;
+  notBefore?: Date;
+  serialNumber?: SerialNumber;
+}): Promise<IssuedDocumentSigningCertificate>;
+```
+
+発行される証明書には次を含めます。
+
+- `basicConstraints CA=false`、critical。
+- `keyUsage digitalSignature, contentCommitment`、critical。`contentCommitment` (旧 *non-repudiation*、RFC 5280 §4.2.1.3) は「この鍵で行った署名が署名者を content に紐付ける意図がある」という慣行的な bit。
+- Extended Key Usage `id-kp-documentSigning` (OID `1.3.6.1.5.5.7.3.36`、RFC 9336)、non-critical。RFC 9336 §3 によりこの KeyPurposeId は「X.509 PKIX 構造以外の document に対する署名検証用途」を示し、`clientAuth` / `serverAuth` / `codeSigning` とは意図的に区別されます。
+- Subject Key Identifier。
+- Authority Key Identifier。
+
+`issueClientCert` との主要な差分:
+
+- **SAN なし**。`dnsNames` / `ipAddresses` / `emailAddresses` は受け取りません。文書署名 leaf における署名者 identity は Subject DN で表します。詳細は [`docs/jp/NON_GOALS.md`](NON_GOALS.md) §4。
+- **CSR 経由の発行 variant なし** (v1)。`issueDocumentSigningCertForPublicKey` は提供しません。文書署名鍵は CA host または HSM 側で生成・保持される flow が一般的なため。理由は `NON_GOALS.md` §4。
+- **CAdES / CMS / ASiC builder なし**。本 library は cert 発行のみ。document を包んで署名する処理は別 package の責務。
+
+`ca` は root でも intermediate でも構いません。返却される `certChainPem` は `leaf + issuer + issuerChain` の順 (例: `signing-leaf + intermediate + root`)。leaf 鍵は常に内部で P-256 ECDSA (`extractable: true`、usage `["sign", "verify"]`) として生成されます。秘密鍵の永続化と取り扱いは呼び出し側の責任で、`issueClientCert` と同じ扱いです。
 
 ### `parseCertificateSigningRequest(input)`
 
@@ -511,6 +556,18 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 
 `issueClientCert` は client cert の鍵を**常に内部生成**するため、`keyPair` option はない。client cert の鍵は ephemeral 想定。
 
+#### `IssueDocumentSigningCertOptions`
+
+`issueDocumentSigningCert` の引数。文書署名用 leaf を 1 本発行するための入力。`IssueClientCertOptions` との差は、SAN 系 field (`dnsNames` / `ipAddresses`) を持たないこと。文書署名 leaf における署名者 identity は Subject DN だけで示す。`IssueClientCertOptions` と同じく `keyPair` option はなく、leaf 鍵は常に内部生成される。
+
+| field          | 型                     | 必須 | default                       | 意味と制約                                                                                                            |
+| -------------- | ---------------------- | ---- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `ca`           | `CertificateAuthority` | ✅   | —                             | 発行 issuer。root または intermediate どちらでも可。`isCA=false` または `keyCertSign` なしの cert を渡すと例外。            |
+| `subject`      | `Subject`              | ✅   | —                             | 発行する文書署名 leaf の subject DN。署名者を識別するための DN。                                                         |
+| `days`         | `number`               | ✅   | —                             | `CreateRootCAOptions.days` と同じ。                                                                                    |
+| `notBefore`    | `Date`                 | —    | 呼び出し時刻                  | `CreateRootCAOptions.notBefore` と同じ。                                                                                |
+| `serialNumber` | `SerialNumber`         | —    | CSPRNG 由来 16-byte random    | `CreateRootCAOptions.serialNumber` と同じ。                                                                             |
+
 #### `ImportCertificateAuthorityOptions`
 
 `importCertificateAuthority` の引数。永続化された CA 情報 (cert PEM + 秘密鍵 `CryptoKey`、必要なら親 chain) を再構成して `CertificateAuthority` instance に戻すための入力。新規 CA を作るのではなく、保存済み CA を Workers の起動時に読み込んで以降の発行に使う運用で利用する。
@@ -547,6 +604,18 @@ CA を「秘密鍵 + 自 cert + 上位 chain」の 3 点で 1 つにまとめた
 | `publicKey`     | `CryptoKey`  | WebCrypto `CryptoKey`。`["verify"]` 用途。                                        |
 | `certChainPem`  | `string`     | leaf + issuer + issuerChain を改行で連結した完全 chain。intermediate 経由で発行した場合は `client + intermediate + root` の順。 |
 
+#### `IssuedDocumentSigningCertificate`
+
+`issueDocumentSigningCert` の戻り値。構造は `IssuedClientCertificate` と同一の 5 field だが、interface 名を分けることで「埋め込み EKU が `id-kp-documentSigning` (RFC 9336) であって `clientAuth` ではない」ことを意味論的に示す。leaf は任意 document への署名 (CAdES、CMS、ASiC-E など、本 library 外で生成) を意図しており、TLS handshake で提示することは想定しない。
+
+| field           | 型           | 意味                                                                              |
+| --------------- | ------------ | --------------------------------------------------------------------------------- |
+| `certPem`       | `string`     | 文書署名 certificate の PEM。                                                     |
+| `certDer`       | `Uint8Array` | 文書署名 cert の DER bytes。                                                       |
+| `privateKey`    | `CryptoKey`  | WebCrypto `CryptoKey`。`["sign"]` 用途。                                          |
+| `publicKey`     | `CryptoKey`  | WebCrypto `CryptoKey`。`["verify"]` 用途。                                        |
+| `certChainPem`  | `string`     | leaf + issuer + issuerChain を改行で連結した完全 chain。intermediate 経由で発行した場合は `signing-leaf + intermediate + root` の順。 |
+
 ### `SubjectAttribute`
 
 `Subject` を構成する 1 entry。X.509 cert の Subject DN (Distinguished Name) は複数の attribute を順番に並べた構造で、その 1 つを `{ type, value }` で表現する。EdgCA は `CN=foo,O=Example` のような DN 文字列入力を受け付けず、必ずこの structured な配列で渡す設計。multi-valued RDN (1 つの RDN に複数 attribute) も非対応で、1 entry = 1 RDN。
@@ -573,7 +642,10 @@ CA を「秘密鍵 + 自 cert + 上位 chain」の 3 点で 1 つにまとめた
 
 EdgCA は次を提供しません。
 
-- server certificate 発行。
+- server certificate 発行。leaf scope は mTLS client cert と文書署名 cert のみ。
+- 文書署名 leaf の CSR 経由発行 (`issueDocumentSigningCertForPublicKey` は v1 では存在しない)。
+- 文書署名 leaf への SAN (`dnsNames` / `ipAddresses` / `emailAddresses`)。
+- CAdES / CMS / PAdES / XAdES / ASiC の builder や verifier。EdgCA は文書署名 cert を発行するだけで、document を含む署名 container の生成は別の関心事。
 - 公開 certificate parsing API。
 - certificate chain validation (chain 遡及・PKI path building)。`verifyClientCertificateIssuedBy` は直接の発行者 1 本に対する identity 確認に限定。
 - cert からの時刻 field の抽出。`verifyClientCertificateIssuedBy` の `validity` option は時刻 check を提供するが、`notBefore` / `notAfter` は呼び出し側が外から渡す (`cf.tlsClientAuth.certNotBefore` / `certNotAfter` を `Date` に変換するのは application 側)。

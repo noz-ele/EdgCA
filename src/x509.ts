@@ -105,6 +105,10 @@ export function extendedKeyUsageClientAuthExtension(): Uint8Array {
   return extension(OID.extendedKeyUsage, false, sequence(oid(OID.clientAuth)));
 }
 
+export function extendedKeyUsageDocumentSigningExtension(): Uint8Array {
+  return extension(OID.extendedKeyUsage, false, sequence(oid(OID.documentSigning)));
+}
+
 export function subjectKeyIdentifierExtension(keyIdentifier: Uint8Array): Uint8Array {
   return extension(OID.subjectKeyIdentifier, false, octetString(keyIdentifier));
 }
@@ -285,6 +289,7 @@ function assertYearInRange(year: number, fieldName: string): void {
 
 const KEY_USAGE_BITS = {
   digitalSignature: 0,
+  contentCommitment: 1,
   keyCertSign: 5,
   cRLSign: 6
 } as const;

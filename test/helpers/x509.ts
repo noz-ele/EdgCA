@@ -26,6 +26,7 @@ export interface ParsedKeyUsage {
   unusedBits: number;
   bytes: Uint8Array;
   digitalSignature: boolean;
+  contentCommitment: boolean;
   keyCertSign: boolean;
   cRLSign: boolean;
 }
@@ -200,6 +201,7 @@ export function parseKeyUsage(value: Uint8Array): ParsedKeyUsage {
     unusedBits,
     bytes,
     digitalSignature: (first & 0x80) !== 0,
+    contentCommitment: (first & 0x40) !== 0,
     keyCertSign: (first & 0x04) !== 0,
     cRLSign: (first & 0x02) !== 0
   };
