@@ -29,8 +29,10 @@ import {
 import {
   cryptoKeyToPkcs8Pem,
   defaultPfxPath,
-  importPkcs8PrivateKeyFromPem
+  importPkcs8PrivateKeyFromPem,
+  writeIssuedLeafTriplet
 } from "../src/cli/io.js";
+import { bytesEqual, pemToDer, pemToDerWithLabel, splitPemBlocks } from "../src/index.js";
 import { parsePfx } from "./helpers/parse-pfx.js";
 
 let tempDir: string;
@@ -566,20 +568,30 @@ describe("pem-to-pfx command", () => {
       dnsNames: ["chain.example.test"]
     });
 
-    const certPath = path.join(tempDir, "chain-test.crt.pem");
-    const keyPath = path.join(tempDir, "chain-test.key.pem");
-    const chainPath = path.join(tempDir, "chain-test.chain.pem");
-    await Promise.all([
-      writeFile(certPath, issued.certPem, "utf8"),
-      writeFile(keyPath, await cryptoKeyToPkcs8Pem(leafKp.privateKey), "utf8"),
-      writeFile(chainPath, issued.certChainPem, "utf8")
-    ]);
+    // Exercise the full CLI write path: writeIssuedLeafTriplet is what the
+    // `issue-client` subcommand actually uses, and it strips the leaf from
+    // certChainPem before writing chain.pem so the file faithfully holds an
+    // issuer-only chain. The issueClientCertForPublicKey return type omits the
+    // private key (caller-managed key flow), so we attach leafKp here to match
+    // the writeIssuedLeafTriplet input contract.
+    const issuedForCliWrite = {
+      certPem: issued.certPem,
+      certDer: issued.certDer,
+      certChainPem: issued.certChainPem,
+      privateKey: leafKp.privateKey,
+      publicKey: leafKp.publicKey
+    };
+    const { certPath, keyPath, chainPath } = await writeIssuedLeafTriplet(
+      issuedForCliWrite,
+      tempDir,
+      "chain-test"
+    );
 
     const outPath = path.join(tempDir, "chain-test.pfx");
     await pemToPfxCommand([
       "--cert", certPath,
       "--key", keyPath,
-      "--chain", chainPath,
+      "--chain", chainPath!,
       "--password", "dev",
       "--out", outPath
     ]);
@@ -587,12 +599,9 @@ describe("pem-to-pfx command", () => {
     const pfx = await readFile(outPath);
     const password = new TextEncoder().encode("dev");
     const result = await parsePfx(pfx, password);
-    // certChainPem contains leaf + intermediate + root → 3 CERTIFICATE blocks.
-    // splitPemBlocks pulls all of them, but pemToPfxCommand only uses entries
-    // from --chain, which is issued.certChainPem (also 3 blocks including
-    // the leaf duplicate). The leaf cert is also passed via --cert, so the
-    // PFX cert bag list = leaf (from certDer) + 3 entries from chain = 4.
-    expect(result.certBags.length).toBe(4);
+    // After A: chain.pem is issuer-only (intermediate + root), so:
+    //   leaf (from --cert) + intermediate + root (from --chain) = 3 cert bags.
+    expect(result.certBags.length).toBe(3);
   });
 
   it("accepts a P-384 key+cert pair", async () => {
@@ -782,10 +791,28 @@ describe("issue-client command (writes to CWD)", () => {
       "--dns-name", "alt.example.test",
       "--ip", "10.0.0.1"
     ]);
-    // The leaf chain must contain leaf + intermediate + root → 3 CERTIFICATE blocks.
+    // client.chain.pem is the issuer-only chain (no leaf), so it must contain
+    // intermediate + root → 2 CERTIFICATE blocks.
     const chainPem = await readFile(path.join(tempDir, "client.chain.pem"), "utf8");
     const certCount = chainPem.match(/-----BEGIN CERTIFICATE-----/g)?.length ?? 0;
-    expect(certCount).toBe(3);
+    expect(certCount).toBe(2);
+  });
+
+  it("writes client.chain.pem as issuer-only (no leaf cert inside)", async () => {
+    await issueClientCommand([
+      "--ca-cert", "intermediate.crt.pem",
+      "--ca-key", "intermediate.key.pem",
+      "--ca-chain", "intermediate.chain.pem",
+      "--subject", "CN=eve",
+      "--dns-name", "eve.example.test"
+    ]);
+    const leafPem = await readFile(path.join(tempDir, "client.crt.pem"), "utf8");
+    const chainPem = await readFile(path.join(tempDir, "client.chain.pem"), "utf8");
+    const leafDer = pemToDer(leafPem);
+    for (const block of splitPemBlocks(chainPem)) {
+      const blockDer = pemToDerWithLabel(block, "CERTIFICATE");
+      expect(bytesEqual(blockDer, leafDer)).toBe(false);
+    }
   });
 
   it("respects --name for the output basename", async () => {

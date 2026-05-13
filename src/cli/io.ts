@@ -2,9 +2,12 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   arrayBufferFromBytes,
+  bytesEqual,
   encodePem,
   importCertificateAuthority,
+  pemToDer,
   pemToDerWithLabel,
+  splitPemBlocks,
   type CertificateAuthority,
   type IssuedClientCertificate
 } from "../index.js";
@@ -80,13 +83,30 @@ export async function writeIssuedLeafTriplet(
   const chainPath = path.join(outDir, `${basename}.chain.pem`);
   const keyPem = await cryptoKeyToPkcs8Pem(issued.privateKey);
 
+  // The library's `certChainPem` is a fullchain (leaf + issuers) suitable for
+  // nginx-style server config. The CLI convention for `*.chain.pem` is the
+  // issuer-only chain (no leaf), matching what `pem-to-pfx --chain` expects.
+  // Strip the leaf out by DER match so the file faithfully represents an
+  // issuer-only chain regardless of where the leaf sits in certChainPem.
+  const issuerOnlyChainPem = stripLeafFromChain(issued.certPem, issued.certChainPem);
+
   await Promise.all([
     writeFile(certPath, issued.certPem, "utf8"),
     writeFile(keyPath, keyPem, "utf8"),
-    writeFile(chainPath, issued.certChainPem, "utf8")
+    writeFile(chainPath, issuerOnlyChainPem, "utf8")
   ]);
 
   return { certPath, keyPath, chainPath };
+}
+
+function stripLeafFromChain(leafPem: string, chainPem: string): string {
+  const leafDer = pemToDer(leafPem);
+  const issuerBlocks = splitPemBlocks(chainPem).filter((block) => {
+    const blockDer = pemToDerWithLabel(block, "CERTIFICATE");
+    return !bytesEqual(blockDer, leafDer);
+  });
+  if (issuerBlocks.length === 0) return "";
+  return issuerBlocks.join("\n") + "\n";
 }
 
 export interface LoadCaInput {

@@ -25,7 +25,7 @@ export {
   splitPemBlocks
 } from "./pem.js";
 export { generateKeyPair, type SupportedCurve } from "./crypto.js";
-export { arrayBufferFromBytes } from "./bytes.js";
+export { arrayBufferFromBytes, bytesEqual } from "./bytes.js";
 export { exportPkcs12, type ExportPkcs12Input } from "./pkcs12.js";
 export {
   verifyClientCertificateIssuedBy,
