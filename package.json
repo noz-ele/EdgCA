@@ -1,6 +1,6 @@
 {
   "name": "@noz-ele/edgca",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "A small Cloudflare Workers-friendly toolkit for issuing self-managed CA and mTLS client certificates.",
   "type": "module",
   "license": "MIT",
