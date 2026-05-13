@@ -165,7 +165,7 @@ function assertOptionalStringArray(name: string, values: readonly string[] | und
   }
 }
 
-function extension(extensionOid: string, critical: boolean, valueDer: Uint8Array): Uint8Array {
+export function extension(extensionOid: string, critical: boolean, valueDer: Uint8Array): Uint8Array {
   return sequence(
     oid(extensionOid),
     ...(critical ? [boolean(true)] : []),

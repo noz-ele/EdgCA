@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   certificateToPem,
+  createCertificateSigningRequest,
   createRootCA,
   importCertificateAuthority,
   issueClientCert,
@@ -5051,6 +5052,349 @@ describe("CSR parsing and POP verification", () => {
       subject: csr.subject,
       days: 30,
       dnsNames: csr.requestedDnsNames as string[]
+    });
+    expect(
+      await verifyClientCertificateIssuedBy({ ca: root, certPem: issued.certPem })
+    ).toBe(true);
+  });
+});
+
+describe("createCertificateSigningRequest", () => {
+  it("round-trips through parse + POP verify with subject and SAN", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const created = await createCertificateSigningRequest({
+      subject: clientSubject,
+      keyPair,
+      dnsNames: ["client.example.test", "alt.example.test"],
+      ipAddresses: ["10.0.0.1", "2001:db8::1"]
+    });
+
+    const parsed = await parseCertificateSigningRequest(created.der);
+    expect(parsed.subject).toEqual(clientSubject);
+    expect(parsed.requestedDnsNames).toEqual(["client.example.test", "alt.example.test"]);
+    expect(parsed.requestedIpAddresses).toEqual(["10.0.0.1", "2001:db8::1"]);
+    expect(parsed.signatureAlgorithmOid).toBe(OID.ecdsaWithSha256);
+    expect(parsed.otherAttributes.length).toBe(0);
+    expect(await verifyCertificateSigningRequestSignature(parsed)).toBe(true);
+
+    expect(created.pem.startsWith("-----BEGIN CERTIFICATE REQUEST-----\n")).toBe(true);
+    expect(created.pem.trimEnd().endsWith("-----END CERTIFICATE REQUEST-----")).toBe(true);
+    const fromPem = await parseCertificateSigningRequest(created.pem);
+    expect(fromPem.subject).toEqual(clientSubject);
+  });
+
+  for (const curve of ["P-384", "P-521"] as const) {
+    it(`emits and verifies a ${curve} CSR`, async () => {
+      const keyPair = await crypto.subtle.generateKey(
+        { name: "ECDSA", namedCurve: curve },
+        true,
+        ["sign", "verify"]
+      );
+      const created = await createCertificateSigningRequest({
+        subject: clientSubject,
+        keyPair
+      });
+      const parsed = await parseCertificateSigningRequest(created.der);
+      expect((parsed.publicKey.algorithm as EcKeyAlgorithm).namedCurve).toBe(curve);
+      expect(await verifyCertificateSigningRequestSignature(parsed)).toBe(true);
+    });
+  }
+
+  it("emits no extensionRequest attribute when no SAN and no extras are provided", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const created = await createCertificateSigningRequest({
+      subject: clientSubject,
+      keyPair
+    });
+    const parsed = await parseCertificateSigningRequest(created.der);
+    expect(parsed.requestedExtensions.length).toBe(0);
+    expect(parsed.requestedDnsNames).toEqual([]);
+    expect(parsed.requestedIpAddresses).toEqual([]);
+  });
+
+  it("passes through caller-supplied raw extensions and round-trips them", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    // A small opaque extension value (OCTET STRING contents are caller-defined).
+    const customOid = "1.3.6.1.4.1.99999.1";
+    const customValueDer = new Uint8Array([0x04, 0x03, 0x01, 0x02, 0x03]);
+    const created = await createCertificateSigningRequest({
+      subject: clientSubject,
+      keyPair,
+      dnsNames: ["host.example.test"],
+      extensions: [{ oid: customOid, critical: false, valueDer: customValueDer }]
+    });
+    const parsed = await parseCertificateSigningRequest(created.der);
+    expect(parsed.requestedExtensions.length).toBe(2);
+    const san = parsed.requestedExtensions.find((ext) => ext.oid === OID.subjectAltName);
+    const custom = parsed.requestedExtensions.find((ext) => ext.oid === customOid);
+    expect(san).toBeDefined();
+    expect(custom).toBeDefined();
+    expect(custom!.critical).toBe(false);
+    expect(custom!.valueDer).toEqual(customValueDer);
+    expect(await verifyCertificateSigningRequestSignature(parsed)).toBe(true);
+  });
+
+  it("rejects a caller-supplied extension whose OID duplicates SAN", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    await expect(
+      createCertificateSigningRequest({
+        subject: clientSubject,
+        keyPair,
+        dnsNames: ["host.example.test"],
+        extensions: [{ oid: OID.subjectAltName, critical: false, valueDer: new Uint8Array([0x30, 0x00]) }]
+      })
+    ).rejects.toThrow(/Duplicate CSR extension OID/);
+  });
+
+  it("rejects duplicates between caller-supplied extensions", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    await expect(
+      createCertificateSigningRequest({
+        subject: clientSubject,
+        keyPair,
+        extensions: [
+          { oid: "1.3.6.1.4.1.99999.1", critical: false, valueDer: new Uint8Array([0x04, 0x00]) },
+          { oid: "1.3.6.1.4.1.99999.1", critical: true, valueDer: new Uint8Array([0x04, 0x00]) }
+        ]
+      })
+    ).rejects.toThrow(/Duplicate CSR extension OID/);
+  });
+
+  it("rejects a non-ECDSA keyPair", async () => {
+    const rsaKeyPair = await crypto.subtle.generateKey(
+      { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+      true,
+      ["sign", "verify"]
+    );
+    await expect(
+      createCertificateSigningRequest({ subject: clientSubject, keyPair: rsaKeyPair })
+    ).rejects.toThrow(/Expected ECDSA key/);
+  });
+
+  it("rejects when private and public keys use different curves", async () => {
+    const [a, b] = await Promise.all([
+      crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]),
+      crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-384" }, true, ["sign", "verify"])
+    ]);
+    await expect(
+      createCertificateSigningRequest({
+        subject: clientSubject,
+        keyPair: { privateKey: a.privateKey, publicKey: b.publicKey }
+      })
+    ).rejects.toThrow(/curve mismatch/);
+  });
+
+  it("round-trips an extension with critical=true (emits BOOLEAN TRUE and parser recovers it)", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const customOid = "1.3.6.1.4.1.99999.7";
+    const valueDer = new Uint8Array([0x04, 0x02, 0xaa, 0xbb]);
+    const created = await createCertificateSigningRequest({
+      subject: clientSubject,
+      keyPair,
+      extensions: [{ oid: customOid, critical: true, valueDer }]
+    });
+    const parsed = await parseCertificateSigningRequest(created.der);
+    const found = parsed.requestedExtensions.find((ext) => ext.oid === customOid);
+    expect(found).toBeDefined();
+    expect(found!.critical).toBe(true);
+    expect(found!.valueDer).toEqual(valueDer);
+  });
+
+  it("preserves caller-supplied extension order in extensionRequest", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const oids = [
+      "1.3.6.1.4.1.99999.10",
+      "1.3.6.1.4.1.99999.11",
+      "1.3.6.1.4.1.99999.12"
+    ];
+    const created = await createCertificateSigningRequest({
+      subject: clientSubject,
+      keyPair,
+      dnsNames: ["host.example.test"],
+      extensions: oids.map((extOid, i) => ({
+        oid: extOid,
+        critical: false,
+        valueDer: new Uint8Array([0x04, 0x01, i])
+      }))
+    });
+    const parsed = await parseCertificateSigningRequest(created.der);
+    expect(parsed.requestedExtensions.map((ext) => ext.oid)).toEqual([
+      OID.subjectAltName,
+      ...oids
+    ]);
+  });
+
+  it("treats empty SAN arrays the same as omitted (no extensionRequest emitted)", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const created = await createCertificateSigningRequest({
+      subject: clientSubject,
+      keyPair,
+      dnsNames: [],
+      ipAddresses: []
+    });
+    const parsed = await parseCertificateSigningRequest(created.der);
+    expect(parsed.requestedExtensions.length).toBe(0);
+    expect(parsed.otherAttributes.length).toBe(0);
+  });
+
+  it("verifies POP after a full PEM emission and re-parse", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const created = await createCertificateSigningRequest({
+      subject: clientSubject,
+      keyPair,
+      dnsNames: ["host.example.test"]
+    });
+    const fromPem = await parseCertificateSigningRequest(created.pem);
+    expect(await verifyCertificateSigningRequestSignature(fromPem)).toBe(true);
+  });
+
+  it("produces a different DER on each call (ECDSA k-randomness) while both verify", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const a = await createCertificateSigningRequest({ subject: clientSubject, keyPair });
+    const b = await createCertificateSigningRequest({ subject: clientSubject, keyPair });
+    expect(bytesEqual(a.der, b.der)).toBe(false);
+    expect(await verifyCertificateSigningRequestSignature(await parseCertificateSigningRequest(a.der))).toBe(true);
+    expect(await verifyCertificateSigningRequestSignature(await parseCertificateSigningRequest(b.der))).toBe(true);
+  });
+
+  it("propagates subjectAltNameExtension's duplicate-dNSName rejection", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    await expect(
+      createCertificateSigningRequest({
+        subject: clientSubject,
+        keyPair,
+        dnsNames: ["dup.example.test", "dup.example.test"]
+      })
+    ).rejects.toThrow(/Duplicate SAN dNSName/);
+  });
+
+  it("propagates subjectAltNameExtension's invalid-dNSName rejection", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    await expect(
+      createCertificateSigningRequest({
+        subject: clientSubject,
+        keyPair,
+        dnsNames: ["not a dns name"]
+      })
+    ).rejects.toThrow(/Invalid SAN dNSName/);
+  });
+
+  it("propagates subjectAltNameExtension's invalid-iPAddress rejection", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    await expect(
+      createCertificateSigningRequest({
+        subject: clientSubject,
+        keyPair,
+        ipAddresses: ["999.999.999.999"]
+      })
+    ).rejects.toThrow();
+  });
+
+  it("propagates encodeName's empty-subject rejection", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    await expect(
+      createCertificateSigningRequest({ subject: [], keyPair })
+    ).rejects.toThrow(/subject must be a non-empty array/);
+  });
+
+  it("emits a PEM body whose lines wrap at 64 columns", async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const { pem } = await createCertificateSigningRequest({
+      subject: clientSubject,
+      keyPair,
+      dnsNames: ["host.example.test"]
+    });
+    const lines = pem.trimEnd().split("\n");
+    expect(lines[0]).toBe("-----BEGIN CERTIFICATE REQUEST-----");
+    expect(lines[lines.length - 1]).toBe("-----END CERTIFICATE REQUEST-----");
+    const bodyLines = lines.slice(1, -1);
+    for (let i = 0; i < bodyLines.length - 1; i += 1) {
+      expect(bodyLines[i]!.length).toBe(64);
+    }
+    expect(bodyLines[bodyLines.length - 1]!.length).toBeLessThanOrEqual(64);
+  });
+
+  it("integrates with issueClientCertForPublicKey via the create -> parse -> issue path", async () => {
+    const root = await createRootCA({ subject: rootSubject, days: 365 });
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const created = await createCertificateSigningRequest({
+      subject: clientSubject,
+      keyPair,
+      dnsNames: ["client.example.test"]
+    });
+    const parsed = await parseCertificateSigningRequest(created.der);
+    expect(await verifyCertificateSigningRequestSignature(parsed)).toBe(true);
+
+    const issued = await issueClientCertForPublicKey({
+      ca: root,
+      publicKey: parsed.publicKey,
+      subject: parsed.subject,
+      days: 30,
+      dnsNames: parsed.requestedDnsNames as string[]
     });
     expect(
       await verifyClientCertificateIssuedBy({ ca: root, certPem: issued.certPem })

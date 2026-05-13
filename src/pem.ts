@@ -6,6 +6,10 @@ export function certificateToPem(der: Uint8Array): string {
   return encodePem("CERTIFICATE", der);
 }
 
+export function csrToPem(der: Uint8Array): string {
+  return encodePem("CERTIFICATE REQUEST", der);
+}
+
 export function pemToDer(pem: string): Uint8Array {
   const match = /-----BEGIN (.+?)-----([\s\S]*?)-----END \1-----/.exec(pem);
   if (!match || !match[2]) {

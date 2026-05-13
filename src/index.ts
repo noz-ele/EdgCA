@@ -7,11 +7,14 @@ export {
   issueIntermediateCA
 } from "./ca.js";
 export {
+  createCertificateSigningRequest,
   parseCertificateSigningRequest,
   verifyCertificateSigningRequestSignature,
-  type ParsedCertificateSigningRequest,
+  type CertificateSigningRequestAttribute,
   type CertificateSigningRequestExtension,
-  type CertificateSigningRequestAttribute
+  type CreateCertificateSigningRequestInput,
+  type CreatedCertificateSigningRequest,
+  type ParsedCertificateSigningRequest
 } from "./csr.js";
 export { pemToDer, certificateToPem } from "./pem.js";
 export { exportPkcs12, type ExportPkcs12Input } from "./pkcs12.js";

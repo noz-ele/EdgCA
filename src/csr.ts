@@ -1,17 +1,32 @@
-import { cloneBytes } from "./bytes.js";
-import { importPublicKeySpki, verifyDer } from "./crypto.js";
+import { cloneBytes, concatBytes } from "./bytes.js";
 import {
+  curveOf,
+  exportSpki,
+  importPublicKeySpki,
+  signDer,
+  signatureAlgorithmOidForCurve,
+  verifyDer
+} from "./crypto.js";
+import {
+  bitString,
   decodeInteger,
   decodeOid,
+  der,
+  integer,
+  oid,
   readChildren,
   readElement,
   readSequenceChildren,
+  sequence,
+  set,
   TAG,
   type DerElement
 } from "./der.js";
+import { encodeName } from "./name.js";
 import { OID, SUBJECT_ATTRIBUTE_OIDS } from "./oids.js";
-import { pemToDerWithLabel, splitPemBlocks } from "./pem.js";
+import { csrToPem, pemToDerWithLabel, splitPemBlocks } from "./pem.js";
 import type { Subject, SubjectAttributeType } from "./types.js";
+import { extension, subjectAltNameExtension } from "./x509.js";
 
 const SHORT_NAME_BY_OID: Record<string, SubjectAttributeType> = Object.fromEntries(
   Object.entries(SUBJECT_ATTRIBUTE_OIDS).map(([shortName, oid]) => [oid, shortName as SubjectAttributeType])
@@ -56,9 +71,9 @@ export interface ParsedCertificateSigningRequest {
 export async function parseCertificateSigningRequest(
   input: string | Uint8Array
 ): Promise<ParsedCertificateSigningRequest> {
-  const der = typeof input === "string" ? csrPemToDer(input) : input;
-  const root = readElement(der);
-  if (root.tag !== TAG.SEQUENCE || root.end !== der.length) {
+  const derBytes = typeof input === "string" ? csrPemToDer(input) : input;
+  const root = readElement(derBytes);
+  if (root.tag !== TAG.SEQUENCE || root.end !== derBytes.length) {
     throw new Error("Invalid CSR DER");
   }
 
@@ -110,7 +125,7 @@ export async function parseCertificateSigningRequest(
     ? decodeRequestedExtensions(extensionRequest.valuesDer)
     : [];
 
-  const sanExtension = requestedExtensions.find((extension) => extension.oid === OID.subjectAltName);
+  const sanExtension = requestedExtensions.find((ext) => ext.oid === OID.subjectAltName);
   const { dnsNames, ipAddresses } = sanExtension
     ? decodeSubjectAltName(sanExtension.valueDer)
     : { dnsNames: [], ipAddresses: [] };
@@ -134,6 +149,98 @@ export async function verifyCertificateSigningRequestSignature(
 ): Promise<boolean> {
   return verifyDer(csr.publicKey, csr.signatureDer, csr.certificationRequestInfoDer);
 }
+
+export interface CreateCertificateSigningRequestInput {
+  subject: Subject;
+  keyPair: CryptoKeyPair;
+  dnsNames?: readonly string[];
+  ipAddresses?: readonly string[];
+  extensions?: readonly CertificateSigningRequestExtension[];
+}
+
+export interface CreatedCertificateSigningRequest {
+  der: Uint8Array;
+  pem: string;
+}
+
+export async function createCertificateSigningRequest(
+  input: CreateCertificateSigningRequestInput
+): Promise<CreatedCertificateSigningRequest> {
+  const privateCurve = curveOf(input.keyPair.privateKey);
+  const publicCurve = curveOf(input.keyPair.publicKey);
+  if (privateCurve !== publicCurve) {
+    throw new Error("CSR keyPair private/public curve mismatch");
+  }
+
+  const subjectNameDer = encodeName(input.subject);
+  const spki = await exportSpki(input.keyPair.publicKey);
+
+  const requestedExtensions = collectRequestedExtensions(
+    input.dnsNames,
+    input.ipAddresses,
+    input.extensions
+  );
+
+  const attributes: Uint8Array[] = [];
+  if (requestedExtensions.length > 0) {
+    attributes.push(
+      sequence(
+        oid(OID.extensionRequest),
+        set(sequence(...requestedExtensions))
+      )
+    );
+  }
+  // CertificationRequestInfo.attributes is IMPLICIT [0] SET OF Attribute.
+  // Wire form: tag 0xa0 wrapping the concatenated Attribute SEQUENCEs.
+  const attributesField = der(0xa0, concatBytes(attributes));
+
+  const certificationRequestInfoDer = sequence(
+    integer(0),
+    subjectNameDer,
+    spki,
+    attributesField
+  );
+
+  const signatureDer = await signDer(input.keyPair.privateKey, certificationRequestInfoDer);
+  const signatureAlgorithmOid = signatureAlgorithmOidForCurve(privateCurve);
+
+  const csrDer = sequence(
+    certificationRequestInfoDer,
+    sequence(oid(signatureAlgorithmOid)),
+    bitString(signatureDer)
+  );
+
+  return {
+    der: csrDer,
+    pem: csrToPem(csrDer)
+  };
+}
+
+function collectRequestedExtensions(
+  dnsNames: readonly string[] | undefined,
+  ipAddresses: readonly string[] | undefined,
+  extraExtensions: readonly CertificateSigningRequestExtension[] | undefined
+): Uint8Array[] {
+  const seenOids = new Set<string>();
+  const out: Uint8Array[] = [];
+
+  const san = subjectAltNameExtension(dnsNames, ipAddresses);
+  if (san) {
+    seenOids.add(OID.subjectAltName);
+    out.push(san);
+  }
+
+  for (const ext of extraExtensions ?? []) {
+    if (seenOids.has(ext.oid)) {
+      throw new Error(`Duplicate CSR extension OID: ${ext.oid}`);
+    }
+    seenOids.add(ext.oid);
+    out.push(extension(ext.oid, ext.critical, ext.valueDer));
+  }
+
+  return out;
+}
+
 
 function csrPemToDer(pem: string): Uint8Array {
   // RFC 7468 §7 uses "CERTIFICATE REQUEST"; some legacy tools emit "NEW CERTIFICATE REQUEST".
