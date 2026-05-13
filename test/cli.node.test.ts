@@ -1,6 +1,9 @@
+import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import * as tls from "node:tls";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createRootCA,
@@ -8,7 +11,17 @@ import {
   issueClientCert,
   type SupportedCurve
 } from "../src/index.js";
+import { createRootCaCommand } from "../src/cli/commands/create-root-ca.js";
+import { issueClientCommand } from "../src/cli/commands/issue-client.js";
+import { issueIntermediateCaCommand } from "../src/cli/commands/issue-intermediate-ca.js";
 import { pemToPfxCommand } from "../src/cli/commands/pem-to-pfx.js";
+import { parseDnString } from "../src/cli/dn.js";
+import {
+  parseCurveFlag,
+  parseDaysFlag,
+  requireString,
+  UsageError
+} from "../src/cli/flags.js";
 import {
   cryptoKeyToPkcs8Pem,
   defaultPfxPath,
@@ -28,7 +41,198 @@ afterEach(async () => {
   await rm(tempDir, { recursive: true, force: true });
 });
 
-describe("CLI io helpers: PKCS#8 PEM round-trip", () => {
+// ---------------------------------------------------------------------------
+// dn.ts — parseDnString
+// ---------------------------------------------------------------------------
+
+describe("parseDnString", () => {
+  it("parses a single attribute", () => {
+    expect(parseDnString("CN=foo")).toEqual([{ type: "CN", value: "foo" }]);
+  });
+
+  it("parses multiple attributes preserving order", () => {
+    expect(parseDnString("CN=foo,O=Acme,C=JP")).toEqual([
+      { type: "CN", value: "foo" },
+      { type: "O", value: "Acme" },
+      { type: "C", value: "JP" }
+    ]);
+  });
+
+  it("trims spaces around components and values", () => {
+    expect(parseDnString("CN = foo , O = bar ")).toEqual([
+      { type: "CN", value: "foo" },
+      { type: "O", value: "bar" }
+    ]);
+  });
+
+  it("normalizes short-name keys to upper case", () => {
+    expect(parseDnString("cn=foo,o=bar")).toEqual([
+      { type: "CN", value: "foo" },
+      { type: "O", value: "bar" }
+    ]);
+  });
+
+  it("accepts dotted-OID attribute types as-is", () => {
+    expect(parseDnString("1.2.840.113549.1.9.1=user@example.test")).toEqual([
+      { type: "1.2.840.113549.1.9.1", value: "user@example.test" }
+    ]);
+  });
+
+  it("keeps additional '=' characters inside the value", () => {
+    expect(parseDnString("CN=key=value=more")).toEqual([
+      { type: "CN", value: "key=value=more" }
+    ]);
+  });
+
+  it("treats a backslash-escaped comma as part of the value", () => {
+    expect(parseDnString("CN=Smith\\, Jr,O=Acme")).toEqual([
+      { type: "CN", value: "Smith, Jr" },
+      { type: "O", value: "Acme" }
+    ]);
+  });
+
+  it("ignores empty components produced by stray commas", () => {
+    expect(parseDnString("CN=foo,,O=bar")).toEqual([
+      { type: "CN", value: "foo" },
+      { type: "O", value: "bar" }
+    ]);
+  });
+
+  it("rejects entirely empty input", () => {
+    expect(() => parseDnString("")).toThrow(/empty/i);
+  });
+
+  it("rejects input with only separators / whitespace", () => {
+    expect(() => parseDnString(", , ,")).toThrow(/empty/i);
+  });
+
+  it("rejects a component missing '='", () => {
+    expect(() => parseDnString("CN")).toThrow(/missing '='/);
+  });
+
+  it("rejects an empty key", () => {
+    expect(() => parseDnString("=foo")).toThrow(/empty key/);
+  });
+
+  it("rejects an empty value", () => {
+    expect(() => parseDnString("CN=")).toThrow(/empty value/);
+  });
+
+  it("rejects unknown short names", () => {
+    expect(() => parseDnString("XX=foo")).toThrow(/Unsupported DN attribute/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// flags.ts
+// ---------------------------------------------------------------------------
+
+describe("flags: parseDaysFlag", () => {
+  it("accepts a positive integer", () => {
+    expect(parseDaysFlag("1")).toBe(1);
+    expect(parseDaysFlag("365")).toBe(365);
+    expect(parseDaysFlag("3650")).toBe(3650);
+  });
+
+  it("rejects zero", () => {
+    expect(() => parseDaysFlag("0")).toThrow(UsageError);
+  });
+
+  it("rejects negative integers", () => {
+    expect(() => parseDaysFlag("-1")).toThrow(UsageError);
+  });
+
+  it("rejects non-integers", () => {
+    expect(() => parseDaysFlag("3.5")).toThrow(UsageError);
+  });
+
+  it("rejects non-numeric strings", () => {
+    expect(() => parseDaysFlag("abc")).toThrow(UsageError);
+    expect(() => parseDaysFlag("")).toThrow(UsageError);
+  });
+});
+
+describe("flags: parseCurveFlag", () => {
+  for (const curve of ["P-256", "P-384", "P-521"] as const) {
+    it(`accepts ${curve}`, () => {
+      expect(parseCurveFlag(curve)).toBe(curve);
+    });
+  }
+
+  it("rejects unknown curves", () => {
+    expect(() => parseCurveFlag("P-128")).toThrow(UsageError);
+  });
+
+  it("rejects lowercase variants (case-sensitive on purpose)", () => {
+    expect(() => parseCurveFlag("p-256")).toThrow(UsageError);
+  });
+
+  it("rejects the empty string", () => {
+    expect(() => parseCurveFlag("")).toThrow(UsageError);
+  });
+});
+
+describe("flags: requireString", () => {
+  it("returns the value when defined and non-empty", () => {
+    expect(requireString("foo", "--flag")).toBe("foo");
+  });
+
+  it("throws UsageError on undefined", () => {
+    expect(() => requireString(undefined, "--flag")).toThrow(UsageError);
+  });
+
+  it("throws UsageError on the empty string", () => {
+    expect(() => requireString("", "--flag")).toThrow(UsageError);
+  });
+
+  it("includes the flag name in the message", () => {
+    expect(() => requireString(undefined, "--cert")).toThrow(/--cert/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// io: defaultPfxPath additional boundaries
+// ---------------------------------------------------------------------------
+
+describe("io: defaultPfxPath", () => {
+  it("strips .crt.pem and appends .pfx in the same directory", () => {
+    expect(defaultPfxPath(path.join("dir", "client.crt.pem"))).toBe(
+      path.join("dir", "client.pfx")
+    );
+  });
+
+  it("strips a plain .pem suffix", () => {
+    expect(defaultPfxPath(path.join("dir", "client.pem"))).toBe(
+      path.join("dir", "client.pfx")
+    );
+  });
+
+  it("leaves an extensionless name as-is and appends .pfx", () => {
+    expect(defaultPfxPath("client")).toBe("client.pfx");
+  });
+
+  it("strips a mixed-case .CRT.PEM suffix", () => {
+    expect(defaultPfxPath("client.CRT.PEM")).toBe("client.pfx");
+  });
+
+  it("strips a mixed-case .Pem suffix", () => {
+    expect(defaultPfxPath("client.Pem")).toBe("client.pfx");
+  });
+
+  it("strips only the final .crt.pem from a multi-dotted name", () => {
+    expect(defaultPfxPath("client.dev.crt.pem")).toBe("client.dev.pfx");
+  });
+
+  it("appends .pfx to an unrecognised extension verbatim", () => {
+    expect(defaultPfxPath("client.cer")).toBe("client.cer.pfx");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// io: PKCS#8 PEM round-trip + corrupt-body rejection
+// ---------------------------------------------------------------------------
+
+describe("io: PKCS#8 PEM round-trip", () => {
   for (const curve of ["P-256", "P-384", "P-521"] as const) {
     it(`exports and re-imports a ${curve} private key via PEM`, async () => {
       const keyPair = await generateKeyPair(curve);
@@ -40,7 +244,9 @@ describe("CLI io helpers: PKCS#8 PEM round-trip", () => {
       const reimported = await importPkcs8PrivateKeyFromPem(keyPem);
       expect((reimported.algorithm as EcKeyAlgorithm).namedCurve).toBe(curve);
 
-      const hash = ({ "P-256": "SHA-256", "P-384": "SHA-384", "P-521": "SHA-512" } as const)[curve];
+      const hash = (
+        { "P-256": "SHA-256", "P-384": "SHA-384", "P-521": "SHA-512" } as const
+      )[curve];
       const data = new TextEncoder().encode("round-trip-payload");
       const sig = await crypto.subtle.sign({ name: "ECDSA", hash }, reimported, data);
       const ok = await crypto.subtle.verify({ name: "ECDSA", hash }, keyPair.publicKey, sig, data);
@@ -68,30 +274,24 @@ describe("CLI io helpers: PKCS#8 PEM round-trip", () => {
     const rsaPem = await cryptoKeyToPkcs8Pem(rsa.privateKey);
     await expect(importPkcs8PrivateKeyFromPem(rsaPem)).rejects.toThrow(/ECDSA/);
   });
-});
 
-describe("CLI io helpers: defaultPfxPath", () => {
-  it("strips .crt.pem and appends .pfx in the same directory", () => {
-    const result = defaultPfxPath(path.join("dir", "client.crt.pem"));
-    expect(result).toBe(path.join("dir", "client.pfx"));
-  });
-
-  it("strips a plain .pem suffix", () => {
-    const result = defaultPfxPath(path.join("dir", "client.pem"));
-    expect(result).toBe(path.join("dir", "client.pfx"));
-  });
-
-  it("leaves an extensionless name as-is and appends .pfx", () => {
-    expect(defaultPfxPath("client")).toBe("client.pfx");
+  it("rejects a PRIVATE KEY PEM whose body decodes to non-PKCS#8 bytes", async () => {
+    // A valid PEM frame with garbage DER inside — every WebCrypto importKey
+    // attempt across the three curves should fail.
+    const garbageBody = Buffer.from(new Uint8Array(64).fill(0x00)).toString("base64");
+    const pem = `-----BEGIN PRIVATE KEY-----\n${garbageBody}\n-----END PRIVATE KEY-----\n`;
+    await expect(importPkcs8PrivateKeyFromPem(pem)).rejects.toThrow(/ECDSA/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// pem-to-pfx command
+// ---------------------------------------------------------------------------
 
 describe("pem-to-pfx command", () => {
-  async function writeIssuedClientToTemp(curve: SupportedCurve = "P-256"): Promise<{
-    certPath: string;
-    keyPath: string;
-    chainPath: string;
-  }> {
+  async function writeIssuedClientToTemp(
+    curve: SupportedCurve = "P-256"
+  ): Promise<{ certPath: string; keyPath: string; chainPath: string }> {
     const rootKeyPair = await generateKeyPair(curve);
     const root = await createRootCA({
       subject: [{ type: "CN", value: "CLI Test Root" }],
@@ -129,9 +329,24 @@ describe("pem-to-pfx command", () => {
 
     const info = await stat(outPath);
     expect(info.size).toBeGreaterThan(100);
-    // PFX is a top-level ASN.1 SEQUENCE → first byte 0x30.
     const head = await readFile(outPath);
     expect(head[0]).toBe(0x30);
+  });
+
+  it("emits a PFX that Node's tls.createSecureContext accepts (real round-trip)", async () => {
+    const { certPath, keyPath, chainPath } = await writeIssuedClientToTemp();
+    const outPath = path.join(tempDir, "roundtrip.pfx");
+
+    await pemToPfxCommand([
+      "--cert", certPath,
+      "--key", keyPath,
+      "--chain", chainPath,
+      "--out", outPath,
+      "--password", "dev"
+    ]);
+
+    const pfx = await readFile(outPath);
+    expect(() => tls.createSecureContext({ pfx, passphrase: "dev" })).not.toThrow();
   });
 
   it("defaults --out to <cert-basename>.pfx alongside the cert when omitted", async () => {
@@ -197,6 +412,39 @@ describe("pem-to-pfx command", () => {
     ).rejects.toThrow(/--password/);
   });
 
+  it("rejects unknown flags (parseArgs strict)", async () => {
+    const { certPath, keyPath } = await writeIssuedClientToTemp();
+    await expect(
+      pemToPfxCommand([
+        "--cert", certPath,
+        "--key", keyPath,
+        "--password", "dev",
+        "--bogus", "x"
+      ])
+    ).rejects.toThrow();
+  });
+
+  it("rejects when --cert and --key are for different keypairs (mismatch guard)", async () => {
+    const { certPath } = await writeIssuedClientToTemp();
+    // Overwrite the key file with an unrelated private key.
+    const unrelated = await generateKeyPair("P-256");
+    const unrelatedKeyPem = await cryptoKeyToPkcs8Pem(unrelated.privateKey);
+    const keyPath = path.join(tempDir, "unrelated.key.pem");
+    await writeFile(keyPath, unrelatedKeyPem, "utf8");
+
+    await expect(
+      pemToPfxCommand([
+        "--cert", certPath,
+        "--key", keyPath,
+        "--password", "dev",
+        "--out", path.join(tempDir, "should-not-exist.pfx")
+      ])
+    ).rejects.toThrow(/does not match/i);
+
+    // And the output file must not have been written.
+    await expect(stat(path.join(tempDir, "should-not-exist.pfx"))).rejects.toThrow();
+  });
+
   it("accepts a P-384 key+cert pair", async () => {
     const rootKp = await generateKeyPair("P-384");
     const root = await createRootCA({
@@ -222,7 +470,305 @@ describe("pem-to-pfx command", () => {
       "--out", outPath
     ]);
 
-    const info = await stat(outPath);
-    expect(info.size).toBeGreaterThan(100);
+    expect((await stat(outPath)).size).toBeGreaterThan(100);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// create-root-ca / issue-intermediate-ca / issue-client commands (chdir-based)
+// ---------------------------------------------------------------------------
+
+describe("create-root-ca command (writes to CWD)", () => {
+  let originalCwd: string;
+
+  beforeEach(() => {
+    originalCwd = process.cwd();
+    process.chdir(tempDir);
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+  });
+
+  it("writes root.crt.pem and root.key.pem with default --name", async () => {
+    await createRootCaCommand(["--subject", "CN=Test Root"]);
+    const [certPem, keyPem] = await Promise.all([
+      readFile(path.join(tempDir, "root.crt.pem"), "utf8"),
+      readFile(path.join(tempDir, "root.key.pem"), "utf8")
+    ]);
+    expect(certPem.startsWith("-----BEGIN CERTIFICATE-----\n")).toBe(true);
+    expect(keyPem.startsWith("-----BEGIN PRIVATE KEY-----\n")).toBe(true);
+  });
+
+  it("respects --name for the output basename", async () => {
+    await createRootCaCommand(["--subject", "CN=Custom", "--name", "my-root"]);
+    await expect(stat(path.join(tempDir, "my-root.crt.pem"))).resolves.toBeTruthy();
+    await expect(stat(path.join(tempDir, "my-root.key.pem"))).resolves.toBeTruthy();
+  });
+
+  it("respects --curve when generating the key", async () => {
+    await createRootCaCommand([
+      "--subject", "CN=P384 Root",
+      "--curve", "P-384",
+      "--name", "p384-root"
+    ]);
+    const keyPem = await readFile(path.join(tempDir, "p384-root.key.pem"), "utf8");
+    const key = await importPkcs8PrivateKeyFromPem(keyPem);
+    expect((key.algorithm as EcKeyAlgorithm).namedCurve).toBe("P-384");
+  });
+
+  it("rejects an empty --subject", async () => {
+    await expect(createRootCaCommand(["--subject", ""])).rejects.toThrow();
+  });
+
+  it("rejects invalid --days", async () => {
+    await expect(
+      createRootCaCommand(["--subject", "CN=x", "--days", "0"])
+    ).rejects.toThrow(UsageError);
+  });
+
+  it("rejects invalid --curve", async () => {
+    await expect(
+      createRootCaCommand(["--subject", "CN=x", "--curve", "P-128"])
+    ).rejects.toThrow(UsageError);
+  });
+});
+
+describe("issue-intermediate-ca command (writes to CWD)", () => {
+  let originalCwd: string;
+
+  beforeEach(async () => {
+    originalCwd = process.cwd();
+    process.chdir(tempDir);
+    await createRootCaCommand(["--subject", "CN=Test Root"]);
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+  });
+
+  it("writes intermediate.{crt,key,chain}.pem from a root CA", async () => {
+    await issueIntermediateCaCommand([
+      "--ca-cert", "root.crt.pem",
+      "--ca-key", "root.key.pem",
+      "--subject", "CN=Test Intermediate"
+    ]);
+    const chainPem = await readFile(path.join(tempDir, "intermediate.chain.pem"), "utf8");
+    // chain must contain at least one CERTIFICATE block (the root)
+    expect(chainPem).toMatch(/-----BEGIN CERTIFICATE-----/);
+  });
+
+  it("respects --name for the output basename", async () => {
+    await issueIntermediateCaCommand([
+      "--ca-cert", "root.crt.pem",
+      "--ca-key", "root.key.pem",
+      "--subject", "CN=Renamed Intermediate",
+      "--name", "ica"
+    ]);
+    await expect(stat(path.join(tempDir, "ica.crt.pem"))).resolves.toBeTruthy();
+    await expect(stat(path.join(tempDir, "ica.key.pem"))).resolves.toBeTruthy();
+    await expect(stat(path.join(tempDir, "ica.chain.pem"))).resolves.toBeTruthy();
+  });
+
+  it("rejects when --ca-cert is missing", async () => {
+    await expect(
+      issueIntermediateCaCommand([
+        "--ca-key", "root.key.pem",
+        "--subject", "CN=x"
+      ])
+    ).rejects.toThrow(/--ca-cert/);
+  });
+
+  it("rejects when --ca-cert and --ca-key are from different CAs (mismatch propagates)", async () => {
+    // Create a second root with the same default name 'root', overwriting nothing
+    // and write its files under different names.
+    await createRootCaCommand(["--subject", "CN=Other Root", "--name", "other"]);
+    await expect(
+      issueIntermediateCaCommand([
+        "--ca-cert", "root.crt.pem",
+        "--ca-key", "other.key.pem",
+        "--subject", "CN=x"
+      ])
+    ).rejects.toThrow(/does not match/i);
+  });
+});
+
+describe("issue-client command (writes to CWD)", () => {
+  let originalCwd: string;
+
+  beforeEach(async () => {
+    originalCwd = process.cwd();
+    process.chdir(tempDir);
+    await createRootCaCommand(["--subject", "CN=Test Root"]);
+    await issueIntermediateCaCommand([
+      "--ca-cert", "root.crt.pem",
+      "--ca-key", "root.key.pem",
+      "--subject", "CN=Test Intermediate"
+    ]);
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+  });
+
+  it("issues a client cert from a root CA (no chain file)", async () => {
+    await issueClientCommand([
+      "--ca-cert", "root.crt.pem",
+      "--ca-key", "root.key.pem",
+      "--subject", "CN=alice"
+    ]);
+    await expect(stat(path.join(tempDir, "client.crt.pem"))).resolves.toBeTruthy();
+    await expect(stat(path.join(tempDir, "client.key.pem"))).resolves.toBeTruthy();
+    await expect(stat(path.join(tempDir, "client.chain.pem"))).resolves.toBeTruthy();
+  });
+
+  it("issues a client cert from an intermediate CA with --ca-chain", async () => {
+    await issueClientCommand([
+      "--ca-cert", "intermediate.crt.pem",
+      "--ca-key", "intermediate.key.pem",
+      "--ca-chain", "intermediate.chain.pem",
+      "--subject", "CN=bob",
+      "--dns-name", "bob.example.test",
+      "--dns-name", "alt.example.test",
+      "--ip", "10.0.0.1"
+    ]);
+    // The leaf chain must contain leaf + intermediate + root → 3 CERTIFICATE blocks.
+    const chainPem = await readFile(path.join(tempDir, "client.chain.pem"), "utf8");
+    const certCount = chainPem.match(/-----BEGIN CERTIFICATE-----/g)?.length ?? 0;
+    expect(certCount).toBe(3);
+  });
+
+  it("respects --name for the output basename", async () => {
+    await issueClientCommand([
+      "--ca-cert", "intermediate.crt.pem",
+      "--ca-key", "intermediate.key.pem",
+      "--ca-chain", "intermediate.chain.pem",
+      "--subject", "CN=carol",
+      "--name", "carol-cert"
+    ]);
+    await expect(stat(path.join(tempDir, "carol-cert.crt.pem"))).resolves.toBeTruthy();
+    await expect(stat(path.join(tempDir, "carol-cert.key.pem"))).resolves.toBeTruthy();
+    await expect(stat(path.join(tempDir, "carol-cert.chain.pem"))).resolves.toBeTruthy();
+  });
+
+  it("rejects when --subject is missing", async () => {
+    await expect(
+      issueClientCommand([
+        "--ca-cert", "root.crt.pem",
+        "--ca-key", "root.key.pem"
+      ])
+    ).rejects.toThrow(/--subject/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CLI dispatcher — spawn `node dist/cli.js …`
+// ---------------------------------------------------------------------------
+
+interface SpawnResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+}
+
+async function runCli(args: string[]): Promise<SpawnResult> {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const cliPath = path.join(repoRoot, "dist", "cli.js");
+  return new Promise<SpawnResult>((resolve, reject) => {
+    const child = spawn(process.execPath, [cliPath, ...args], {
+      cwd: tempDir,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("close", (exitCode) => {
+      resolve({ stdout, stderr, exitCode });
+    });
+  });
+}
+
+describe("dispatcher (spawned)", () => {
+  it("prints the usage to stdout on --help with exit 0", async () => {
+    const { stdout, exitCode } = await runCli(["--help"]);
+    expect(stdout).toMatch(/Usage:/);
+    expect(stdout).toMatch(/create-root-ca/);
+    expect(exitCode).toBe(0);
+  });
+
+  it("prints the usage to stdout on -h with exit 0", async () => {
+    const { stdout, exitCode } = await runCli(["-h"]);
+    expect(stdout).toMatch(/Usage:/);
+    expect(exitCode).toBe(0);
+  });
+
+  it("prints the usage with no subcommand and exits 0", async () => {
+    const { stdout, exitCode } = await runCli([]);
+    expect(stdout).toMatch(/Usage:/);
+    expect(exitCode).toBe(0);
+  });
+
+  it("exits 2 on an unknown subcommand and writes the usage to stderr", async () => {
+    const { stderr, exitCode } = await runCli(["nonsense-subcommand"]);
+    expect(stderr).toMatch(/unknown subcommand/);
+    expect(stderr).toMatch(/Usage:/);
+    expect(exitCode).toBe(2);
+  });
+
+  it("exits 2 on a UsageError from a subcommand (missing required flag)", async () => {
+    const { stderr, exitCode } = await runCli(["create-root-ca"]);
+    expect(stderr).toMatch(/--subject/);
+    expect(exitCode).toBe(2);
+  });
+
+  it("exits 1 on a non-UsageError from a subcommand (file not found)", async () => {
+    const { stderr, exitCode } = await runCli([
+      "pem-to-pfx",
+      "--cert", "does-not-exist.crt.pem",
+      "--key", "does-not-exist.key.pem",
+      "--password", "dev"
+    ]);
+    expect(stderr.length).toBeGreaterThan(0);
+    expect(exitCode).toBe(1);
+  });
+
+  it("runs the full root → intermediate → client → pfx pipeline end-to-end", async () => {
+    const root = await runCli(["create-root-ca", "--subject", "CN=E2E Root"]);
+    expect(root.exitCode).toBe(0);
+    const intermediate = await runCli([
+      "issue-intermediate-ca",
+      "--ca-cert", "root.crt.pem",
+      "--ca-key", "root.key.pem",
+      "--subject", "CN=E2E Intermediate"
+    ]);
+    expect(intermediate.exitCode).toBe(0);
+    const client = await runCli([
+      "issue-client",
+      "--ca-cert", "intermediate.crt.pem",
+      "--ca-key", "intermediate.key.pem",
+      "--ca-chain", "intermediate.chain.pem",
+      "--subject", "CN=e2e-client",
+      "--dns-name", "e2e.example.test"
+    ]);
+    expect(client.exitCode).toBe(0);
+    const pfx = await runCli([
+      "pem-to-pfx",
+      "--cert", "client.crt.pem",
+      "--key", "client.key.pem",
+      "--chain", "client.chain.pem",
+      "--password", "dev"
+    ]);
+    expect(pfx.exitCode).toBe(0);
+
+    const pfxBytes = await readFile(path.join(tempDir, "client.pfx"));
+    expect(() =>
+      tls.createSecureContext({ pfx: pfxBytes, passphrase: "dev" })
+    ).not.toThrow();
   });
 });
