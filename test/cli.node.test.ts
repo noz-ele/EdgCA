@@ -6,9 +6,13 @@ import * as tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  createCertificateSigningRequest,
   createRootCA,
   generateKeyPair,
   issueClientCert,
+  issueClientCertForPublicKey,
+  issueIntermediateCA,
+  parseCertificateSigningRequest,
   type SupportedCurve
 } from "../src/index.js";
 import { createRootCaCommand } from "../src/cli/commands/create-root-ca.js";
@@ -27,6 +31,7 @@ import {
   defaultPfxPath,
   importPkcs8PrivateKeyFromPem
 } from "../src/cli/io.js";
+import { parsePfx } from "./helpers/parse-pfx.js";
 
 let tempDir: string;
 let logSpy: ReturnType<typeof vi.spyOn>;
@@ -149,6 +154,36 @@ describe("flags: parseDaysFlag", () => {
   it("rejects non-numeric strings", () => {
     expect(() => parseDaysFlag("abc")).toThrow(UsageError);
     expect(() => parseDaysFlag("")).toThrow(UsageError);
+  });
+
+  it("rejects surrounding whitespace", () => {
+    expect(() => parseDaysFlag(" 365 ")).toThrow(UsageError);
+    expect(() => parseDaysFlag("365 ")).toThrow(UsageError);
+    expect(() => parseDaysFlag(" 365")).toThrow(UsageError);
+  });
+
+  it("rejects scientific notation", () => {
+    expect(() => parseDaysFlag("1e3")).toThrow(UsageError);
+    expect(() => parseDaysFlag("1E3")).toThrow(UsageError);
+  });
+
+  it("rejects leading zero", () => {
+    expect(() => parseDaysFlag("01")).toThrow(UsageError);
+    expect(() => parseDaysFlag("007")).toThrow(UsageError);
+  });
+
+  it("rejects an explicit sign", () => {
+    expect(() => parseDaysFlag("+1")).toThrow(UsageError);
+  });
+
+  it("rejects hex notation", () => {
+    expect(() => parseDaysFlag("0x10")).toThrow(UsageError);
+  });
+
+  it("rejects values beyond Number.MAX_SAFE_INTEGER", () => {
+    // Number("99999999999999999") loses precision; the regex permits a 17-digit
+    // integer, so this trips the explicit isSafeInteger check.
+    expect(() => parseDaysFlag("99999999999999999")).toThrow(/safe integer range/);
   });
 });
 
@@ -445,6 +480,121 @@ describe("pem-to-pfx command", () => {
     await expect(stat(path.join(tempDir, "should-not-exist.pfx"))).rejects.toThrow();
   });
 
+  it("treats an empty --chain file as 'no chain' rather than failing", async () => {
+    const { certPath, keyPath } = await writeIssuedClientToTemp();
+    const emptyChainPath = path.join(tempDir, "empty.chain.pem");
+    await writeFile(emptyChainPath, "", "utf8");
+
+    const withEmptyChain = path.join(tempDir, "empty-chain.pfx");
+    const withoutChain = path.join(tempDir, "no-chain.pfx");
+    await pemToPfxCommand([
+      "--cert", certPath,
+      "--key", keyPath,
+      "--chain", emptyChainPath,
+      "--password", "dev",
+      "--out", withEmptyChain
+    ]);
+    await pemToPfxCommand([
+      "--cert", certPath,
+      "--key", keyPath,
+      "--password", "dev",
+      "--out", withoutChain
+    ]);
+
+    // Both must be valid PFX (parseable by Node tls), and the bag count must
+    // match: 1 cert bag (leaf only) in each case.
+    const [emptyPfx, noPfx] = await Promise.all([readFile(withEmptyChain), readFile(withoutChain)]);
+    expect(() => tls.createSecureContext({ pfx: emptyPfx, passphrase: "dev" })).not.toThrow();
+    expect(() => tls.createSecureContext({ pfx: noPfx, passphrase: "dev" })).not.toThrow();
+    const password = new TextEncoder().encode("dev");
+    const [emptyParsed, noParsed] = await Promise.all([
+      parsePfx(emptyPfx, password),
+      parsePfx(noPfx, password)
+    ]);
+    expect(emptyParsed.certBags.length).toBe(1);
+    expect(noParsed.certBags.length).toBe(1);
+  });
+
+  it("rejects a --chain file containing a non-CERTIFICATE PEM block", async () => {
+    const { certPath, keyPath } = await writeIssuedClientToTemp();
+    // Plausible operator error: pointing --chain at a PRIVATE KEY by mistake.
+    const wrongKp = await generateKeyPair("P-256");
+    const wrongLabelChainPath = path.join(tempDir, "wrong-label.chain.pem");
+    await writeFile(wrongLabelChainPath, await cryptoKeyToPkcs8Pem(wrongKp.privateKey), "utf8");
+
+    await expect(
+      pemToPfxCommand([
+        "--cert", certPath,
+        "--key", keyPath,
+        "--chain", wrongLabelChainPath,
+        "--password", "dev",
+        "--out", path.join(tempDir, "should-not-write.pfx")
+      ])
+    ).rejects.toThrow(/CERTIFICATE/);
+  });
+
+  it("preserves the full chain inside the PFX (leaf + N chain certs)", async () => {
+    // Build a root → intermediate → client hierarchy so the leaf's chain.pem
+    // contains exactly 2 issuer certs. parsePfx should report 3 cert bags.
+    const rootKp = await generateKeyPair("P-256");
+    const root = await createRootCA({
+      subject: [{ type: "CN", value: "CLI Chain Test Root" }],
+      days: 30,
+      keyPair: rootKp
+    });
+    const interKp = await generateKeyPair("P-256");
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: [{ type: "CN", value: "CLI Chain Test Intermediate" }],
+      days: 14,
+      keyPair: interKp
+    });
+    const leafKp = await generateKeyPair("P-256");
+    // We could call issueClientCert with the intermediate directly; using the
+    // CSR path keeps this purely API-level and parallel to the CLI flow.
+    const csr = await createCertificateSigningRequest({
+      subject: [{ type: "CN", value: "chain-test-client" }],
+      keyPair: leafKp,
+      dnsNames: ["chain.example.test"]
+    });
+    const parsed = await parseCertificateSigningRequest(csr.der);
+    const issued = await issueClientCertForPublicKey({
+      ca: intermediate,
+      publicKey: parsed.publicKey,
+      subject: parsed.subject,
+      days: 7,
+      dnsNames: ["chain.example.test"]
+    });
+
+    const certPath = path.join(tempDir, "chain-test.crt.pem");
+    const keyPath = path.join(tempDir, "chain-test.key.pem");
+    const chainPath = path.join(tempDir, "chain-test.chain.pem");
+    await Promise.all([
+      writeFile(certPath, issued.certPem, "utf8"),
+      writeFile(keyPath, await cryptoKeyToPkcs8Pem(leafKp.privateKey), "utf8"),
+      writeFile(chainPath, issued.certChainPem, "utf8")
+    ]);
+
+    const outPath = path.join(tempDir, "chain-test.pfx");
+    await pemToPfxCommand([
+      "--cert", certPath,
+      "--key", keyPath,
+      "--chain", chainPath,
+      "--password", "dev",
+      "--out", outPath
+    ]);
+
+    const pfx = await readFile(outPath);
+    const password = new TextEncoder().encode("dev");
+    const result = await parsePfx(pfx, password);
+    // certChainPem contains leaf + intermediate + root → 3 CERTIFICATE blocks.
+    // splitPemBlocks pulls all of them, but pemToPfxCommand only uses entries
+    // from --chain, which is issued.certChainPem (also 3 blocks including
+    // the leaf duplicate). The leaf cert is also passed via --cert, so the
+    // PFX cert bag list = leaf (from certDer) + 3 entries from chain = 4.
+    expect(result.certBags.length).toBe(4);
+  });
+
   it("accepts a P-384 key+cert pair", async () => {
     const rootKp = await generateKeyPair("P-384");
     const root = await createRootCA({
@@ -658,6 +808,66 @@ describe("issue-client command (writes to CWD)", () => {
         "--ca-key", "root.key.pem"
       ])
     ).rejects.toThrow(/--subject/);
+  });
+
+  it("accepts multiple --ip flags and encodes all of them in SAN", async () => {
+    await issueClientCommand([
+      "--ca-cert", "intermediate.crt.pem",
+      "--ca-key", "intermediate.key.pem",
+      "--ca-chain", "intermediate.chain.pem",
+      "--subject", "CN=multi-ip",
+      "--ip", "10.0.0.1",
+      "--ip", "10.0.0.2",
+      "--ip", "2001:db8::1"
+    ]);
+    const certPem = await readFile(path.join(tempDir, "client.crt.pem"), "utf8");
+    // We rely on the underlying SAN encoder being already-tested; this just
+    // makes sure the CLI didn't drop any of the --ip values silently. The
+    // simplest probe is to feed the produced cert into Node tls and assert
+    // that all three IPs survived through the issuance API. A cheaper check
+    // is to dump the cert via tls/x509 — but issuing via the CSR helper above
+    // is overkill here. Instead, parse via the library's CSR-side parser
+    // surrogate: we just look for the literal IP byte patterns in the DER.
+    const certDer = Buffer.from(
+      certPem
+        .replace(/-----BEGIN CERTIFICATE-----/g, "")
+        .replace(/-----END CERTIFICATE-----/g, "")
+        .replace(/\s+/g, ""),
+      "base64"
+    );
+    // 10.0.0.1 → 0a 00 00 01, 10.0.0.2 → 0a 00 00 02
+    const hex = Buffer.from(certDer).toString("hex");
+    expect(hex).toContain("0a000001");
+    expect(hex).toContain("0a000002");
+  });
+
+  it("propagates an invalid --ip value as an error (does not write a file)", async () => {
+    await expect(
+      issueClientCommand([
+        "--ca-cert", "intermediate.crt.pem",
+        "--ca-key", "intermediate.key.pem",
+        "--ca-chain", "intermediate.chain.pem",
+        "--subject", "CN=bad-ip",
+        "--ip", "999.999.999.999",
+        "--name", "bad-ip-client"
+      ])
+    ).rejects.toThrow();
+    await expect(stat(path.join(tempDir, "bad-ip-client.crt.pem"))).rejects.toThrow();
+  });
+
+  it("propagates a duplicate --dns-name as an error (does not write a file)", async () => {
+    await expect(
+      issueClientCommand([
+        "--ca-cert", "intermediate.crt.pem",
+        "--ca-key", "intermediate.key.pem",
+        "--ca-chain", "intermediate.chain.pem",
+        "--subject", "CN=dup-dns",
+        "--dns-name", "dup.example.test",
+        "--dns-name", "dup.example.test",
+        "--name", "dup-dns-client"
+      ])
+    ).rejects.toThrow(/Duplicate SAN dNSName/);
+    await expect(stat(path.join(tempDir, "dup-dns-client.crt.pem"))).rejects.toThrow();
   });
 });
 

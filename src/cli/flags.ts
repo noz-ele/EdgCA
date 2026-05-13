@@ -4,10 +4,20 @@ export class UsageError extends Error {
   override name = "UsageError";
 }
 
+// Accept only positive decimal integers with no leading zero, surrounding
+// whitespace, sign, scientific notation, or fractional part. Number() is too
+// permissive (it accepts " 365 ", "1e3", "0x10", "01", "1.0", and silently
+// rounds beyond MAX_SAFE_INTEGER), which would let surprising values slip
+// past CLI validation into the issuance API.
+const POSITIVE_DECIMAL_INTEGER = /^[1-9]\d*$/;
+
 export function parseDaysFlag(value: string): number {
+  if (!POSITIVE_DECIMAL_INTEGER.test(value)) {
+    throw new UsageError(`--days must be a positive decimal integer, got: ${JSON.stringify(value)}`);
+  }
   const n = Number(value);
-  if (!Number.isInteger(n) || n <= 0) {
-    throw new UsageError(`--days must be a positive integer, got: ${value}`);
+  if (!Number.isSafeInteger(n)) {
+    throw new UsageError(`--days exceeds the safe integer range: ${value}`);
   }
   return n;
 }
