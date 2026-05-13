@@ -30,6 +30,7 @@ import {
   cryptoKeyToPkcs8Pem,
   defaultPfxPath,
   importPkcs8PrivateKeyFromPem,
+  stripLeafFromChain,
   writeIssuedLeafTriplet
 } from "../src/cli/io.js";
 import { bytesEqual, pemToDer, pemToDerWithLabel, splitPemBlocks } from "../src/index.js";
@@ -230,6 +231,87 @@ describe("flags: requireString", () => {
 // ---------------------------------------------------------------------------
 // io: defaultPfxPath additional boundaries
 // ---------------------------------------------------------------------------
+
+describe("io: stripLeafFromChain", () => {
+  // Build a deterministic-ish hierarchy once per test that needs PEMs.
+  async function buildTestPems(): Promise<{
+    leafPem: string;
+    intermediatePem: string;
+    rootPem: string;
+    leafPlusIssuersPem: string;
+    issuersOnlyPem: string;
+  }> {
+    const root = await createRootCA({
+      subject: [{ type: "CN", value: "Strip Test Root" }],
+      days: 30
+    });
+    const intermediate = await issueIntermediateCA({
+      ca: root,
+      subject: [{ type: "CN", value: "Strip Test Intermediate" }],
+      days: 14
+    });
+    const issued = await issueClientCert({
+      ca: intermediate,
+      subject: [{ type: "CN", value: "strip-test-client" }],
+      days: 7
+    });
+    return {
+      leafPem: issued.certPem,
+      intermediatePem: intermediate.certPem,
+      rootPem: root.certPem,
+      leafPlusIssuersPem: issued.certChainPem,
+      issuersOnlyPem: intermediate.certPem + "\n" + root.certPem + "\n"
+    };
+  }
+
+  it("removes the leaf when it appears in the chain", async () => {
+    const { leafPem, leafPlusIssuersPem } = await buildTestPems();
+    const result = stripLeafFromChain(leafPem, leafPlusIssuersPem);
+    const leafDer = pemToDer(leafPem);
+    for (const block of splitPemBlocks(result)) {
+      expect(bytesEqual(pemToDerWithLabel(block, "CERTIFICATE"), leafDer)).toBe(false);
+    }
+    expect(splitPemBlocks(result).length).toBe(2);
+  });
+
+  it("returns the input unchanged when the leaf is not present (issuer-only passed through)", async () => {
+    const { leafPem, issuersOnlyPem } = await buildTestPems();
+    const result = stripLeafFromChain(leafPem, issuersOnlyPem);
+    // Same block count and identical DERs in identical order.
+    const beforeBlocks = splitPemBlocks(issuersOnlyPem);
+    const afterBlocks = splitPemBlocks(result);
+    expect(afterBlocks.length).toBe(beforeBlocks.length);
+    for (let i = 0; i < beforeBlocks.length; i += 1) {
+      const beforeDer = pemToDerWithLabel(beforeBlocks[i]!, "CERTIFICATE");
+      const afterDer = pemToDerWithLabel(afterBlocks[i]!, "CERTIFICATE");
+      expect(bytesEqual(beforeDer, afterDer)).toBe(true);
+    }
+  });
+
+  it("removes every occurrence when the leaf appears multiple times", async () => {
+    const { leafPem, intermediatePem, rootPem } = await buildTestPems();
+    // Construct a chain with the leaf duplicated at positions 0 and 2.
+    const weirdChainPem = [leafPem, intermediatePem, leafPem, rootPem]
+      .map((p) => p.trim())
+      .join("\n") + "\n";
+    const result = stripLeafFromChain(leafPem, weirdChainPem);
+    const leafDer = pemToDer(leafPem);
+    for (const block of splitPemBlocks(result)) {
+      expect(bytesEqual(pemToDerWithLabel(block, "CERTIFICATE"), leafDer)).toBe(false);
+    }
+    expect(splitPemBlocks(result).length).toBe(2);
+  });
+
+  it("returns an empty string when the chain contains only the leaf", async () => {
+    const { leafPem } = await buildTestPems();
+    expect(stripLeafFromChain(leafPem, leafPem)).toBe("");
+  });
+
+  it("returns an empty string when the chain input is empty", async () => {
+    const { leafPem } = await buildTestPems();
+    expect(stripLeafFromChain(leafPem, "")).toBe("");
+  });
+});
 
 describe("io: defaultPfxPath", () => {
   it("strips .crt.pem and appends .pfx in the same directory", () => {
@@ -604,6 +686,50 @@ describe("pem-to-pfx command", () => {
     expect(result.certBags.length).toBe(3);
   });
 
+  it("(regression) pem-to-pfx --chain is pass-through: manually-supplied fullchain duplicates the leaf", async () => {
+    // pem-to-pfx intentionally trusts its --chain input as-is. The leaf
+    // duplication bug was fixed on the *write* side (issue-client now emits an
+    // issuer-only chain.pem); pem-to-pfx itself does NOT dedup. This test pins
+    // that contract: if a caller manually hands a fullchain (leaf + root) PEM
+    // to --chain, the PFX ends up with the leaf in 2 bags (one from --cert,
+    // one from --chain). If a future change silently adds dedup inside
+    // pem-to-pfx, this test will fail and force explicit re-evaluation.
+    const root = await createRootCA({
+      subject: [{ type: "CN", value: "Regression Root" }],
+      days: 30
+    });
+    const issued = await issueClientCert({
+      ca: root,
+      subject: [{ type: "CN", value: "regression-leaf" }],
+      days: 7
+    });
+    // issued.certChainPem here is [leaf, root] (root-issued, no intermediate).
+    // Write it verbatim as a fullchain file — i.e., bypass writeIssuedLeafTriplet.
+    const fullChainPath = path.join(tempDir, "regression.fullchain.pem");
+    const leafPath = path.join(tempDir, "regression.leaf.crt.pem");
+    const keyPath = path.join(tempDir, "regression.leaf.key.pem");
+    await Promise.all([
+      writeFile(fullChainPath, issued.certChainPem, "utf8"),
+      writeFile(leafPath, issued.certPem, "utf8"),
+      writeFile(keyPath, await cryptoKeyToPkcs8Pem(issued.privateKey), "utf8")
+    ]);
+
+    const outPath = path.join(tempDir, "regression.pfx");
+    await pemToPfxCommand([
+      "--cert", leafPath,
+      "--key", keyPath,
+      "--chain", fullChainPath,
+      "--password", "dev",
+      "--out", outPath
+    ]);
+
+    const pfxBytes = await readFile(outPath);
+    const parsed = await parsePfx(pfxBytes, new TextEncoder().encode("dev"));
+    // 1 (leaf from --cert) + 2 (leaf + root from fullchain --chain) = 3 bags.
+    // If silent dedup is ever added to pem-to-pfx, this drops to 2.
+    expect(parsed.certBags.length).toBe(3);
+  });
+
   it("accepts a P-384 key+cert pair", async () => {
     const rootKp = await generateKeyPair("P-384");
     const root = await createRootCA({
@@ -781,6 +907,24 @@ describe("issue-client command (writes to CWD)", () => {
     await expect(stat(path.join(tempDir, "client.chain.pem"))).resolves.toBeTruthy();
   });
 
+  it("writes a 1-block chain.pem (root only, no leaf) when issued directly from a root CA", async () => {
+    await issueClientCommand([
+      "--ca-cert", "root.crt.pem",
+      "--ca-key", "root.key.pem",
+      "--subject", "CN=alice-root",
+      "--name", "alice-root-client"
+    ]);
+    const rootPem = await readFile(path.join(tempDir, "root.crt.pem"), "utf8");
+    const leafPem = await readFile(path.join(tempDir, "alice-root-client.crt.pem"), "utf8");
+    const chainPem = await readFile(path.join(tempDir, "alice-root-client.chain.pem"), "utf8");
+
+    const blocks = splitPemBlocks(chainPem);
+    expect(blocks.length).toBe(1);
+    const onlyDer = pemToDerWithLabel(blocks[0]!, "CERTIFICATE");
+    expect(bytesEqual(onlyDer, pemToDer(rootPem))).toBe(true);
+    expect(bytesEqual(onlyDer, pemToDer(leafPem))).toBe(false);
+  });
+
   it("issues a client cert from an intermediate CA with --ca-chain", async () => {
     await issueClientCommand([
       "--ca-cert", "intermediate.crt.pem",
@@ -798,7 +942,7 @@ describe("issue-client command (writes to CWD)", () => {
     expect(certCount).toBe(2);
   });
 
-  it("writes client.chain.pem as issuer-only (no leaf cert inside)", async () => {
+  it("writes client.chain.pem as issuer-only (intermediate + root, no leaf)", async () => {
     await issueClientCommand([
       "--ca-cert", "intermediate.crt.pem",
       "--ca-key", "intermediate.key.pem",
@@ -807,12 +951,20 @@ describe("issue-client command (writes to CWD)", () => {
       "--dns-name", "eve.example.test"
     ]);
     const leafPem = await readFile(path.join(tempDir, "client.crt.pem"), "utf8");
+    const rootPem = await readFile(path.join(tempDir, "root.crt.pem"), "utf8");
+    const intermediatePem = await readFile(path.join(tempDir, "intermediate.crt.pem"), "utf8");
     const chainPem = await readFile(path.join(tempDir, "client.chain.pem"), "utf8");
+
     const leafDer = pemToDer(leafPem);
-    for (const block of splitPemBlocks(chainPem)) {
-      const blockDer = pemToDerWithLabel(block, "CERTIFICATE");
-      expect(bytesEqual(blockDer, leafDer)).toBe(false);
-    }
+    const rootDer = pemToDer(rootPem);
+    const intermediateDer = pemToDer(intermediatePem);
+    const chainDers = splitPemBlocks(chainPem).map((b) => pemToDerWithLabel(b, "CERTIFICATE"));
+
+    // Exactly the two issuer DERs are present; the leaf DER is absent.
+    expect(chainDers.length).toBe(2);
+    expect(chainDers.some((d) => bytesEqual(d, intermediateDer))).toBe(true);
+    expect(chainDers.some((d) => bytesEqual(d, rootDer))).toBe(true);
+    expect(chainDers.some((d) => bytesEqual(d, leafDer))).toBe(false);
   });
 
   it("respects --name for the output basename", async () => {
@@ -1007,5 +1159,10 @@ describe("dispatcher (spawned)", () => {
     expect(() =>
       tls.createSecureContext({ pfx: pfxBytes, passphrase: "dev" })
     ).not.toThrow();
+
+    // The E2E pipeline must produce a PFX with no leaf duplication:
+    // leaf (from --cert) + intermediate + root (from issuer-only chain.pem) = 3 bags.
+    const parsed = await parsePfx(pfxBytes, new TextEncoder().encode("dev"));
+    expect(parsed.certBags.length).toBe(3);
   });
 });

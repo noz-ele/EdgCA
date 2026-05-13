@@ -99,7 +99,7 @@ export async function writeIssuedLeafTriplet(
   return { certPath, keyPath, chainPath };
 }
 
-function stripLeafFromChain(leafPem: string, chainPem: string): string {
+export function stripLeafFromChain(leafPem: string, chainPem: string): string {
   const leafDer = pemToDer(leafPem);
   const issuerBlocks = splitPemBlocks(chainPem).filter((block) => {
     const blockDer = pemToDerWithLabel(block, "CERTIFICATE");
