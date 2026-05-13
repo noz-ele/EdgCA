@@ -19,6 +19,7 @@ EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理�
 
 ## Contents
 
+- [CLI](#cli) — `npx @noz-ele/edgca …` で 4 つの定番作業をワンライナーで実行
 - [Quick Start](#quick-start) — root → intermediate → client cert を発行 (PFX 束ね手順も含む)
 - [文書署名用 certificate を発行する](#文書署名用-certificate-を発行する) — RFC 9336 `id-kp-documentSigning` の leaf を発行
 - [Verify (Cloudflare Worker)](#verify-cloudflare-worker) — 自 CA から発行されたかを判定
@@ -36,6 +37,66 @@ npm install @noz-ele/edgca
 ```
 
 ESM 専用 (`"type": "module"`) で、`globalThis.crypto.subtle` が動く runtime (Cloudflare Workers、Node.js 20+、modern browser 等) で動作します。CommonJS からの `require` は対象外です。
+
+## CLI
+
+EdgCA には、4 つの定番ワンショット作業向けの小さな zero-dependency CLI (`bin: edgca`) が同梱されています。library API を薄くラップしただけのもので、`node:util.parseArgs` を使っているため CLI を使わない consumer の依存にも何も増えません。
+
+> `npx` は CLI を **インストールせずに** 実行します。パッケージは npm のローカルキャッシュにダウンロードされ、`bin` が実行され、プロジェクトの `node_modules` / `package.json` には何も追加されません。1 回だけ試したい用途 (ローカル開発用 CA を作る、PFX を組む等) はこれで済みます。繰り返し使うなら `npm install -g @noz-ele/edgca` で global install し、以降は `edgca …` を直接呼べます。
+
+出力ファイルはすべて **現在のディレクトリ** に書き出されます。ファイル名は `--name` から導出され (default は `root` / `intermediate` / `client`)、cert は `<name>.crt.pem`、private key は PKCS#8 PEM の `<name>.key.pem`、chain (必要な場合) は `<name>.chain.pem` です。
+
+```sh
+# 1. root CA を作成 (default: P-256、3650 日)
+npx @noz-ele/edgca create-root-ca --subject "CN=My Test Root,O=Acme,C=JP"
+# → ./root.crt.pem, ./root.key.pem
+
+# 2. その root から intermediate CA を発行
+npx @noz-ele/edgca issue-intermediate-ca \
+  --ca-cert root.crt.pem --ca-key root.key.pem \
+  --subject "CN=My Intermediate,O=Acme"
+# → ./intermediate.crt.pem, ./intermediate.key.pem, ./intermediate.chain.pem
+
+# 3. intermediate から mTLS client cert を発行
+npx @noz-ele/edgca issue-client \
+  --ca-cert intermediate.crt.pem --ca-key intermediate.key.pem \
+  --ca-chain intermediate.chain.pem \
+  --subject "CN=alice" \
+  --dns-name alice.example.test --ip 10.0.0.1 \
+  --days 365
+# → ./client.crt.pem, ./client.key.pem, ./client.chain.pem
+
+# 4. cert + key (+ 任意の chain) を password 付き PFX にまとめる
+npx @noz-ele/edgca pem-to-pfx \
+  --cert client.crt.pem --key client.key.pem --chain client.chain.pem \
+  --password "hunter2"
+# → ./client.pfx   (--out 省略時は --cert と同じディレクトリの <cert-basename>.pfx)
+```
+
+フラグ一覧 (端末で見るには `npx @noz-ele/edgca --help`):
+
+```
+edgca create-root-ca         --subject <dn>
+                             [--days 3650] [--curve P-256|P-384|P-521]
+                             [--name root]
+
+edgca issue-intermediate-ca  --ca-cert <pem> --ca-key <pem>
+                             --subject <dn>
+                             [--days 1825] [--curve P-256|P-384|P-521]
+                             [--name intermediate]
+
+edgca issue-client           --ca-cert <pem> --ca-key <pem> [--ca-chain <pem>]
+                             --subject <dn>
+                             [--dns-name <name>]... [--ip <addr>]...
+                             [--days 365] [--name client]
+
+edgca pem-to-pfx             --cert <pem> --key <pem> --password <pw>
+                             [--chain <pem>] [--out <pfx>]
+```
+
+`--subject` は OpenSSL 互換の DN 文字列 (`"CN=foo,O=bar,C=JP"`) を受け取ります。短縮名は大文字小文字を区別せず (`CN`/`O`/`OU`/`C`/`ST`/`L`/`E`/`DC`/`SERIALNUMBER`/`STREET`/`POSTALCODE`/`TITLE`/`GIVENNAME`/`SURNAME`/`UID`)、dotted OID 形式 (`1.2.840.113549.1.9.1=...`) もそのまま受理します。秘密鍵は PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`) として読み書きします。SEC1 (`EC PRIVATE KEY`) は非対応です。
+
+> ⚠ CLI はローカル検証やワンショット運用作業向けの便利 wrapper です。server / Worker / browser 上のプログラム利用では library API を直接呼び出してください。そちらなら秘密鍵は `CryptoKey` のままで disk を一切経由しません。背景は [Key Handling](#key-handling) を参照。
 
 ## Quick Start
 

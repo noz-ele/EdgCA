@@ -12,11 +12,18 @@ import {
   issueClientCertForPublicKey,
   issueDocumentSigningCert,
   importCertificateAuthority,
+  createCertificateSigningRequest,
   parseCertificateSigningRequest,
   verifyCertificateSigningRequestSignature,
   verifyClientCertificateIssuedBy,
   certificateToPem,
+  csrToPem,
   pemToDer,
+  pemToDerWithLabel,
+  splitPemBlocks,
+  encodePem,
+  generateKeyPair,
+  arrayBufferFromBytes,
   exportPkcs12
 } from "@noz-ele/edgca";
 ```
@@ -278,6 +285,46 @@ Notable absences (vs. `issueClientCert`):
 
 Either a root or an intermediate may be passed as `ca`. The returned `certChainPem` is concatenated as `leaf + issuer + issuerChain` (e.g., `signing-leaf + intermediate + root`). The leaf key is always generated internally as P-256 ECDSA (`extractable: true`, `["sign", "verify"]`); persistence and key-handling are the caller's responsibility, exactly as for `issueClientCert`.
 
+### `createCertificateSigningRequest(input)`
+
+Builds a PKCS#10 CSR (RFC 2986) from a caller-supplied subject and ECDSA `CryptoKeyPair`. The CSR is signed under the curve of the keypair's private key (P-256/SHA-256, P-384/SHA-384, P-521/SHA-512), and both DER and PEM forms of the CSR are returned. The library does not generate or persist the keypair — the caller owns the private key and decides how to keep it.
+
+```ts
+function createCertificateSigningRequest(
+  input: CreateCertificateSigningRequestInput
+): Promise<CreatedCertificateSigningRequest>;
+
+interface CreateCertificateSigningRequestInput {
+  subject: Subject;
+  keyPair: CryptoKeyPair;
+  dnsNames?: readonly string[];
+  ipAddresses?: readonly string[];
+  extensions?: readonly CertificateSigningRequestExtension[];
+}
+
+interface CertificateSigningRequestExtension {
+  oid: string;
+  critical: boolean;
+  valueDer: Uint8Array;
+}
+
+interface CreatedCertificateSigningRequest {
+  der: Uint8Array;
+  pem: string;
+}
+```
+
+Behavior:
+
+- **Algorithm scope**: `keyPair.privateKey` and `keyPair.publicKey` must both be ECDSA on the same supported curve. RSA, Ed25519, and mismatched-curve keypairs throw at the API boundary.
+- **SAN**: if either `dnsNames` or `ipAddresses` is non-empty, a SAN extension is emitted inside the CSR's `extensionRequest` attribute. Empty arrays are treated as omitted (no SAN attribute is produced). dNSName / iPAddress validation matches the SAN encoder used by the issue functions (duplicate dNSName, invalid hostnames, invalid IP literals all throw).
+- **Custom extensions**: every entry in `extensions` is emitted verbatim into `extensionRequest`. The library does **not** parse or validate the `valueDer` — that is caller-defined. An extension whose OID duplicates SAN or another caller-supplied extension throws `Duplicate CSR extension OID`.
+- **Order**: caller-supplied `extensions` retain their input order; SAN (when emitted) is always placed first.
+- **PEM form**: the `pem` field uses the RFC 7468 `CERTIFICATE REQUEST` label.
+- **No state**: the function is pure; calling it twice with the same input produces two distinct DER blobs because ECDSA signatures are randomized.
+
+This function is the producer side of `parseCertificateSigningRequest` + `verifyCertificateSigningRequestSignature`. A caller-managed key combined with the issuer's `issueClientCertForPublicKey` is the recommended way to enroll without ever handing the private key over the wire.
+
 ### `parseCertificateSigningRequest(input)`
 
 Parses a PKCS#10 (RFC 2986) CSR provided as either DER bytes or a PEM string. The library extracts the structured fields needed for issuance and surfaces everything else as raw bytes for caller-side decoding.
@@ -429,18 +476,68 @@ If you operate multiple CAs and want to know which one issued a cert, iterate ov
 
 ### `certificateToPem(der)`
 
-Encodes DER certificate bytes into a PEM certificate block.
+Encodes DER certificate bytes into a PEM `CERTIFICATE` block. Equivalent to `encodePem("CERTIFICATE", der)`.
 
 ```ts
 function certificateToPem(der: Uint8Array): string;
 ```
 
+### `csrToPem(der)`
+
+Encodes DER PKCS#10 CSR bytes into a PEM `CERTIFICATE REQUEST` block (RFC 7468 §7). Equivalent to `encodePem("CERTIFICATE REQUEST", der)`.
+
+```ts
+function csrToPem(der: Uint8Array): string;
+```
+
+### `encodePem(label, der)`
+
+Wraps arbitrary DER bytes into a PEM block with the given RFC 7468 label, base64-encoded and broken into 64-character lines. Used by `certificateToPem` and `csrToPem`, and exposed so that callers (notably the CLI) can emit other label types — e.g., `"PRIVATE KEY"` for PKCS#8 private keys exported via `crypto.subtle.exportKey("pkcs8", …)`.
+
+```ts
+function encodePem(label: string, der: Uint8Array): string;
+```
+
 ### `pemToDer(pem)`
 
-Decodes the first PEM block in the given string into DER bytes.
+Decodes the first PEM block in the given string into DER bytes, without checking the label.
 
 ```ts
 function pemToDer(pem: string): Uint8Array;
+```
+
+### `pemToDerWithLabel(pem, label)`
+
+Decodes the first PEM block whose label matches `label` exactly. Throws if no matching block is found, or if the matching block has an empty body. Use this to safely extract a specific type (e.g., `"CERTIFICATE"` vs `"PRIVATE KEY"` vs `"CERTIFICATE REQUEST"`) from a multi-block PEM file.
+
+```ts
+function pemToDerWithLabel(pem: string, label: string): Uint8Array;
+```
+
+### `splitPemBlocks(pem)`
+
+Splits a string containing one or more PEM blocks into an array of complete PEM block strings (including their `-----BEGIN/END-----` lines). Useful for iterating a chain file (`leaf + intermediate + root` concatenated) without having to label-discriminate first.
+
+```ts
+function splitPemBlocks(pem: string): string[];
+```
+
+### `generateKeyPair(curve?)`
+
+Generates an extractable ECDSA `CryptoKeyPair` (`["sign", "verify"]`) on the given supported curve. Defaults to P-256. The CA / issue / CSR-create functions accept a caller-supplied `keyPair` for the same purpose; this helper is exposed primarily for callers who want to pre-generate a key and inspect it before invoking those functions.
+
+```ts
+function generateKeyPair(curve?: SupportedCurve): Promise<CryptoKeyPair>;
+
+type SupportedCurve = "P-256" | "P-384" | "P-521";
+```
+
+### `arrayBufferFromBytes(bytes)`
+
+Returns a freshly allocated `ArrayBuffer` containing a copy of the given `Uint8Array`'s contents. This exists so that callers passing bytes to WebCrypto (`crypto.subtle.importKey`, `crypto.subtle.sign`, etc.) can satisfy the `BufferSource` parameter type cleanly under TypeScript's strict lib types, without aliasing the caller's underlying buffer.
+
+```ts
+function arrayBufferFromBytes(bytes: Uint8Array): ArrayBuffer;
 ```
 
 ### `exportPkcs12(input)`

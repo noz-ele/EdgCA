@@ -23,6 +23,7 @@ ECDSA on **NIST P-256, P-384, and P-521** is supported throughout (signing, veri
 
 ## Contents
 
+- [CLI](#cli) — `npx edgca …` one-liners for the four most common tasks
 - [Quick Start](#quick-start) — root → intermediate → client cert (incl. PFX bundling)
 - [Issue a document-signing certificate](#issue-a-document-signing-certificate) — RFC 9336 `id-kp-documentSigning` leaf
 - [Verify on Cloudflare Worker](#verify-cloudflare-worker) — confirm a cert was issued by your CA
@@ -40,6 +41,66 @@ npm install @noz-ele/edgca
 ```
 
 ESM-only (`"type": "module"`). Runs on any runtime where `globalThis.crypto.subtle` is available (Cloudflare Workers, Node.js 20+, modern browsers, etc.). CommonJS `require` is not supported.
+
+## CLI
+
+EdgCA ships a small zero-dependency CLI (`bin: edgca`) for the four most common one-shot tasks. It is a thin wrapper over the library API and uses `node:util.parseArgs` — no transitive dependencies are pulled in for non-CLI consumers.
+
+> `npx` runs the CLI **without installing** it — it fetches the package into npm's local cache, executes the `bin`, and leaves your project's `node_modules` / `package.json` untouched. Use this for one-shot tasks (creating a local dev CA, building a PFX). For repeated use, install globally with `npm install -g @noz-ele/edgca` and then call `edgca …` directly.
+
+All commands write outputs to the **current working directory**. Filenames are derived from `--name` (default: `root` / `intermediate` / `client`). Cert files are `<name>.crt.pem`, private keys are PKCS#8 PEM at `<name>.key.pem`, and full chains (when relevant) are `<name>.chain.pem`.
+
+```sh
+# 1. Create a root CA (default: P-256, 3650 days)
+npx @noz-ele/edgca create-root-ca --subject "CN=My Test Root,O=Acme,C=JP"
+# → ./root.crt.pem, ./root.key.pem
+
+# 2. Issue an intermediate CA from that root
+npx @noz-ele/edgca issue-intermediate-ca \
+  --ca-cert root.crt.pem --ca-key root.key.pem \
+  --subject "CN=My Intermediate,O=Acme"
+# → ./intermediate.crt.pem, ./intermediate.key.pem, ./intermediate.chain.pem
+
+# 3. Issue an mTLS client cert from the intermediate
+npx @noz-ele/edgca issue-client \
+  --ca-cert intermediate.crt.pem --ca-key intermediate.key.pem \
+  --ca-chain intermediate.chain.pem \
+  --subject "CN=alice" \
+  --dns-name alice.example.test --ip 10.0.0.1 \
+  --days 365
+# → ./client.crt.pem, ./client.key.pem, ./client.chain.pem
+
+# 4. Bundle a cert + key (+ optional chain) into a password-protected PFX
+npx @noz-ele/edgca pem-to-pfx \
+  --cert client.crt.pem --key client.key.pem --chain client.chain.pem \
+  --password "hunter2"
+# → ./client.pfx   (defaults to <cert-basename>.pfx next to --cert)
+```
+
+Flags summary (run `npx @noz-ele/edgca --help` to see this in your terminal):
+
+```
+edgca create-root-ca         --subject <dn>
+                             [--days 3650] [--curve P-256|P-384|P-521]
+                             [--name root]
+
+edgca issue-intermediate-ca  --ca-cert <pem> --ca-key <pem>
+                             --subject <dn>
+                             [--days 1825] [--curve P-256|P-384|P-521]
+                             [--name intermediate]
+
+edgca issue-client           --ca-cert <pem> --ca-key <pem> [--ca-chain <pem>]
+                             --subject <dn>
+                             [--dns-name <name>]... [--ip <addr>]...
+                             [--days 365] [--name client]
+
+edgca pem-to-pfx             --cert <pem> --key <pem> --password <pw>
+                             [--chain <pem>] [--out <pfx>]
+```
+
+`--subject` accepts an OpenSSL-style DN string (`"CN=foo,O=bar,C=JP"`); short names are case-insensitive (`CN`/`O`/`OU`/`C`/`ST`/`L`/`E`/`DC`/`SERIALNUMBER`/`STREET`/`POSTALCODE`/`TITLE`/`GIVENNAME`/`SURNAME`/`UID`), and dotted OID attributes (`1.2.840.113549.1.9.1=...`) are accepted as-is. Private keys are read/written as PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`); SEC1 (`EC PRIVATE KEY`) is not supported.
+
+> ⚠ The CLI is a convenience wrapper for local testing and one-shot operational tasks. For programmatic use in a server, Worker, or browser, call the library API directly — that way private keys stay in `CryptoKey` form and never touch disk. See [Key Handling](#key-handling) for the rationale.
 
 ## Quick Start
 

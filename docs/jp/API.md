@@ -12,11 +12,18 @@ import {
   issueClientCertForPublicKey,
   issueDocumentSigningCert,
   importCertificateAuthority,
+  createCertificateSigningRequest,
   parseCertificateSigningRequest,
   verifyCertificateSigningRequestSignature,
   verifyClientCertificateIssuedBy,
   certificateToPem,
+  csrToPem,
   pemToDer,
+  pemToDerWithLabel,
+  splitPemBlocks,
+  encodePem,
+  generateKeyPair,
+  arrayBufferFromBytes,
   exportPkcs12
 } from "@noz-ele/edgca";
 ```
@@ -278,6 +285,46 @@ function issueDocumentSigningCert(options: {
 
 `ca` は root でも intermediate でも構いません。返却される `certChainPem` は `leaf + issuer + issuerChain` の順 (例: `signing-leaf + intermediate + root`)。leaf 鍵は常に内部で P-256 ECDSA (`extractable: true`、usage `["sign", "verify"]`) として生成されます。秘密鍵の永続化と取り扱いは呼び出し側の責任で、`issueClientCert` と同じ扱いです。
 
+### `createCertificateSigningRequest(input)`
+
+呼び出し側が用意した subject と ECDSA `CryptoKeyPair` から PKCS#10 CSR (RFC 2986) を組み立てます。署名は鍵ペアの private key の curve で行い (P-256/SHA-256、P-384/SHA-384、P-521/SHA-512)、CSR の DER と PEM の両方を返します。鍵ペアの生成・保持は library 側では行いません。秘密鍵は呼び出し側が用意して持ち続けます。
+
+```ts
+function createCertificateSigningRequest(
+  input: CreateCertificateSigningRequestInput
+): Promise<CreatedCertificateSigningRequest>;
+
+interface CreateCertificateSigningRequestInput {
+  subject: Subject;
+  keyPair: CryptoKeyPair;
+  dnsNames?: readonly string[];
+  ipAddresses?: readonly string[];
+  extensions?: readonly CertificateSigningRequestExtension[];
+}
+
+interface CertificateSigningRequestExtension {
+  oid: string;
+  critical: boolean;
+  valueDer: Uint8Array;
+}
+
+interface CreatedCertificateSigningRequest {
+  der: Uint8Array;
+  pem: string;
+}
+```
+
+挙動:
+
+- **algorithm 範囲**: `keyPair.privateKey` と `keyPair.publicKey` は同一の supported curve 上の ECDSA である必要があります。RSA、Ed25519、curve が食い違う pair は API 境界で throw。
+- **SAN**: `dnsNames` / `ipAddresses` のいずれかが非空なら `extensionRequest` 属性内に SAN extension を emit します。両方とも空配列の場合は SAN 属性自体を出力しません。dNSName / iPAddress の検証は発行系の SAN encoder と同じで、重複 dNSName / 不正なホスト名 / 不正な IP literal は throw します。
+- **caller-supplied extensions**: `extensions` の各 entry は `extensionRequest` にそのまま埋め込みます。`valueDer` の中身は library が parse / 検証しません。SAN や他の caller-supplied extension と OID が重複した場合は `Duplicate CSR extension OID` で throw。
+- **順序**: caller-supplied `extensions` は入力順を保持し、SAN (emit する場合) は常に先頭に置きます。
+- **PEM 形式**: `pem` field は RFC 7468 の `CERTIFICATE REQUEST` label を使用します。
+- **state なし**: 関数は純粋で、同じ入力で 2 回呼べば 2 つの異なる DER が返ります (ECDSA 署名は randomized なため)。
+
+これは `parseCertificateSigningRequest` + `verifyCertificateSigningRequestSignature` の producer 側 API です。呼び出し側で鍵を持つ運用と、issuer 側の `issueClientCertForPublicKey` を組み合わせると、秘密鍵を一切ネットワーク越しに渡さず enrollment できます。
+
 ### `parseCertificateSigningRequest(input)`
 
 PKCS#10 (RFC 2986) CSR を DER バイト列または PEM 文字列で受け取り、発行に必要な構造化 field を取り出し、それ以外は raw bytes として呼び出し側に渡します。
@@ -429,18 +476,68 @@ const ok = inWindow && await verifyClientCertificateIssuedBy({ ca, certPem });
 
 ### `certificateToPem(der)`
 
-DER certificate bytes を PEM certificate block に encode します。
+DER certificate bytes を PEM `CERTIFICATE` block に encode します。`encodePem("CERTIFICATE", der)` と等価です。
 
 ```ts
 function certificateToPem(der: Uint8Array): string;
 ```
 
+### `csrToPem(der)`
+
+DER PKCS#10 CSR bytes を PEM `CERTIFICATE REQUEST` block (RFC 7468 §7) に encode します。`encodePem("CERTIFICATE REQUEST", der)` と等価です。
+
+```ts
+function csrToPem(der: Uint8Array): string;
+```
+
+### `encodePem(label, der)`
+
+任意の DER bytes を、指定 RFC 7468 label 付きの PEM block にまとめます (base64 + 64 文字折り返し)。`certificateToPem` と `csrToPem` の内部で使われており、CLI など他の label 種別を emit したい場合 (例: `crypto.subtle.exportKey("pkcs8", …)` で取り出した PKCS#8 秘密鍵に `"PRIVATE KEY"` を被せる) に呼び出せます。
+
+```ts
+function encodePem(label: string, der: Uint8Array): string;
+```
+
 ### `pemToDer(pem)`
 
-文字列内の最初の PEM block を DER bytes に decode します。
+文字列内の最初の PEM block を、label を問わず DER bytes に decode します。
 
 ```ts
 function pemToDer(pem: string): Uint8Array;
+```
+
+### `pemToDerWithLabel(pem, label)`
+
+`label` と完全一致する最初の PEM block を取り出して decode します。一致する block が存在しない場合や、一致したが body が空の場合は throw します。1 つの PEM ファイルに複数種別の block が混在しているとき (例: `"CERTIFICATE"` と `"PRIVATE KEY"` と `"CERTIFICATE REQUEST"`) に、目的の種別だけを安全に取り出す用途で使います。
+
+```ts
+function pemToDerWithLabel(pem: string, label: string): Uint8Array;
+```
+
+### `splitPemBlocks(pem)`
+
+1 つ以上の PEM block を含む文字列を、完全な PEM block (`-----BEGIN/END-----` 行を含む) 文字列の配列に分割します。chain ファイル (`leaf + intermediate + root` を連結したもの) を label で判別する前に block 単位で回したい場合に使えます。
+
+```ts
+function splitPemBlocks(pem: string): string[];
+```
+
+### `generateKeyPair(curve?)`
+
+指定 supported curve 上の extractable な ECDSA `CryptoKeyPair` (`["sign", "verify"]`) を生成します。default は P-256。CA / 発行 / CSR 作成 API は同じ目的で `keyPair` option を受け取れるため、この helper は主に「先に鍵を作って中身を確認してから渡したい」呼び出し側向けです。
+
+```ts
+function generateKeyPair(curve?: SupportedCurve): Promise<CryptoKeyPair>;
+
+type SupportedCurve = "P-256" | "P-384" | "P-521";
+```
+
+### `arrayBufferFromBytes(bytes)`
+
+与えられた `Uint8Array` の中身をコピーした新しい `ArrayBuffer` を返します。WebCrypto (`crypto.subtle.importKey`、`crypto.subtle.sign` 等) に bytes を渡すとき、TypeScript の厳格な lib 型のもとで `BufferSource` を満たしつつ、呼び出し側が保持する元 buffer と aliasing しないために使います。
+
+```ts
+function arrayBufferFromBytes(bytes: Uint8Array): ArrayBuffer;
 ```
 
 ### `exportPkcs12(input)`

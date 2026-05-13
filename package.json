@@ -49,6 +49,9 @@
     }
   },
   "types": "./dist/index.d.ts",
+  "bin": {
+    "edgca": "./dist/cli.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -61,6 +64,7 @@
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.15.2",
+    "@types/node": "^25.7.0",
     "@vitest/coverage-istanbul": "^4.1.5",
     "fast-check": "^4.7.0",
     "typescript": "^5.9.3",

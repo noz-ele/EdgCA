@@ -50,7 +50,7 @@ export function splitPemBlocks(pem: string): string[] {
   return blocks;
 }
 
-function encodePem(label: string, der: Uint8Array): string {
+export function encodePem(label: string, der: Uint8Array): string {
   const base64 = btoa(bytesToBinary(der));
   const lines: string[] = [];
 
