@@ -37,6 +37,7 @@ import {
 } from "../src/cli/io.js";
 import { bytesEqual, pemToDer, pemToDerWithLabel, splitPemBlocks } from "../src/index.js";
 import { parsePfx } from "./helpers/parse-pfx.js";
+import { pseudoV3CertPemWithSpki } from "./helpers/pseudo-cert.js";
 
 let tempDir: string;
 let logSpy: ReturnType<typeof vi.spyOn>;
@@ -543,6 +544,39 @@ describe("pem-to-pfx command", () => {
         "--bogus", "x"
       ])
     ).rejects.toThrow();
+  });
+
+  it("packs an RSA-cert + RSA-key end-to-end (the original user-reported case)", async () => {
+    // Regression for v0.5.1: with both --cert and --key being RSA (the
+    // real-world Cloudflare Managed CA scenario), pem-to-pfx used to throw
+    // "SubjectPublicKeyInfo is not an EC public key" from inside
+    // parseCertificateDer. Now the cert side reads only the SPKI bytes,
+    // which is algorithm-agnostic, and the key side is already opaque
+    // bytes pass-through. End-to-end:
+    const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const keyPem = privateKey.export({ format: "pem", type: "pkcs8" }) as string;
+    const rsaSpki = new Uint8Array(publicKey.export({ format: "der", type: "spki" }) as Buffer);
+    const certPem = pseudoV3CertPemWithSpki(rsaSpki);
+
+    const certPath = path.join(tempDir, "rsa.crt.pem");
+    const keyPath = path.join(tempDir, "rsa.key.pem");
+    await Promise.all([
+      writeFile(certPath, certPem, "utf8"),
+      writeFile(keyPath, keyPem, "utf8")
+    ]);
+    const outPath = path.join(tempDir, "rsa-end-to-end.pfx");
+    await pemToPfxCommand([
+      "--cert", certPath,
+      "--key", keyPath,
+      "--password", "dev",
+      "--out", outPath
+    ]);
+
+    const pfx = await readFile(outPath);
+    const parsed = await parsePfx(pfx, new TextEncoder().encode("dev"));
+    const rsaPkcs8 = new Uint8Array(privateKey.export({ format: "der", type: "pkcs8" }) as Buffer);
+    expect(bytesEqual(parsed.keyPkcs8, rsaPkcs8)).toBe(true);
+    expect(parsed.certBags.length).toBe(1);
   });
 
   it("packs an RSA-2048 PEM (algorithm-agnostic pass-through)", async () => {

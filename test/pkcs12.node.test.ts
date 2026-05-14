@@ -22,6 +22,7 @@ import {
 import { OID } from "../src/oids.js";
 import { parseCertificateDer } from "../src/parser.js";
 import { parsePfx } from "./helpers/parse-pfx.js";
+import { buildPseudoV3CertWithSpki } from "./helpers/pseudo-cert.js";
 
 const TEST_ITERATIONS = 2048;
 const TEST_MAC_ITERATIONS = 2048;
@@ -315,6 +316,40 @@ describe("exportPkcs12", () => {
     });
     const parsed = await parsePfx(pfx, password);
     expect(bytesEqual(parsed.keyPkcs8, leafPkcs8)).toBe(true);
+  });
+
+  it("accepts an RSA-cert + RSA-key end-to-end (algorithm-agnostic SPKI extraction)", async () => {
+    // Regression: exportPkcs12 used to route certDer through parseCertificateDer,
+    // which imported the SPKI as an ECDSA CryptoKey (via curveFromSpki) and
+    // threw "SubjectPublicKeyInfo is not an EC public key" for RSA certs. The
+    // PKCS#12 build only needs the SPKI's raw bytes (for localKeyId), so the
+    // pkcs12 path was switched to extractCertificateSpkiDer, which does not
+    // import the public key. This test builds a structurally-valid v3 X.509
+    // cert carrying an RSA SPKI and asserts the whole flow succeeds.
+    const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const rsaSpki = new Uint8Array(publicKey.export({ format: "der", type: "spki" }) as Buffer);
+    const rsaPkcs8 = new Uint8Array(privateKey.export({ format: "der", type: "pkcs8" }) as Buffer);
+    const certDer = buildPseudoV3CertWithSpki(rsaSpki);
+
+    const password = utf8("rsa-cert");
+    const pfx = await exportPkcs12({
+      certDer,
+      privateKey: rsaPkcs8,
+      password,
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+    const parsed = await parsePfx(pfx, password);
+    expect(bytesEqual(parsed.keyPkcs8, rsaPkcs8)).toBe(true);
+    // localKeyId must be SHA-1 over the SPKI BIT STRING value (RFC 5280
+    // §4.2.1.2 method 1), regardless of inner key algorithm. Reproduce it
+    // independently from the RSA SPKI and verify it landed in both bags.
+    const spkiBitString = readSequenceChildren(readElement(rsaSpki))[1]!;
+    const expectedLocalKeyId = new Uint8Array(
+      await crypto.subtle.digest("SHA-1", arrayBufferFromBytes(spkiBitString.value.subarray(1)))
+    );
+    expect(bytesEqual(parsed.certBags[0]!.localKeyId!, expectedLocalKeyId)).toBe(true);
+    expect(bytesEqual(parsed.keyBag.localKeyId!, expectedLocalKeyId)).toBe(true);
   });
 
   it("does not parse the privateKey: arbitrary (non-PKCS#8) bytes are wrapped verbatim", async () => {

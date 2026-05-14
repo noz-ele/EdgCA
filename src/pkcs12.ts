@@ -12,7 +12,7 @@ import {
   set
 } from "./der.js";
 import { OID } from "./oids.js";
-import { parseCertificateDer } from "./parser.js";
+import { extractCertificateSpkiDer } from "./parser.js";
 
 export interface ExportPkcs12Input {
   certDer: Uint8Array;
@@ -37,8 +37,8 @@ export async function exportPkcs12(input: ExportPkcs12Input): Promise<Uint8Array
   const macIterations = input.macIterations ?? DEFAULT_MAC_ITERATIONS;
   validateInput(input, iterations, macIterations);
 
-  const parsedLeaf = await parseCertificateDer(input.certDer);
-  const localKeyId = await keyIdentifierFromSpki(parsedLeaf.subjectPublicKeyInfoDer);
+  const spkiDer = extractCertificateSpkiDer(input.certDer);
+  const localKeyId = await keyIdentifierFromSpki(spkiDer);
 
   const friendlyNameAttr = input.friendlyName !== undefined && input.friendlyName.length > 0
     ? buildFriendlyNameAttr(input.friendlyName)

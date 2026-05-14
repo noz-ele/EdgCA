@@ -25,6 +25,45 @@ export interface ParsedCertificate {
   authorityKeyIdentifier?: Uint8Array;
 }
 
+// Read just the SubjectPublicKeyInfo DER from a v3 X.509 certificate without
+// importing the public key. Used by exportPkcs12, which needs the SPKI for
+// localKeyId computation (SHA-1 of the BIT STRING value) regardless of the
+// inner key algorithm. parseCertificateDer below additionally imports the
+// SPKI as an ECDSA CryptoKey for the issuance/verify paths; that import is
+// EC-only and must not be on the pkcs12 path.
+export function extractCertificateSpkiDer(der: Uint8Array): Uint8Array {
+  const certificate = readElement(der);
+  if (certificate.tag !== TAG.SEQUENCE || certificate.end !== der.length) {
+    throw new Error("Invalid certificate DER");
+  }
+  const [tbsCertificate] = readSequenceChildren(certificate);
+  if (!tbsCertificate) {
+    throw new Error("Invalid certificate structure");
+  }
+  const tbsChildren = readSequenceChildren(tbsCertificate);
+  const versionTag = tbsChildren[0];
+  if (!versionTag || versionTag.tag !== 0xa0) {
+    throw new Error("Unsupported X.509 version (only v3 is supported)");
+  }
+  const versionInner = readElement(versionTag.value);
+  if (versionInner.tag !== TAG.INTEGER || decodeInteger(versionInner.value) !== 2n) {
+    throw new Error("Unsupported X.509 version (only v3 is supported)");
+  }
+  // tbsCertificate (v3) layout:
+  //   [0] version [0] EXPLICIT INTEGER 2
+  //   [1] serialNumber
+  //   [2] signature (AlgorithmIdentifier)
+  //   [3] issuer
+  //   [4] validity
+  //   [5] subject
+  //   [6] subjectPublicKeyInfo
+  const subjectPublicKeyInfo = tbsChildren[6];
+  if (!subjectPublicKeyInfo || subjectPublicKeyInfo.tag !== TAG.SEQUENCE) {
+    throw new Error("Invalid certificate: missing subjectPublicKeyInfo");
+  }
+  return subjectPublicKeyInfo.raw;
+}
+
 export async function parseCertificateDer(der: Uint8Array): Promise<ParsedCertificate> {
   const certificate = readElement(der);
   if (certificate.tag !== TAG.SEQUENCE || certificate.end !== der.length) {
