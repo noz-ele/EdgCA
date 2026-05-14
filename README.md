@@ -7,7 +7,7 @@ EdgCA is a small TypeScript library for issuing mTLS client certificates and doc
 ## Features
 
 - **WebCrypto-only, zero runtime dependencies.** All cryptographic operations go through `globalThis.crypto.subtle`. The same code runs on Cloudflare Workers, Node.js 20+, and modern browsers without polyfills or bundler shims.
-- **Lightweight.** v0.5.1 — tarball **44.4 kB** · unpacked **164.5 kB** · 73 files. No transitive dependencies; the CLI uses only `node:util.parseArgs`. (Re-measured on every release.)
+- **Lightweight.** v0.5.1 — tarball **44.8 kB** · unpacked **165.5 kB** · 73 files. No transitive dependencies; the CLI uses only `node:util.parseArgs`. (Re-measured on every release.)
 - **CA hierarchy (two-level).** Create a self-signed root CA and, optionally, issue an intermediate CA from it. Three or more levels of intermediates are intentionally out of scope.
 - **PFX (PKCS#12) bundling.** Wrap a cert + private key (and optional chain) into a password-protected `.pfx` / `.p12` for OS keystore import (Win11+, macOS 15+, iOS/iPadOS 18+, modern Linux). Algorithm-agnostic — accepts arbitrary PKCS#8 DER bytes (ECDSA, RSA, Ed25519, …).
 - **mTLS client certificate issuance.** Issue a leaf with internal key generation, or from a caller-managed key via the CSR path below.
