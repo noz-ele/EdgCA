@@ -2,13 +2,12 @@ import { readFile, writeFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import {
   exportPkcs12,
-  importCertificateAuthority,
   pemToDer,
   pemToDerWithLabel,
   splitPemBlocks
 } from "../../index.js";
 import { requireString } from "../flags.js";
-import { defaultPfxPath, importPkcs8PrivateKeyFromPem } from "../io.js";
+import { defaultPfxPath } from "../io.js";
 
 export async function pemToPfxCommand(args: string[]): Promise<void> {
   const { values } = parseArgs({
@@ -39,14 +38,7 @@ export async function pemToPfxCommand(args: string[]): Promise<void> {
   const chainDer = chainPem
     ? splitPemBlocks(chainPem).map((block) => pemToDerWithLabel(block, "CERTIFICATE"))
     : [];
-  const privateKey = await importPkcs8PrivateKeyFromPem(keyPem);
-
-  // Refuse to emit a PFX whose key does not match the leaf cert. The library's
-  // exportPkcs12 does not check this, so without the guard a mismatched pair
-  // silently produces a structurally valid but unusable .pfx file. We discard
-  // the returned CertificateAuthority — only the sign/verify round-trip
-  // performed inside importCertificateAuthority matters here.
-  await importCertificateAuthority({ certPem, privateKey });
+  const privateKey = pemToDerWithLabel(keyPem, "PRIVATE KEY");
 
   const pfx = await exportPkcs12({
     certDer,

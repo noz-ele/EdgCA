@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
+import { generateKeyPairSync } from "node:crypto";
 import * as tls from "node:tls";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createRootCA,
   exportPkcs12,
@@ -31,6 +32,10 @@ const HASH_BY_CURVE: Record<SupportedCurve, "SHA-256" | "SHA-384" | "SHA-512"> =
   "P-521": "SHA-512"
 };
 
+async function toPkcs8(key: CryptoKey): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.exportKey("pkcs8", key));
+}
+
 async function makeRootAndLeaf() {
   const ca = await createRootCA({
     subject: [{ type: "CN", value: "EdgCA Test Root" }],
@@ -41,7 +46,8 @@ async function makeRootAndLeaf() {
     subject: [{ type: "CN", value: "client" }],
     days: 7
   });
-  return { ca, issued };
+  const leafPkcs8 = await toPkcs8(issued.privateKey);
+  return { ca, issued, leafPkcs8 };
 }
 
 function utf8(s: string): Uint8Array {
@@ -79,11 +85,11 @@ async function signRoundTripsViaPfx(
 
 describe("exportPkcs12", () => {
   it("produces a PFX that Node's tls.createSecureContext accepts", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const passphrase = "p@ssw0rd-✓";
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password: utf8(passphrase),
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -95,10 +101,10 @@ describe("exportPkcs12", () => {
   });
 
   it("throws on wrong password when consumed by Node", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password: utf8("right"),
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -110,11 +116,11 @@ describe("exportPkcs12", () => {
   });
 
   it("round-trips: extracted private key signs, cert public key verifies (P-256)", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const password = utf8("round-trip");
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password,
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -124,11 +130,11 @@ describe("exportPkcs12", () => {
   });
 
   it("emits matching localKeyID on cert bag and key bag", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const password = utf8("local-key-id");
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password,
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -143,11 +149,11 @@ describe("exportPkcs12", () => {
   });
 
   it("rejects an empty password", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     await expect(
       exportPkcs12({
         certDer: issued.certDer,
-        privateKey: issued.privateKey,
+        privateKey: leafPkcs8,
         password: new Uint8Array(0),
         iterations: TEST_ITERATIONS,
         macIterations: TEST_MAC_ITERATIONS
@@ -156,11 +162,11 @@ describe("exportPkcs12", () => {
   });
 
   it("rejects a non-Uint8Array password (caller passed a string)", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     await expect(
       exportPkcs12({
         certDer: issued.certDer,
-        privateKey: issued.privateKey,
+        privateKey: leafPkcs8,
         // intentionally wrong runtime type
         password: "raw-string" as unknown as Uint8Array,
         iterations: TEST_ITERATIONS,
@@ -169,55 +175,206 @@ describe("exportPkcs12", () => {
     ).rejects.toThrow(/password/);
   });
 
-  it("rejects a non-extractable private key", async () => {
+  it("rejects a non-Uint8Array privateKey (caller passed a CryptoKey)", async () => {
     const { issued } = await makeRootAndLeaf();
-    const sealed = await crypto.subtle.generateKey(
-      { name: "ECDSA", namedCurve: "P-256" },
-      false,
-      ["sign"]
-    );
     await expect(
       exportPkcs12({
         certDer: issued.certDer,
-        privateKey: sealed.privateKey,
+        // intentionally wrong runtime type
+        privateKey: issued.privateKey as unknown as Uint8Array,
         password: utf8("p"),
         iterations: TEST_ITERATIONS,
         macIterations: TEST_MAC_ITERATIONS
       })
-    ).rejects.toThrow(/extractable/);
+    ).rejects.toThrow(/privateKey/);
   });
 
-  it("rejects a non-ECDSA private key", async () => {
+  it("rejects an empty privateKey", async () => {
     const { issued } = await makeRootAndLeaf();
-    const rsa = await crypto.subtle.generateKey(
-      {
-        name: "RSASSA-PKCS1-v1_5",
-        modulusLength: 2048,
-        publicExponent: new Uint8Array([1, 0, 1]),
-        hash: "SHA-256"
-      },
-      true,
-      ["sign", "verify"]
-    );
     await expect(
       exportPkcs12({
         certDer: issued.certDer,
-        privateKey: rsa.privateKey,
+        privateKey: new Uint8Array(0),
         password: utf8("p"),
         iterations: TEST_ITERATIONS,
         macIterations: TEST_MAC_ITERATIONS
       })
-    ).rejects.toThrow(/ECDSA/);
+    ).rejects.toThrow(/privateKey/);
+  });
+
+  it.each([
+    ["undefined", undefined],
+    ["null", null],
+    ["number", 42],
+    ["plain ArrayBuffer", new ArrayBuffer(32)],
+    ["string", "BEGIN CERTIFICATE"]
+  ])("rejects a non-Uint8Array certDer (%s)", async (_label, bad) => {
+    const { leafPkcs8 } = await makeRootAndLeaf();
+    await expect(
+      exportPkcs12({
+        certDer: bad as unknown as Uint8Array,
+        privateKey: leafPkcs8,
+        password: utf8("p"),
+        iterations: TEST_ITERATIONS,
+        macIterations: TEST_MAC_ITERATIONS
+      })
+    ).rejects.toThrow(/certDer/);
+  });
+
+  it("rejects an empty certDer", async () => {
+    const { leafPkcs8 } = await makeRootAndLeaf();
+    await expect(
+      exportPkcs12({
+        certDer: new Uint8Array(0),
+        privateKey: leafPkcs8,
+        password: utf8("p"),
+        iterations: TEST_ITERATIONS,
+        macIterations: TEST_MAC_ITERATIONS
+      })
+    ).rejects.toThrow(/certDer/);
+  });
+
+  it.each([
+    ["string", "not-an-array"],
+    ["object", { 0: new Uint8Array(10), length: 1 }],
+    ["number", 0]
+  ])("rejects a non-Array chainDer (%s)", async (_label, bad) => {
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
+    await expect(
+      exportPkcs12({
+        certDer: issued.certDer,
+        chainDer: bad as unknown as Uint8Array[],
+        privateKey: leafPkcs8,
+        password: utf8("p"),
+        iterations: TEST_ITERATIONS,
+        macIterations: TEST_MAC_ITERATIONS
+      })
+    ).rejects.toThrow(/chainDer/);
+  });
+
+  it("rejects a chainDer entry that is not a Uint8Array", async () => {
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
+    await expect(
+      exportPkcs12({
+        certDer: issued.certDer,
+        chainDer: [issued.certDer, "string-not-uint8array" as unknown as Uint8Array],
+        privateKey: leafPkcs8,
+        password: utf8("p"),
+        iterations: TEST_ITERATIONS,
+        macIterations: TEST_MAC_ITERATIONS
+      })
+    ).rejects.toThrow(/chainDer/);
+  });
+
+  it("rejects an empty Uint8Array inside chainDer", async () => {
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
+    await expect(
+      exportPkcs12({
+        certDer: issued.certDer,
+        chainDer: [issued.certDer, new Uint8Array(0)],
+        privateKey: leafPkcs8,
+        password: utf8("p"),
+        iterations: TEST_ITERATIONS,
+        macIterations: TEST_MAC_ITERATIONS
+      })
+    ).rejects.toThrow(/chainDer/);
+  });
+
+  it.each([
+    ["undefined", undefined],
+    ["null", null],
+    ["number", 42],
+    ["plain ArrayBuffer", new ArrayBuffer(32)],
+    ["string", "BEGIN PRIVATE KEY"]
+  ])("rejects a non-Uint8Array privateKey (%s)", async (_label, bad) => {
+    const { issued } = await makeRootAndLeaf();
+    await expect(
+      exportPkcs12({
+        certDer: issued.certDer,
+        privateKey: bad as unknown as Uint8Array,
+        password: utf8("p"),
+        iterations: TEST_ITERATIONS,
+        macIterations: TEST_MAC_ITERATIONS
+      })
+    ).rejects.toThrow(/privateKey/);
+  });
+
+  it("accepts a Node Buffer as privateKey (Buffer extends Uint8Array)", async () => {
+    // Node users commonly hold PKCS#8 in a Buffer (e.g. fs.readFile output or
+    // Node KeyObject.export). Buffer is a Uint8Array subclass, so it must
+    // satisfy the instanceof check.
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
+    const asBuffer = Buffer.from(leafPkcs8);
+    const password = utf8("buffer-input");
+    const pfx = await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: asBuffer,
+      password,
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+    const parsed = await parsePfx(pfx, password);
+    expect(bytesEqual(parsed.keyPkcs8, leafPkcs8)).toBe(true);
+  });
+
+  it("does not parse the privateKey: arbitrary (non-PKCS#8) bytes are wrapped verbatim", async () => {
+    // Core design contract: exportPkcs12 treats `privateKey` as opaque
+    // bytes and MUST NOT attempt PKCS#8 (or any other) structural
+    // validation. If a future change inserts "well, let's at least
+    // sanity-check that this looks like ASN.1" or "let's verify the
+    // OID", this test must fail and force re-evaluation. We use a fixed
+    // pseudo-random byte string (not even valid DER) and assert that
+    // parsePfx returns exactly those bytes back from the key bag.
+    const { issued } = await makeRootAndLeaf();
+    const garbage = new Uint8Array(64);
+    for (let i = 0; i < garbage.length; i += 1) garbage[i] = (i * 31 + 7) & 0xff;
+    const password = utf8("garbage-bytes-passthrough");
+    const pfx = await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: garbage,
+      password,
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+    const parsed = await parsePfx(pfx, password);
+    expect(bytesEqual(parsed.keyPkcs8, garbage)).toBe(true);
+  });
+
+  it("accepts arbitrary (non-ECDSA) PKCS#8 bytes — algorithm-agnostic pass-through", async () => {
+    // exportPkcs12 is a generic PKCS#12 packer: it MUST accept any PKCS#8
+    // DER bytes, not just ECDSA. Generate an RSA-2048 key via Node's crypto
+    // and feed the raw PKCS#8 bytes through. We pair it with the existing
+    // ECDSA cert from the harness because exportPkcs12 does not verify
+    // cert/key consistency — the test is about the library's willingness
+    // to wrap arbitrary key bytes, not about producing a TLS-usable PFX.
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const rsaPkcs8 = new Uint8Array(privateKey.export({ format: "der", type: "pkcs8" }) as Buffer);
+
+    const { issued } = await makeRootAndLeaf();
+    const password = utf8("rsa-bytes-pass-through");
+    const pfx = await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: rsaPkcs8,
+      password,
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+
+    // The PFX must be structurally parseable and its key bag must contain
+    // exactly the RSA PKCS#8 bytes we passed in (proves true pass-through:
+    // no re-encoding via WebCrypto importKey/exportKey detour).
+    const parsed = await parsePfx(pfx, password);
+    expect(bytesEqual(parsed.keyPkcs8, rsaPkcs8)).toBe(true);
   });
 
   it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
     "rejects iterations=%s",
     async (bad) => {
-      const { issued } = await makeRootAndLeaf();
+      const { issued, leafPkcs8 } = await makeRootAndLeaf();
       await expect(
         exportPkcs12({
           certDer: issued.certDer,
-          privateKey: issued.privateKey,
+          privateKey: leafPkcs8,
           password: utf8("p"),
           iterations: bad,
           macIterations: TEST_MAC_ITERATIONS
@@ -229,11 +386,11 @@ describe("exportPkcs12", () => {
   it.each([0, -1, 1.5, Number.NaN])(
     "rejects macIterations=%s",
     async (bad) => {
-      const { issued } = await makeRootAndLeaf();
+      const { issued, leafPkcs8 } = await makeRootAndLeaf();
       await expect(
         exportPkcs12({
           certDer: issued.certDer,
-          privateKey: issued.privateKey,
+          privateKey: leafPkcs8,
           password: utf8("p"),
           iterations: TEST_ITERATIONS,
           macIterations: bad
@@ -243,11 +400,11 @@ describe("exportPkcs12", () => {
   );
 
   it("rejects a non-Uint8Array friendlyName", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     await expect(
       exportPkcs12({
         certDer: issued.certDer,
-        privateKey: issued.privateKey,
+        privateKey: leafPkcs8,
         password: utf8("p"),
         // intentionally wrong runtime type
         friendlyName: "label" as unknown as Uint8Array,
@@ -278,7 +435,7 @@ describe("exportPkcs12", () => {
     const pfx = await exportPkcs12({
       certDer: leaf.certDer,
       chainDer: [intermediate.certDer],
-      privateKey: leaf.privateKey,
+      privateKey: await toPkcs8(leaf.privateKey),
       password: utf8(passphrase),
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -321,7 +478,7 @@ describe("exportPkcs12", () => {
     const pfx = await exportPkcs12({
       certDer: leaf.certDer,
       chainDer: [intermediate.certDer, root.certDer],
-      privateKey: leaf.privateKey,
+      privateKey: await toPkcs8(leaf.privateKey),
       password,
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -337,12 +494,12 @@ describe("exportPkcs12", () => {
   });
 
   it("treats chainDer=[] as no chain", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const password = utf8("empty-chain");
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
       chainDer: [],
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password,
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -353,12 +510,12 @@ describe("exportPkcs12", () => {
   });
 
   it("emits friendlyName as BMPString on leaf cert bag and key bag only", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const password = utf8("name");
     const friendlyName = utf8("EdgCA Test Client");
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password,
       friendlyName,
       iterations: TEST_ITERATIONS,
@@ -375,11 +532,11 @@ describe("exportPkcs12", () => {
   });
 
   it("treats friendlyName=Uint8Array(0) as no friendlyName", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const password = utf8("blank-name");
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password,
       friendlyName: new Uint8Array(0),
       iterations: TEST_ITERATIONS,
@@ -394,11 +551,11 @@ describe("exportPkcs12", () => {
   it("emits bagAttributes in canonical DER SET OF order (short friendlyName comes first)", async () => {
     // Encoded sizes: Attribute(friendlyName="x") = 19 bytes total, attr(localKeyID 20B SHA-1) = 37 bytes.
     // X.690 §11.6 picks the lex-smaller (and 0-padded shorter) component first → friendlyName precedes localKeyID.
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const password = utf8("canon");
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password,
       friendlyName: utf8("x"),
       iterations: TEST_ITERATIONS,
@@ -411,11 +568,11 @@ describe("exportPkcs12", () => {
   });
 
   it("handles a 2-byte UTF-8 password (e.g. café)", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const passphrase = "café";
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password: utf8(passphrase),
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -426,12 +583,12 @@ describe("exportPkcs12", () => {
   });
 
   it("handles a password whose UTF-8 produces a UTF-16 surrogate pair", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const passphrase = "lock-🔐";
     const password = utf8(passphrase);
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password,
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -444,14 +601,34 @@ describe("exportPkcs12", () => {
     ).toThrow();
   });
 
+  it("rejects a friendlyName containing an invalid UTF-8 sequence", async () => {
+    // Parity with the password UTF-8 test above: friendlyName is encoded
+    // as BMPString via the same utf8ToUtf16Be path, so invalid UTF-8 must
+    // also propagate out at the API boundary rather than producing a
+    // structurally damaged BMPString.
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
+    // 0xc2 is a 2-byte UTF-8 leader with no continuation byte.
+    const friendlyName = new Uint8Array([0x6e, 0xc2]);
+    await expect(
+      exportPkcs12({
+        certDer: issued.certDer,
+        privateKey: leafPkcs8,
+        password: utf8("p"),
+        friendlyName,
+        iterations: TEST_ITERATIONS,
+        macIterations: TEST_MAC_ITERATIONS
+      })
+    ).rejects.toThrow(/UTF-8/);
+  });
+
   it("rejects a password containing an invalid UTF-8 sequence", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     // 0xc2 is a 2-byte UTF-8 leader with no continuation byte.
     const password = new Uint8Array([0x70, 0xc2]);
     await expect(
       exportPkcs12({
         certDer: issued.certDer,
-        privateKey: issued.privateKey,
+        privateKey: leafPkcs8,
         password,
         iterations: TEST_ITERATIONS,
         macIterations: TEST_MAC_ITERATIONS
@@ -474,7 +651,7 @@ describe("exportPkcs12", () => {
     const password = utf8("p384");
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: leafKp.privateKey,
+      privateKey: await toPkcs8(leafKp.privateKey),
       password,
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -501,7 +678,7 @@ describe("exportPkcs12", () => {
     const password = utf8("p521");
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: leafKp.privateKey,
+      privateKey: await toPkcs8(leafKp.privateKey),
       password,
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -513,12 +690,42 @@ describe("exportPkcs12", () => {
     expect(await signRoundTripsViaPfx(issued.certDer, password, pfx)).toBe(true);
   });
 
+  it("validator does not impose an upper bound on iterations (passes MAX_SAFE_INTEGER+1 through)", async () => {
+    // Number.isInteger(2^53) === true even though it sits at the MAX_SAFE_INTEGER + 1
+    // boundary where integer precision starts breaking down. We deliberately do
+    // NOT add an upper-bound check — PBKDF2 is mathematically defined for any
+    // positive iteration count and WebCrypto / the runtime decides what is
+    // actually executable. This test pins that contract: validateInput does
+    // not throw "iterations must be a positive integer" for MAX_SAFE_INTEGER+1.
+    // We stub crypto.subtle.deriveKey so we never actually run 2^53 PBKDF2
+    // rounds; the stub throws a distinct sentinel so we can assert we reached
+    // the WebCrypto layer (i.e. the validator did not reject upstream).
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
+    const SENTINEL = "STUB-DERIVE-KEY-REACHED";
+    const spy = vi
+      .spyOn(crypto.subtle, "deriveKey")
+      .mockImplementation(() => Promise.reject(new Error(SENTINEL)));
+    try {
+      await expect(
+        exportPkcs12({
+          certDer: issued.certDer,
+          privateKey: leafPkcs8,
+          password: utf8("upper-bound"),
+          iterations: Number.MAX_SAFE_INTEGER + 1, // = 2^53
+          macIterations: TEST_MAC_ITERATIONS
+        })
+      ).rejects.toThrow(SENTINEL);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("works with iterations=1 and macIterations=1 (minimum boundary)", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const passphrase = "min";
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password: utf8(passphrase),
       iterations: 1,
       macIterations: 1
@@ -531,11 +738,11 @@ describe("exportPkcs12", () => {
   it("handles a password whose UTF-16BE form spans multiple PKCS#12 v-blocks", async () => {
     // 50 ASCII chars → 100 B UTF-16BE + 2 B terminator = 102 B.
     // ceil(102 / 64) * 64 = 128 B → P2 spans two v-blocks (not one).
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const passphrase = "x".repeat(50);
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password: utf8(passphrase),
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -546,11 +753,11 @@ describe("exportPkcs12", () => {
   });
 
   it("emits PBES2 with explicit hmacWithSha256 + NULL prf parameters (defends against default-prf trap)", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const password = utf8("prf");
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password,
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -568,12 +775,12 @@ describe("exportPkcs12", () => {
   });
 
   it("does not mutate the caller's password buffer", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const password = utf8("immutable-password");
     const snapshot = new Uint8Array(password);
     await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password,
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -582,12 +789,12 @@ describe("exportPkcs12", () => {
   });
 
   it("does not mutate the caller's friendlyName buffer", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const friendlyName = utf8("Stable Name");
     const snapshot = new Uint8Array(friendlyName);
     await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password: utf8("p"),
       friendlyName,
       iterations: TEST_ITERATIONS,
@@ -596,12 +803,29 @@ describe("exportPkcs12", () => {
     expect(bytesEqual(friendlyName, snapshot)).toBe(true);
   });
 
+  it("does not mutate the caller's privateKey buffer", async () => {
+    // The library historically wiped its own internally-exported PKCS#8 copy.
+    // Now that the caller hands in the PKCS#8 bytes directly, the library must
+    // NOT touch them. Pin the contract so any future regression (e.g.
+    // re-adding a wipe(input.privateKey)) is caught immediately.
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
+    const snapshot = new Uint8Array(leafPkcs8);
+    await exportPkcs12({
+      certDer: issued.certDer,
+      privateKey: leafPkcs8,
+      password: utf8("p"),
+      iterations: TEST_ITERATIONS,
+      macIterations: TEST_MAC_ITERATIONS
+    });
+    expect(bytesEqual(leafPkcs8, snapshot)).toBe(true);
+  });
+
   it("does not mutate the caller's certDer buffer", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const snapshot = new Uint8Array(issued.certDer);
     await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password: utf8("p"),
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -630,7 +854,7 @@ describe("exportPkcs12", () => {
     await exportPkcs12({
       certDer: leaf.certDer,
       chainDer: [chainEntry],
-      privateKey: leaf.privateKey,
+      privateKey: await toPkcs8(leaf.privateKey),
       password: utf8("p"),
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -643,10 +867,10 @@ describe("exportPkcs12", () => {
     // shared between the two PBES2 invocations (e.g. a future caching of
     // randomBytes() output for "performance"). Node would still accept the
     // PFX, so behavioural tests cannot catch this.
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password: utf8("salt-uniqueness"),
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS
@@ -660,12 +884,12 @@ describe("exportPkcs12", () => {
   });
 
   it("computes the MAC over the authSafe OCTET STRING value, not its TLV header", async () => {
-    const { issued } = await makeRootAndLeaf();
+    const { issued, leafPkcs8 } = await makeRootAndLeaf();
     const passphrase = "mac-range";
     const password = utf8(passphrase);
     const pfx = await exportPkcs12({
       certDer: issued.certDer,
-      privateKey: issued.privateKey,
+      privateKey: leafPkcs8,
       password,
       iterations: TEST_ITERATIONS,
       macIterations: TEST_MAC_ITERATIONS

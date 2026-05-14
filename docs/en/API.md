@@ -132,7 +132,7 @@ If you need a deterministic serial number, prefer `bigint`, `number`, or `Uint8A
 interface ExportPkcs12Input {
   certDer: Uint8Array;
   chainDer?: Uint8Array[];
-  privateKey: CryptoKey;          // ECDSA, must be extractable
+  privateKey: Uint8Array;         // PKCS#8 DER bytes; algorithm-agnostic
   password: Uint8Array;           // UTF-8 bytes; non-empty
   friendlyName?: Uint8Array;      // UTF-8 bytes, encoded as BMPString
   iterations?: number;            // PBKDF2, default 600_000
@@ -140,7 +140,9 @@ interface ExportPkcs12Input {
 }
 ```
 
-`password` is taken as a UTF-8 `Uint8Array` (not a `string`) so that callers can keep secret bytes off the immutable JS string heap. `friendlyName`, when present, is converted to a BMPString via a byte-stream UTF-8 → UTF-16BE conversion (no string round-trip). Internal buffers that hold password-derived material are wiped (`fill(0)`) after use.
+`privateKey` is passed as raw PKCS#8 DER bytes (`Uint8Array`), not a `CryptoKey`. PKCS#12 wrapping is algorithm-agnostic — the bytes are encrypted under PBES2 and embedded without any inspection of the inner key algorithm. This makes `exportPkcs12` a generic PKCS#12 packer that works with ECDSA, RSA, Ed25519, or any other algorithm whose PKCS#8 encoding you hold. (Note: EdgCA's issuance APIs are still limited to ECDSA P-256/P-384/P-521 — see [NON_GOALS](https://github.com/noz-ele/EdgCA/blob/main/docs/en/NON_GOALS.md).) Callers that hold a `CryptoKey` extract the bytes via `crypto.subtle.exportKey("pkcs8", key)` before calling.
+
+`password` is taken as a UTF-8 `Uint8Array` (not a `string`) so that callers can keep secret bytes off the immutable JS string heap. `friendlyName`, when present, is converted to a BMPString via a byte-stream UTF-8 → UTF-16BE conversion (no string round-trip). Internal buffers that hold password-derived material are wiped (`fill(0)`) after use. The caller's `privateKey` buffer is not mutated by the library; if the caller needs the bytes wiped, the caller does so after the call returns.
 
 ## Functions
 
@@ -542,7 +544,7 @@ function arrayBufferFromBytes(bytes: Uint8Array): ArrayBuffer;
 
 ### `exportPkcs12(input)`
 
-Bundles a leaf certificate, an optional issuer chain, and the matching ECDSA private key into a password-protected PFX (PKCS#12) file. The output is a `Uint8Array` of DER bytes ready to write as `.pfx` / `.p12`, hand to `tls.createSecureContext({ pfx, passphrase })`, or import into Win11+ / Server 2019+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux PKCS#12 consumers.
+Bundles a leaf certificate, an optional issuer chain, and the matching private key (as PKCS#8 DER bytes) into a password-protected PFX (PKCS#12) file. The key algorithm is not inspected — any PKCS#8 (ECDSA, RSA, Ed25519, …) passes through verbatim. The output is a `Uint8Array` of DER bytes ready to write as `.pfx` / `.p12`, hand to `tls.createSecureContext({ pfx, passphrase })`, or import into Win11+ / Server 2019+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux PKCS#12 consumers.
 
 ```ts
 function exportPkcs12(input: ExportPkcs12Input): Promise<Uint8Array>;
@@ -555,7 +557,7 @@ Algorithms (fixed):
 - Outer MAC: HMAC-SHA-256 with the key derived via the PKCS#12 v1 KDF (RFC 7292 Appendix B, ID = 3, u = 32, v = 64).
 - PBKDF2 prf is emitted explicitly as `hmacWithSha256` with `NULL` parameters; relying on the spec default (which means HMAC-SHA-1) is the most common silent-degradation trap and is intentionally avoided.
 
-Iteration counts default to `600_000` for PBKDF2 and `100_000` for the MAC KDF — these match OWASP's modern guidance and the OpenSSL 3 default. Both can be overridden per call (e.g. lower values for resource-constrained environments). Empty passwords throw; the encoder also rejects non-`Uint8Array` passwords / friendlyNames, non-extractable private keys, non-ECDSA keys, and non-positive iteration counts at the API boundary.
+Iteration counts default to `600_000` for PBKDF2 and `100_000` for the MAC KDF — these match OWASP's modern guidance and the OpenSSL 3 default. Both can be overridden per call (e.g. lower values for resource-constrained environments). Empty passwords throw; the encoder also rejects non-`Uint8Array` passwords / friendlyNames / `privateKey`, empty `privateKey`, and non-positive iteration counts at the API boundary.
 
 Out of scope (won't be produced and won't be accepted by re-import in scoped consumers): legacy 3DES / RC2 / SHA-1 PBE algorithms, PBMAC1, crlBag, secretBag, nested safeContents, envelopedData, and Windows 10 (or older) consumers. See [`docs/en/NON_GOALS.md`](https://github.com/noz-ele/EdgCA/blob/main/docs/en/NON_GOALS.md).
 
@@ -567,7 +569,8 @@ import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
 const pfx = await exportPkcs12({
   certDer: client.certDer,
   chainDer: [intermediate.certDer],
-  privateKey: client.privateKey,
+  // exportPkcs12 takes raw PKCS#8 DER bytes — extract them from your CryptoKey.
+  privateKey: new Uint8Array(await crypto.subtle.exportKey("pkcs8", client.privateKey)),
   password: new TextEncoder().encode(passwordString),
   friendlyName: new TextEncoder().encode("worker-client")
 });
@@ -593,7 +596,7 @@ Examples:
 - A `pathLenConstraint` exceeding the maximum two-level CA hierarchy.
 - `password` is empty, not a `Uint8Array`, or contains an invalid UTF-8 sequence (`exportPkcs12`).
 - `friendlyName` is provided but is not a `Uint8Array` (`exportPkcs12`).
-- `privateKey` is not extractable, or its algorithm is not ECDSA (`exportPkcs12`).
+- `privateKey` is not a non-empty `Uint8Array` of PKCS#8 DER bytes (`exportPkcs12`).
 - `iterations` or `macIterations` is not a positive integer (`exportPkcs12`).
 
 `verifyClientCertificateIssuedBy` returns a `boolean` for the issuer-identity check. No result type is provided for other validations (time, chain, revocation).

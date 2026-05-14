@@ -2,18 +2,25 @@
 
 > 日本語 | [English](../../README.md)
 
-EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理する自己 CA から mTLS 用 client certificate と文書署名用 certificate を発行するための小さな TypeScript ライブラリです。内部での鍵生成、mTLS leaf 向けの CSR ベース enrollment (PKCS#10 + 所持証明)、OS 証明書ストア取り込み用の PFX (PKCS#12) export に対応します。
+EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理する自己 CA から mTLS 用 client certificate と文書署名用 certificate を発行するための小さな TypeScript ライブラリです。
 
-目的は明確に絞っています。
+## 特徴
 
-- 自己署名 root CA を作る。
-- root CA から intermediate CA を発行する。
-- intermediate CA から mTLS 用 client certificate と秘密鍵を発行する。
-- 文書署名用 certificate (RFC 9336 `id-kp-documentSigning`) と秘密鍵を CA から発行する。CAdES / CMS / ASiC など文書署名 container 自体の生成は別 tooling の責務で、EdgCA は signer cert を作るだけ。
-- 受け取った client certificate が自分の CA から発行されたかを判定する。
-- 証明書と鍵を PEM/DER で入出力する。
-- 発行済み証明書 + 秘密鍵を password 付き PFX (PKCS#12) として OS 証明書ストア取り込み用に出力する (Win11+、macOS 15+、iOS/iPadOS 18+、modern Linux consumer 向け)。
-- 暗号演算は `globalThis.crypto.subtle` に委譲する。
+- **WebCrypto のみ・runtime 依存ゼロ。** 暗号演算は全て `globalThis.crypto.subtle` に委譲。Cloudflare Workers / Node.js 20+ / modern browser で polyfill や bundler shim なしに同じコードが動く。
+- **軽量。** v0.5.1 — tarball **44.4 kB** / 展開後 **164.5 kB** / 73 files。transitive dependency ゼロ。CLI も `node:util.parseArgs` のみ。(release ごとに再計測)
+- **CA 階層 (2 段)。** 自己署名 root CA を作る、必要なら root から intermediate CA を発行する。3 段以上の intermediate は意図的に scope 外。
+- **PFX (PKCS#12) bundling。** 証明書 + 秘密鍵 (+ 任意の chain) を password 付き `.pfx` / `.p12` にまとめ OS 証明書ストア (Win11+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux) 取り込み用に書き出す。algorithm 非依存で、任意の PKCS#8 DER bytes (ECDSA / RSA / Ed25519 等) を受ける。
+- **mTLS client certificate 発行。** 内部鍵生成、または下の CSR 経由で caller 管理の公開鍵から発行。
+- **PKCS#10 CSR サポート。** CSR の生成 (POP 込み)、受け取った CSR の parse (subject、要求 SAN、公開鍵、生 extensions/attributes)、POP 署名検証、CSR の公開鍵を入力とした証明書発行 (秘密鍵は library が一切触らない)。
+- **文書署名用 certificate (RFC 9336)。** EKU `id-kp-documentSigning` の leaf を発行。CAdES / CMS / ASiC tool 等の signer cert として使う (container 生成は別 tool)。
+- **発行元判定。** 受け取った client certificate が自 CA 発行かを判定 (issuer identity 確認のみ、完全な mTLS 検証ではない)。
+- **PEM/DER の encode/decode** (certificate と PKCS#10 CSR)。
+- **API 境界での秘密鍵 hygiene。** 秘密鍵は public API 上 `CryptoKey` (発行系) または `Uint8Array` PKCS#8 bytes (`exportPkcs12`) のみで扱い、`string` で受け渡さない。JS の string は immutable で GC まで heap に残り wipe できないため、秘密鍵を string で保持することを設計上避ける。PEM ↔ CryptoKey の変換は caller 側 (string 表現の寿命を caller が制御できるようにするため)。
+
+### 対応アルゴリズム
+
+- **発行 layer**: ECDSA NIST P-256 / P-384 / P-521 (それぞれ標準の SHA-256 / SHA-384 / SHA-512 とペア)。RSA、EdDSA、その他 curve は発行側では意図的に scope 外。
+- **PFX bundling (`exportPkcs12`)**: algorithm 非依存。任意の PKCS#8 DER bytes をそのまま wrap する。
 
 > ⚠ **PKI runtime ではありません。** EdgCA は発行 toolkit であり、汎用 PKI library や runtime ではありません。chain validation、失効確認 (CRL/OCSP)、鍵保管、ローテーションは**提供しません**。`verifyClientCertificateIssuedBy` は **mTLS 検証ではなく**、提示者の認証も**しません** — 詳細は下の [Verify](#verify-cloudflare-worker) 参照。CA を安全に運用するのは caller の責任です。完全な対象外 list は [NON_GOALS.md](NON_GOALS.md)。
 
@@ -164,7 +171,9 @@ import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
 const pfxBytes = await exportPkcs12({
   certDer: client.certDer,
   chainDer: [intermediate.certDer, root.certDer],   // 任意
-  privateKey: client.privateKey,                     // CryptoKey、extractable 必須
+  // exportPkcs12 は PKCS#8 DER bytes (algorithm 非依存) を受ける。CryptoKey ではない。
+  // CryptoKey を持っている場合は bytes を取り出して渡す:
+  privateKey: new Uint8Array(await crypto.subtle.exportKey("pkcs8", client.privateKey)),
   password: new TextEncoder().encode(passwordString),
   friendlyName: new TextEncoder().encode("worker-client") // 任意、BMPString として埋め込まれる
 });

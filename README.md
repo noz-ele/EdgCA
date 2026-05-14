@@ -2,22 +2,25 @@
 
 > [日本語](https://github.com/noz-ele/EdgCA/blob/main/docs/jp/README.md) | English
 
-EdgCA is a small TypeScript library that issues mTLS client certificates and document-signing certificates from a self-managed CA on Cloudflare Workers-compatible runtimes. It supports internal keygen, CSR-based enrollment for mTLS leaves (PKCS#10 + proof-of-possession), and PFX (PKCS#12) export for OS keystore import.
+EdgCA is a small TypeScript library for issuing mTLS client certificates and document-signing certificates from a self-managed CA on Cloudflare Workers-compatible runtimes.
 
-The scope is intentionally narrow:
+## Features
 
-- Create a self-signed root CA.
-- Issue an intermediate CA from a root CA.
-- Issue an mTLS client certificate and private key from an intermediate CA.
-- Issue an mTLS client certificate from a caller-provided public key (no private key returned). Pairs with the CSR helpers below.
-- Issue a document-signing certificate (RFC 9336 `id-kp-documentSigning`) and private key from a CA. Used as the signer cert for CAdES / CMS / ASiC-style document signatures, which are produced by separate tooling.
-- Parse a PKCS#10 CSR (subject, requested SAN, public key, raw extensions/attributes) and verify its proof-of-possession signature.
-- Decide whether a received client certificate was issued by your own CA.
-- Encode/decode certificates as PEM/DER. Keys are exchanged as `CryptoKey` only — the library never returns or accepts string forms (PEM, JWK, etc.) of private keys.
-- Bundle an issued cert + private key into a password-protected PFX (PKCS#12) file for OS keystore import (Win11+, macOS 15+, iOS/iPadOS 18+, modern Linux consumers).
-- Delegate all cryptographic operations to `globalThis.crypto.subtle`.
+- **WebCrypto-only, zero runtime dependencies.** All cryptographic operations go through `globalThis.crypto.subtle`. The same code runs on Cloudflare Workers, Node.js 20+, and modern browsers without polyfills or bundler shims.
+- **Lightweight.** v0.5.1 — tarball **44.4 kB** · unpacked **164.5 kB** · 73 files. No transitive dependencies; the CLI uses only `node:util.parseArgs`. (Re-measured on every release.)
+- **CA hierarchy (two-level).** Create a self-signed root CA and, optionally, issue an intermediate CA from it. Three or more levels of intermediates are intentionally out of scope.
+- **PFX (PKCS#12) bundling.** Wrap a cert + private key (and optional chain) into a password-protected `.pfx` / `.p12` for OS keystore import (Win11+, macOS 15+, iOS/iPadOS 18+, modern Linux). Algorithm-agnostic — accepts arbitrary PKCS#8 DER bytes (ECDSA, RSA, Ed25519, …).
+- **mTLS client certificate issuance.** Issue a leaf with internal key generation, or from a caller-managed key via the CSR path below.
+- **PKCS#10 CSR support.** Build a CSR (with proof-of-possession), parse a received CSR (subject, requested SAN, public key, raw extensions/attributes), verify its POP signature, and issue a cert from a CSR's public key without ever handling the private key.
+- **Document-signing certificates (RFC 9336).** Issue a leaf with EKU `id-kp-documentSigning`, usable as the signer cert for CAdES / CMS / ASiC tooling (containers themselves are built separately).
+- **Issuance check.** Decide whether a received client certificate was issued by your own CA (issuer-identity match — not full mTLS verification).
+- **PEM/DER encode/decode** for certificates and PKCS#10 CSRs.
+- **Secret key hygiene at the API boundary.** Private keys flow through the public API only as `CryptoKey` (issuance path) or `Uint8Array` PKCS#8 bytes (`exportPkcs12`); never as `string`. JS strings are immutable and stay on the heap until GC, so they cannot be wiped — secret material must not be held in that form. PEM ↔ CryptoKey conversion is the caller's job (so the lifetime of any string representation stays under caller control).
 
-ECDSA on **NIST P-256, P-384, and P-521** is supported throughout (signing, verification, CSR parsing). RSA, EdDSA, and other curves are intentionally out of scope.
+### Supported algorithms
+
+- **Issuance layer**: ECDSA on NIST P-256 / P-384 / P-521 (with the standard SHA-256 / SHA-384 / SHA-512 pairings). RSA, EdDSA, and other curves are intentionally out of scope at issuance.
+- **PFX bundling (`exportPkcs12`)**: algorithm-agnostic — accepts any PKCS#8 DER bytes verbatim.
 
 > ⚠ **Not a PKI runtime.** EdgCA is an issuance toolkit, not a general-purpose PKI library or runtime. It does **not** provide chain validation, revocation (CRL/OCSP), key storage, or rotation. `verifyClientCertificateIssuedBy` is **not** mTLS verification and does **not** authenticate the presenter — see [Verify](#verify-cloudflare-worker) below. Operating a CA safely is the caller's responsibility. Full list: [docs/en/NON_GOALS.md](https://github.com/noz-ele/EdgCA/blob/main/docs/en/NON_GOALS.md).
 
@@ -168,7 +171,9 @@ import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
 const pfxBytes = await exportPkcs12({
   certDer: client.certDer,
   chainDer: [intermediate.certDer, root.certDer],   // optional
-  privateKey: client.privateKey,                     // CryptoKey, must be extractable
+  // exportPkcs12 takes raw PKCS#8 DER bytes (algorithm-agnostic), not a CryptoKey.
+  // If you hold a CryptoKey, extract the bytes first:
+  privateKey: new Uint8Array(await crypto.subtle.exportKey("pkcs8", client.privateKey)),
   password: new TextEncoder().encode(passwordString),
   friendlyName: new TextEncoder().encode("worker-client") // optional, BMPString
 });

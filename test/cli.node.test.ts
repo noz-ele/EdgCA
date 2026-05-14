@@ -1,4 +1,6 @@
+import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
+import { generateKeyPairSync } from "node:crypto";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -543,25 +545,201 @@ describe("pem-to-pfx command", () => {
     ).rejects.toThrow();
   });
 
-  it("rejects when --cert and --key are for different keypairs (mismatch guard)", async () => {
-    const { certPath } = await writeIssuedClientToTemp();
-    // Overwrite the key file with an unrelated private key.
-    const unrelated = await generateKeyPair("P-256");
-    const unrelatedKeyPem = await cryptoKeyToPkcs8Pem(unrelated.privateKey);
-    const keyPath = path.join(tempDir, "unrelated.key.pem");
-    await writeFile(keyPath, unrelatedKeyPem, "utf8");
+  it("packs an RSA-2048 PEM (algorithm-agnostic pass-through)", async () => {
+    // pem-to-pfx is a generic PEM → PFX packer: it MUST accept any
+    // BEGIN PRIVATE KEY PEM, not just EdgCA-issuable ECDSA keys. Generate
+    // an RSA-2048 key via Node, write it as PEM, and confirm pem-to-pfx
+    // wraps it without interpreting the algorithm. Pair it with an
+    // EdgCA-issued ECDSA cert — the cert/key match guard was intentionally
+    // removed because pem-to-pfx no longer interprets the key.
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const keyPem = privateKey.export({ format: "pem", type: "pkcs8" }) as string;
+    const rsaPkcs8 = new Uint8Array(privateKey.export({ format: "der", type: "pkcs8" }) as Buffer);
 
+    const rsaKeyPath = path.join(tempDir, "rsa.key.pem");
+    await writeFile(rsaKeyPath, keyPem, "utf8");
+    const { certPath } = await writeIssuedClientToTemp();
+    const outPath = path.join(tempDir, "rsa-passthrough.pfx");
+    await pemToPfxCommand([
+      "--cert", certPath,
+      "--key", rsaKeyPath,
+      "--password", "dev",
+      "--out", outPath
+    ]);
+
+    const pfx = await readFile(outPath);
+    const parsed = await parsePfx(pfx, new TextEncoder().encode("dev"));
+    expect(bytesEqual(parsed.keyPkcs8, rsaPkcs8)).toBe(true);
+  });
+
+  it("rejects --cert pointing at a PRIVATE KEY PEM (wrong label)", async () => {
+    // Mirror of the --key wrong-label test: pem-to-pfx reads --cert via
+    // pemToDer (which expects a CERTIFICATE block) and must reject when
+    // the file is actually a key.
+    const { keyPath } = await writeIssuedClientToTemp();
+    const kp = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    const keyPem = kp.privateKey.export({ format: "pem", type: "pkcs8" }) as string;
+    const certPath = path.join(tempDir, "wrong.cert.pem");
+    await writeFile(certPath, keyPem, "utf8");
     await expect(
       pemToPfxCommand([
         "--cert", certPath,
         "--key", keyPath,
         "--password", "dev",
-        "--out", path.join(tempDir, "should-not-exist.pfx")
+        "--out", path.join(tempDir, "wrong-cert.pfx")
       ])
-    ).rejects.toThrow(/does not match/i);
+    ).rejects.toThrow();
+  });
 
-    // And the output file must not have been written.
-    await expect(stat(path.join(tempDir, "should-not-exist.pfx"))).rejects.toThrow();
+  it("rejects --cert with a malformed base64 body", async () => {
+    const { keyPath } = await writeIssuedClientToTemp();
+    const bogusPem =
+      "-----BEGIN CERTIFICATE-----\n" +
+      "not base64 @@@\n" +
+      "-----END CERTIFICATE-----\n";
+    const certPath = path.join(tempDir, "bogus.cert.pem");
+    await writeFile(certPath, bogusPem, "utf8");
+    await expect(
+      pemToPfxCommand([
+        "--cert", certPath,
+        "--key", keyPath,
+        "--password", "dev",
+        "--out", path.join(tempDir, "bogus-cert.pfx")
+      ])
+    ).rejects.toThrow();
+  });
+
+  it("rejects --cert pointing at an empty file", async () => {
+    const { keyPath } = await writeIssuedClientToTemp();
+    const certPath = path.join(tempDir, "empty.cert.pem");
+    await writeFile(certPath, "", "utf8");
+    await expect(
+      pemToPfxCommand([
+        "--cert", certPath,
+        "--key", keyPath,
+        "--password", "dev",
+        "--out", path.join(tempDir, "empty-cert.pfx")
+      ])
+    ).rejects.toThrow();
+  });
+
+  it("rejects --cert that is not PEM at all (no header)", async () => {
+    const { keyPath } = await writeIssuedClientToTemp();
+    const certPath = path.join(tempDir, "garbage.cert.pem");
+    await writeFile(certPath, "just some random text, no PEM headers here\n", "utf8");
+    await expect(
+      pemToPfxCommand([
+        "--cert", certPath,
+        "--key", keyPath,
+        "--password", "dev",
+        "--out", path.join(tempDir, "garbage-cert.pfx")
+      ])
+    ).rejects.toThrow();
+  });
+
+  it("rejects --key with an EC PRIVATE KEY (SEC1) label — only PKCS#8 PEM is accepted", async () => {
+    // Node's openssl-derived tooling commonly emits SEC1 (`BEGIN EC PRIVATE
+    // KEY`) for raw EC keys. pem-to-pfx expects PKCS#8 (`BEGIN PRIVATE
+    // KEY`) and must reject SEC1 at the PEM-label boundary rather than
+    // silently mis-interpret it.
+    const { certPath } = await writeIssuedClientToTemp();
+    const kp = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    const sec1Pem = kp.privateKey.export({ format: "pem", type: "sec1" }) as string;
+    expect(sec1Pem.startsWith("-----BEGIN EC PRIVATE KEY-----")).toBe(true);
+    const keyPath = path.join(tempDir, "sec1.key.pem");
+    await writeFile(keyPath, sec1Pem, "utf8");
+    await expect(
+      pemToPfxCommand([
+        "--cert", certPath,
+        "--key", keyPath,
+        "--password", "dev",
+        "--out", path.join(tempDir, "sec1.pfx")
+      ])
+    ).rejects.toThrow(/PRIVATE KEY/);
+  });
+
+  it("rejects --key with an ENCRYPTED PRIVATE KEY label (out of scope per NON_GOALS)", async () => {
+    // Encrypted PKCS#8 PEM is intentionally out of scope. pem-to-pfx must
+    // reject this at the label boundary; it does not attempt to decrypt.
+    const { certPath } = await writeIssuedClientToTemp();
+    const encryptedPem =
+      "-----BEGIN ENCRYPTED PRIVATE KEY-----\n" +
+      "MIIBHzBJBgkqhkiG9w0BBQ0wPDAbBgkqhkiG9w0BBQwwDgQI...\n" +
+      "-----END ENCRYPTED PRIVATE KEY-----\n";
+    const keyPath = path.join(tempDir, "encrypted.key.pem");
+    await writeFile(keyPath, encryptedPem, "utf8");
+    await expect(
+      pemToPfxCommand([
+        "--cert", certPath,
+        "--key", keyPath,
+        "--password", "dev",
+        "--out", path.join(tempDir, "encrypted.pfx")
+      ])
+    ).rejects.toThrow(/PRIVATE KEY/);
+  });
+
+  it("rejects --key whose PEM body is malformed (invalid base64)", async () => {
+    const { certPath } = await writeIssuedClientToTemp();
+    const bogusPem =
+      "-----BEGIN PRIVATE KEY-----\n" +
+      "this is not base64 @@@\n" +
+      "-----END PRIVATE KEY-----\n";
+    const keyPath = path.join(tempDir, "bogus.key.pem");
+    await writeFile(keyPath, bogusPem, "utf8");
+    await expect(
+      pemToPfxCommand([
+        "--cert", certPath,
+        "--key", keyPath,
+        "--password", "dev",
+        "--out", path.join(tempDir, "bogus.pfx")
+      ])
+    ).rejects.toThrow();
+  });
+
+  it("rejects --key that is not PEM at all (no header)", async () => {
+    const { certPath } = await writeIssuedClientToTemp();
+    const keyPath = path.join(tempDir, "garbage.key.pem");
+    await writeFile(keyPath, "just some random text, no PEM headers here\n", "utf8");
+    await expect(
+      pemToPfxCommand([
+        "--cert", certPath,
+        "--key", keyPath,
+        "--password", "dev",
+        "--out", path.join(tempDir, "garbage.pfx")
+      ])
+    ).rejects.toThrow();
+  });
+
+  it("accepts a mismatched cert/key pair (mismatch guard intentionally removed)", async () => {
+    // pem-to-pfx is now a true pass-through. The earlier sign/verify-based
+    // mismatch guard was removed because it required interpreting the key
+    // algorithm (CryptoKey path), which conflicts with the algorithm-
+    // agnostic design. This test pins the new contract: an unrelated key
+    // is wrapped without error. If a future change silently re-introduces
+    // a mismatch check, this test will fail and force explicit re-evaluation.
+    const { certPath } = await writeIssuedClientToTemp();
+    const unrelated = await generateKeyPair("P-256");
+    const unrelatedKeyPem = await cryptoKeyToPkcs8Pem(unrelated.privateKey);
+    const keyPath = path.join(tempDir, "unrelated.key.pem");
+    await writeFile(keyPath, unrelatedKeyPem, "utf8");
+
+    const outPath = path.join(tempDir, "mismatched.pfx");
+    await pemToPfxCommand([
+      "--cert", certPath,
+      "--key", keyPath,
+      "--password", "dev",
+      "--out", outPath
+    ]);
+
+    // Structurally valid PFX must be written; the wrapped key bag must
+    // contain exactly the unrelated key's PKCS#8 (proves no algorithm
+    // detour, no transformation).
+    const pfx = await readFile(outPath);
+    const parsed = await parsePfx(pfx, new TextEncoder().encode("dev"));
+    const unrelatedPkcs8 = new Uint8Array(
+      await crypto.subtle.exportKey("pkcs8", unrelated.privateKey)
+    );
+    expect(bytesEqual(parsed.keyPkcs8, unrelatedPkcs8)).toBe(true);
   });
 
   it("treats an empty --chain file as 'no chain' rather than failing", async () => {
@@ -597,6 +775,55 @@ describe("pem-to-pfx command", () => {
     ]);
     expect(emptyParsed.certBags.length).toBe(1);
     expect(noParsed.certBags.length).toBe(1);
+  });
+
+  it("rejects a --chain file with mixed valid CERTIFICATE blocks and a wrong-label block", async () => {
+    // Operator error: an issuer-only chain that accidentally has a trailing
+    // PRIVATE KEY block (e.g. concatenation order mistake). Even though the
+    // first block parses as a valid certificate, the second wrong-label
+    // block must abort the whole pem-to-pfx run rather than silently
+    // truncating or skipping.
+    const { certPath, keyPath } = await writeIssuedClientToTemp();
+    const root = await createRootCA({
+      subject: [{ type: "CN", value: "Mixed Chain Root" }],
+      days: 30
+    });
+    const wrongKp = await generateKeyPair("P-256");
+    const mixed = root.certPem + (await cryptoKeyToPkcs8Pem(wrongKp.privateKey));
+    const chainPath = path.join(tempDir, "mixed.chain.pem");
+    await writeFile(chainPath, mixed, "utf8");
+    await expect(
+      pemToPfxCommand([
+        "--cert", certPath,
+        "--key", keyPath,
+        "--chain", chainPath,
+        "--password", "dev",
+        "--out", path.join(tempDir, "mixed-chain.pfx")
+      ])
+    ).rejects.toThrow(/CERTIFICATE/);
+  });
+
+  it("rejects a --chain file with a valid CERTIFICATE block followed by malformed base64", async () => {
+    const { certPath, keyPath } = await writeIssuedClientToTemp();
+    const root = await createRootCA({
+      subject: [{ type: "CN", value: "Malformed Chain Root" }],
+      days: 30
+    });
+    const bogusBlock =
+      "-----BEGIN CERTIFICATE-----\n" +
+      "not base64 @@@\n" +
+      "-----END CERTIFICATE-----\n";
+    const chainPath = path.join(tempDir, "malformed-second.chain.pem");
+    await writeFile(chainPath, root.certPem + bogusBlock, "utf8");
+    await expect(
+      pemToPfxCommand([
+        "--cert", certPath,
+        "--key", keyPath,
+        "--chain", chainPath,
+        "--password", "dev",
+        "--out", path.join(tempDir, "malformed-second-chain.pfx")
+      ])
+    ).rejects.toThrow();
   });
 
   it("rejects a --chain file containing a non-CERTIFICATE PEM block", async () => {

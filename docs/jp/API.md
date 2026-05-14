@@ -132,7 +132,7 @@ type SerialNumber = bigint | number | string | Uint8Array;
 interface ExportPkcs12Input {
   certDer: Uint8Array;
   chainDer?: Uint8Array[];
-  privateKey: CryptoKey;          // ECDSA、extractable=true 必須
+  privateKey: Uint8Array;         // PKCS#8 DER bytes、algorithm 非依存
   password: Uint8Array;           // UTF-8 bytes、空 NG
   friendlyName?: Uint8Array;      // UTF-8 bytes、内部で BMPString に変換
   iterations?: number;            // PBKDF2、default 600_000
@@ -140,7 +140,9 @@ interface ExportPkcs12Input {
 }
 ```
 
-`password` は UTF-8 の `Uint8Array` で受け取ります (`string` 不可)。秘密の bytes を JS の immutable な string heap に置かない設計のためです。`friendlyName` を渡した場合は byte stream で UTF-8 → UTF-16BE 変換を行い (string を経由しません) BMPString として埋め込みます。password 由来の中間 buffer は使用後 `fill(0)` で wipe します。
+`privateKey` は **PKCS#8 DER bytes (`Uint8Array`)** で受け取ります (`CryptoKey` ではありません)。PKCS#12 wrapping は内部 algorithm を見ない byte-level の操作 (PBES2 で暗号化して埋め込むだけ) なので、`exportPkcs12` は ECDSA / RSA / Ed25519 など任意の algorithm の PKCS#8 を受けます。発行 API (createRootCA 等) は引き続き ECDSA P-256/P-384/P-521 限定です ([NON_GOALS](NON_GOALS.md) 参照)。`CryptoKey` を持っている caller は `crypto.subtle.exportKey("pkcs8", key)` で bytes を取り出してから渡してください。
+
+`password` は UTF-8 の `Uint8Array` で受け取ります (`string` 不可)。秘密の bytes を JS の immutable な string heap に置かない設計のためです。`friendlyName` を渡した場合は byte stream で UTF-8 → UTF-16BE 変換を行い (string を経由しません) BMPString として埋め込みます。password 由来の中間 buffer は使用後 `fill(0)` で wipe します。`privateKey` の buffer は library 側で書き換えません (caller 所有のため)。wipe したい場合は呼び出し後に caller が行ってください。
 
 ## Functions
 
@@ -542,7 +544,7 @@ function arrayBufferFromBytes(bytes: Uint8Array): ArrayBuffer;
 
 ### `exportPkcs12(input)`
 
-leaf 証明書、任意の issuer chain、対応する ECDSA 秘密鍵をひとまとめにした password 付き PFX (PKCS#12) を組み立てます。出力は DER bytes の `Uint8Array` で、そのまま `.pfx` / `.p12` として書き出したり、`tls.createSecureContext({ pfx, passphrase })` に渡したり、Win11+ / Server 2019+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux PKCS#12 consumer に取り込めます。
+leaf 証明書、任意の issuer chain、対応する秘密鍵 (PKCS#8 DER bytes) をひとまとめにした password 付き PFX (PKCS#12) を組み立てます。鍵の algorithm は inspect せず、任意の PKCS#8 (ECDSA / RSA / Ed25519 など) をそのまま通します。出力は DER bytes の `Uint8Array` で、そのまま `.pfx` / `.p12` として書き出したり、`tls.createSecureContext({ pfx, passphrase })` に渡したり、Win11+ / Server 2019+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux PKCS#12 consumer に取り込めます。
 
 ```ts
 function exportPkcs12(input: ExportPkcs12Input): Promise<Uint8Array>;
@@ -555,7 +557,7 @@ algorithm は固定です:
 - 外側 MAC: HMAC-SHA-256、鍵は PKCS#12 v1 KDF (RFC 7292 App. B、ID = 3、u = 32、v = 64) で導出。
 - PBKDF2 の prf は `hmacWithSha256` + `NULL` parameters を**明示**して emit します。仕様 default に頼ると HMAC-SHA-1 にサイレント縮退する罠があるため意図的に避けています。
 
-反復回数の default は PBKDF2 が `600_000`、MAC KDF が `100_000` で、OWASP の現代的推奨と OpenSSL 3 の default と揃えています。両方とも引数で上書きできます (リソース制約のある環境向けに小さい値を渡せる)。空 password、`Uint8Array` 以外の password / friendlyName、非 extractable な秘密鍵、ECDSA 以外の鍵、非正の反復回数は API 境界で reject します。
+反復回数の default は PBKDF2 が `600_000`、MAC KDF が `100_000` で、OWASP の現代的推奨と OpenSSL 3 の default と揃えています。両方とも引数で上書きできます (リソース制約のある環境向けに小さい値を渡せる)。空 password、`Uint8Array` 以外の password / friendlyName / `privateKey`、空 `privateKey`、非正の反復回数は API 境界で reject します。
 
 対象外 (出力しない、scope consumer での再 import も対象外): 旧式 3DES / RC2 / SHA-1 PBE algorithm、PBMAC1、crlBag、secretBag、入れ子 safeContents、envelopedData、Windows 10 (以前)。詳細は [`docs/jp/NON_GOALS.md`](NON_GOALS.md)。
 
@@ -567,7 +569,8 @@ import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
 const pfx = await exportPkcs12({
   certDer: client.certDer,
   chainDer: [intermediate.certDer],
-  privateKey: client.privateKey,
+  // exportPkcs12 は PKCS#8 DER bytes を受けるので、CryptoKey から取り出して渡す。
+  privateKey: new Uint8Array(await crypto.subtle.exportKey("pkcs8", client.privateKey)),
   password: new TextEncoder().encode(passwordString),
   friendlyName: new TextEncoder().encode("worker-client")
 });
@@ -593,7 +596,7 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 - 最大 2 段の CA 階層を超える `pathLenConstraint` を指定した。
 - `password` が空 / `Uint8Array` ではない / 不正な UTF-8 sequence を含む (`exportPkcs12`)。
 - `friendlyName` を渡したが `Uint8Array` ではない (`exportPkcs12`)。
-- `privateKey` が extractable ではない、または algorithm が ECDSA ではない (`exportPkcs12`)。
+- `privateKey` が空でない `Uint8Array` (PKCS#8 DER bytes) ではない (`exportPkcs12`)。
 - `iterations` または `macIterations` が正の整数ではない (`exportPkcs12`)。
 
 `verifyClientCertificateIssuedBy` は CA 局判定の `boolean` を返します。それ以外の検証 (時刻、chain、revocation) を表す result type は提供しません。

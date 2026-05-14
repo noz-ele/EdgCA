@@ -17,7 +17,7 @@ import { parseCertificateDer } from "./parser.js";
 export interface ExportPkcs12Input {
   certDer: Uint8Array;
   chainDer?: Uint8Array[];
-  privateKey: CryptoKey;
+  privateKey: Uint8Array;
   password: Uint8Array;
   friendlyName?: Uint8Array;
   iterations?: number;
@@ -80,9 +80,7 @@ export async function exportPkcs12(input: ExportPkcs12Input): Promise<Uint8Array
     ))
   );
 
-  const pkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", input.privateKey));
-  const keyEncrypted = await pbes2EncryptAesCbc(pkcs8, pbkdf2BaseKey, iterations);
-  wipe(pkcs8);
+  const keyEncrypted = await pbes2EncryptAesCbc(input.privateKey, pbkdf2BaseKey, iterations);
 
   const epki = sequence(keyEncrypted.algorithm, octetString(keyEncrypted.ciphertext));
   const keyBag = buildKeySafeBag(epki, leafAttrs);
@@ -129,14 +127,24 @@ export async function exportPkcs12(input: ExportPkcs12Input): Promise<Uint8Array
 }
 
 function validateInput(input: ExportPkcs12Input, iterations: number, macIterations: number): void {
+  if (!(input.certDer instanceof Uint8Array) || input.certDer.length === 0) {
+    throw new Error("certDer must be a non-empty Uint8Array of certificate DER bytes");
+  }
+  if (input.chainDer !== undefined) {
+    if (!Array.isArray(input.chainDer)) {
+      throw new Error("chainDer must be an array of Uint8Array");
+    }
+    for (const entry of input.chainDer) {
+      if (!(entry instanceof Uint8Array) || entry.length === 0) {
+        throw new Error("chainDer entries must be non-empty Uint8Array");
+      }
+    }
+  }
   if (!(input.password instanceof Uint8Array) || input.password.length === 0) {
     throw new Error("password must be a non-empty Uint8Array of UTF-8 bytes");
   }
-  if (!input.privateKey.extractable) {
-    throw new Error("privateKey must be extractable");
-  }
-  if ((input.privateKey.algorithm as { name?: string }).name !== "ECDSA") {
-    throw new Error("privateKey must be an ECDSA key");
+  if (!(input.privateKey instanceof Uint8Array) || input.privateKey.length === 0) {
+    throw new Error("privateKey must be a non-empty Uint8Array of PKCS#8 DER bytes");
   }
   if (!Number.isInteger(iterations) || iterations < 1) {
     throw new Error("iterations must be a positive integer");
