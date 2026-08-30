@@ -15,6 +15,8 @@ import {
   createCertificateSigningRequest,
   parseCertificateSigningRequest,
   verifyCertificateSigningRequestSignature,
+  verifyCertificateIssuedBy,
+  verifyCertificateChain,
   verifyClientCertificateIssuedBy,
   certificateToPem,
   csrToPem,
@@ -28,7 +30,30 @@ import {
 } from "@noz-ele/edgca";
 ```
 
-PFX 専用 surface だけ取り込みたい場合は `import { exportPkcs12 } from "@noz-ele/edgca/pkcs12"` で CA / CSR / verify モジュールを引き込まずに利用できます。
+root entry point は後方互換の aggregate surface とし、全 API を再 export します。用途を限定して bundle したい場合は次の subpath を使います。
+
+```ts
+// CA 作成・証明書発行だけ。verify module を静的 import しない。
+import {
+  createRootCA,
+  importCertificateAuthority,
+  issueIntermediateCA,
+  issueClientCert,
+  issueClientCertForPublicKey,
+  issueDocumentSigningCert
+} from "@noz-ele/edgca/issuer";
+
+// 公開証明書による検証だけ。issuer module と CA 秘密鍵は不要。
+import {
+  verifyCertificateIssuedBy,
+  verifyCertificateChain
+} from "@noz-ele/edgca/verify";
+
+// PFX 組み立てだけ。
+import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
+```
+
+`package.json` は `sideEffects: false` を維持する。subpath は tree-shaking の有無に依存せず、発行だけを使う consumer が今後拡大する verify module を静的 import しないための境界です。`./verify` の public API は PEM / DER と公開鍵だけを扱い、`CertificateAuthority.privateKey` を要求しません。
 
 ECDSA は **NIST P-256 / P-384 / P-521** をサポートします。内部生成のデフォルト curve は P-256 で、それ以外を使う場合は WebCrypto で `CryptoKeyPair` を生成し `keyPair` option で渡します。各 curve に対応する hash は標準ペアリング (P-256/SHA-256、P-384/SHA-384、P-521/SHA-512) です。CA hierarchy 内で curve を混在できます (例: P-256 root → P-384 intermediate → P-521 leaf)。各 cert の signatureAlgorithm は **issuer** の curve を反映します。
 
@@ -126,6 +151,50 @@ type SerialNumber = bigint | number | string | Uint8Array;
 
 決定的な serial number が必要な場合は、`bigint`、`number`、または `Uint8Array` の利用を推奨します。`string` は decimal digits または hexadecimal text として扱われます。
 
+### `CertificateVerificationPurpose`
+
+```ts
+type CertificateVerificationPurpose =
+  | "ca"
+  | "clientAuth"
+  | "documentSigning";
+```
+
+`verifyCertificateChain` の target certificate に期待する profile。省略時は用途固有の leaf / CA profile を検査せず、chain、時刻、issuer CA 制約、署名、critical extension だけを検証します。
+
+### `CertificateChainVerificationResult`
+
+```ts
+type CertificateVerificationFailureReason =
+  | "not-yet-valid"
+  | "expired"
+  | "issuer-name-mismatch"
+  | "key-identifier-mismatch"
+  | "invalid-signature"
+  | "issuer-not-ca"
+  | "issuer-key-usage-invalid"
+  | "path-length-exceeded"
+  | "target-profile-invalid"
+  | "invalid-chain-order"
+  | "duplicate-extension"
+  | "signature-algorithm-mismatch"
+  | "unsupported-critical-extension"
+  | "untrusted-root";
+
+type CertificateChainVerificationResult =
+  | {
+      valid: true;
+      trustedRootIndex: number;
+    }
+  | {
+      valid: false;
+      reason: CertificateVerificationFailureReason;
+      certificateIndex: number;
+    };
+```
+
+`certificateIndex` は `0` が target certificate、`1` がその直接 issuer で、chain 上の位置を表します。`untrusted-root` では次に必要だった terminal issuer の位置を示します。trust 条件を満たさない well-formed certificate は `valid: false`。PEM / DER として解析不能、未対応 signature algorithm、API option 不正は結果値ではなく例外です。
+
 ### `ExportPkcs12Input`
 
 ```ts
@@ -172,7 +241,7 @@ root certificate は self-signed です。返却値の `issuerChainPem` は `""`
 
 `pathLenConstraint` 省略時は `1` です。指定できる値は `0` または `1` です。`0` の root CA は client certificate だけを発行でき、intermediate CA は発行できません。
 
-`keyPair` を渡すと、その鍵ペアで root CA を発行します。鍵管理を呼び出し側に寄せるため、長期保管されている鍵を WebCrypto `importKey` で `CryptoKey` 化してから渡す利用形態が推奨です。省略時は内部で P-256 ECDSA 鍵を生成します (テスト・PoC 用途)。`privateKey` の usages に `"sign"`、`publicKey` の usages に `"verify"` が含まれている必要があります。
+`keyPair` を渡すと、その鍵ペアで root CA を発行します。鍵管理を呼び出し側に寄せるため、長期保管されている鍵を WebCrypto `importKey` で `CryptoKey` 化してから渡す利用形態が推奨です。省略時は内部で P-256 ECDSA 鍵を生成します (テスト・PoC 用途)。`privateKey` の usages に `"sign"`、`publicKey` の usages に `"verify"` が含まれている必要があります。両鍵は署名・検証 round-trip で対応を確認し、不一致なら発行前に throw します。
 
 ### `issueIntermediateCA(options)`
 
@@ -203,7 +272,7 @@ issuer root CA が `pathLenConstraint=0` の場合、この関数は例外を投
 
 返却される CA の `issuerChainPem` には parent chain が保存されます。
 
-`keyPair` を渡すと、その鍵ペアで intermediate CA を発行します。`createRootCA` と同じく、保管済みの鍵を `CryptoKey` 化してから渡す形が推奨です。省略時は内部で P-256 ECDSA 鍵を生成します。
+`keyPair` を渡すと、その鍵ペアで intermediate CA を発行します。`createRootCA` と同じく、保管済みの鍵を `CryptoKey` 化してから渡す形が推奨です。秘密鍵と公開鍵の対応を発行前に確認します。省略時は内部で P-256 ECDSA 鍵を生成します。
 
 ### `issueClientCert(options)`
 
@@ -392,7 +461,81 @@ intermediate CA を再 import する場合は、`issuerChainPem` に parent chai
 
 呼び出し側は永続化された PKCS#8 PEM などを `crypto.subtle.importKey("pkcs8", …, { name: "ECDSA", namedCurve: "P-256" }, extractable, ["sign"])` で `CryptoKey` 化してから渡してください。library は format 変換を行いません。
 
+### `verifyCertificateIssuedBy(options)`
+
+certificate と直接の issuer 1 本の関係を検証します。issuer の秘密鍵や `CertificateAuthority` は不要です。
+
+```ts
+function verifyCertificateIssuedBy(options: {
+  certificatePem: string;
+  issuerCertificatePem: string;
+  at?: Date | number;
+}): Promise<boolean>;
+```
+
+次のすべてが成立した場合に `true` を返します。
+
+- certificate の issuer DN と issuer certificate の subject DN が一致する。
+- certificate の AKI と issuer certificate の SKI が一致する。AKI / SKI が必要な位置に存在しなければ `false`。
+- certificate の署名を issuer certificate の公開鍵で検証できる。
+- certificate と issuer certificate の DER 内 `notBefore ≤ at ≤ notAfter` が成立する。`at` の default は `Date.now()`。
+- issuer certificate が `BasicConstraints CA=true` と `KeyUsage keyCertSign` を持つ。
+- 重複 extension、署名 algorithm の内外不一致、未対応 critical extension がない。
+
+この関数は 1 link だけを対象とし、target certificate の EKU profile や root への到達は検証しません。chain 全体と用途を確認する場合は `verifyCertificateChain` を使います。trust 条件の不成立は `false`、構文上処理不能な PEM / DER、未対応 algorithm、不正な `at` は例外です。
+
+### `verifyCertificateChain(options)`
+
+caller が順序を明示した certificate chain を、明示された trust anchor まで検証します。
+
+```ts
+function verifyCertificateChain(options: {
+  certificatePem: string;
+  intermediateCertificatesPem?: readonly string[];
+  trustedRootCertificatesPem: readonly string[];
+  at?: Date | number;
+  purpose?: CertificateVerificationPurpose;
+}): Promise<CertificateChainVerificationResult>;
+```
+
+入力規則:
+
+- `intermediateCertificatesPem` は target の**直接 issuer から順番**に渡す。EdgCA の 2-level CA 制約に合わせ、要素数は `0` または `1`。
+- `trustedRootCertificatesPem` は 1 本以上を明示する。OS / runtime の trust store は参照しない。
+- `at` の default は `Date.now()`。target、intermediate、選択された root の DER 内有効期間を同じ時刻で検証する。
+- `purpose` は target に期待する profile。`"ca"` は `CA=true` と `keyCertSign`、`"clientAuth"` は `CA=false`、`digitalSignature`、EKU `clientAuth`、`"documentSigning"` は `CA=false`、`digitalSignature`、`contentCommitment`、EKU `id-kp-documentSigning` を要求する。
+
+検証内容:
+
+1. target から順に、各 child / issuer 間の issuer DN、AKI / SKI、署名を検証する。
+2. issuer として使う intermediate / root の `BasicConstraints CA=true`、`KeyUsage keyCertSign`、`pathLenConstraint` を検証する。
+3. target、intermediate、root の DER 内 `UTCTime` / `GeneralizedTime` を parse し、有効期間を検証する。
+4. 重複 extension、未対応 critical extension、TBSCertificate と外側の signature algorithm 不一致を拒否する。
+5. chain 末尾の issuer が `trustedRootCertificatesPem` の certificate と DER 全体で一致することを要求する。DN だけの一致では信頼しない。
+6. 選択された EdgCA root の自己署名と CA 制約を整合性 check する。root の信頼自体は自己署名ではなく、caller が trust anchor として明示したことから得る。
+
+この関数は unordered な候補群から issuer を探索しません。AIA 取得、OS trust store、CRL / OCSP、TLS handshake の proof-of-possession、server hostname 照合も行いません。
+
+```ts
+import { verifyCertificateChain } from "@noz-ele/edgca/verify";
+
+const result = await verifyCertificateChain({
+  certificatePem: clientPem,
+  intermediateCertificatesPem: [intermediatePem],
+  trustedRootCertificatesPem: [rootPem],
+  purpose: "clientAuth"
+});
+
+if (!result.valid) {
+  throw new Error(
+    `certificate chain rejected at ${result.certificateIndex}: ${result.reason}`
+  );
+}
+```
+
 ### `verifyClientCertificateIssuedBy(options)`
+
+> **互換 API:** 新規コードでは `@noz-ele/edgca/verify` の `verifyCertificateIssuedBy` または `verifyCertificateChain` を推奨します。この API は既存 caller のため root entry point に残し、現在の引数と挙動を変更しません。
 
 `options.ca` が `options.certPem` を発行した issuer か判定します。Cloudflare Workers で `request.cf.tlsClientAuth.certRFC9440` を decode した PEM を受け取り、自分の自己 CA が発行した cert かを application 側で確認するための post-handshake な発行元 check です。
 
@@ -415,7 +558,7 @@ function verifyClientCertificateIssuedBy(options: {
 - (`validity` 指定時) `validity.notBefore ≤ now ≤ validity.notAfter` が成立する。
 - `certPem` の issuer DN が `ca` の subject DN と完全一致する。
 - `certPem` の Authority Key Identifier が `ca` の Subject Key Identifier と完全一致する。`certPem` が AKI を持たない場合は `false`。
-- `certPem` の signature を `ca.publicKey` で verify できる (ECDSA P-256 / SHA-256)。
+- `certPem` の signature を `ca.publicKey` で verify できる (ECDSA P-256 / P-384 / P-521 と標準 hash pairing)。
 
 PEM や DER として parse 不能な入力は `Error` を投げます (CA 不一致 = `false`、入力破損 = throw、と扱いを分ける)。
 
@@ -599,7 +742,14 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 - `privateKey` が空でない `Uint8Array` (PKCS#8 DER bytes) ではない (`exportPkcs12`)。
 - `iterations` または `macIterations` が正の整数ではない (`exportPkcs12`)。
 
-`verifyClientCertificateIssuedBy` は CA 局判定の `boolean` を返します。それ以外の検証 (時刻、chain、revocation) を表す result type は提供しません。
+検証 API は「処理不能」と「処理できたが信頼条件を満たさない」を分離します。
+
+- 壊れた PEM / DER、未対応 algorithm、不正な option は `Error`。
+- `verifyCertificateIssuedBy` の issuer 不一致、期限外、署名不正は `false`。
+- `verifyCertificateChain` の chain / profile / trust 不成立は `CertificateChainVerificationResult` の `{ valid: false, reason, certificateIndex }`。
+- legacy `verifyClientCertificateIssuedBy` は従来どおり CA 局判定の `boolean`。
+
+失効状態は検証対象外なので result reason に含めません。
 
 ## Field Reference
 
@@ -740,15 +890,19 @@ CA を「秘密鍵 + 自 cert + 上位 chain」の 3 点で 1 つにまとめた
 
 ## Non-Goals
 
-EdgCA は次を提供しません。
+EdgCA は限定的な chain validation を提供しますが、次は提供しません。
 
 - server certificate 発行。leaf scope は mTLS client cert と文書署名 cert のみ。
 - 文書署名 leaf の CSR 経由発行 (`issueDocumentSigningCertForPublicKey` は v1 では存在しない)。
 - 文書署名 leaf への SAN (`dnsNames` / `ipAddresses` / `emailAddresses`)。
 - CAdES / CMS / PAdES / XAdES / ASiC の builder や verifier。EdgCA は文書署名 cert を発行するだけで、document を含む署名 container の生成は別の関心事。
 - 公開 certificate parsing API。
-- certificate chain validation (chain 遡及・PKI path building)。`verifyClientCertificateIssuedBy` は直接の発行者 1 本に対する identity 確認に限定。
-- cert からの時刻 field の抽出。`verifyClientCertificateIssuedBy` の `validity` option は時刻 check を提供するが、`notBefore` / `notAfter` は呼び出し側が外から渡す (`cf.tlsClientAuth.certNotBefore` / `certNotAfter` を `Date` に変換するのは application 側)。
+- unordered な certificate 候補群からの PKI path building / issuer 自動探索、AIA からの intermediate 取得。
+- OS / runtime trust store の参照。trusted root は caller が明示する。
+- intermediate を 2 本以上含む CA hierarchy / chain 検証。最大 `root → intermediate → leaf`。
+- Cloudflare 固有の textual time parser。certificate DER 内の `UTCTime` / `GeneralizedTime` は verify module が parse するが、`cf.tlsClientAuth.certNotBefore` / `certNotAfter` の文字列変換は application 側。
 - CRL、OCSP、失効 DB、失効確認。
+- TLS handshake と certificate private key の proof-of-possession 検証。
+- server certificate の hostname / SAN identity 検証。
 - 鍵の保管、暗号化保存、Cloudflare storage 連携。
 - key の format 変換 (PEM ↔ CryptoKey、JWK ↔ CryptoKey 等)。永続化形式の選択と変換は呼び出し側で WebCrypto API を直接使って行う。

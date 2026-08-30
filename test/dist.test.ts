@@ -17,6 +17,28 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 }
 
 describe("published dist API", () => {
+  it("exposes isolated issuer and verify entry points", async () => {
+    const issuer = await import("../dist/issuer.js");
+    const verifier = await import("../dist/verify.js");
+    expect("verifyCertificateChain" in issuer).toBe(false);
+    expect("createRootCA" in verifier).toBe(false);
+
+    const root = await issuer.createRootCA({
+      subject: [{ type: "CN", value: "entrypoint-root" }],
+      days: 3650
+    });
+    const client = await issuer.issueClientCert({
+      ca: root,
+      subject: [{ type: "CN", value: "entrypoint-client" }],
+      days: 30
+    });
+    await expect(verifier.verifyCertificateChain({
+      certificatePem: client.certPem,
+      trustedRootCertificatesPem: [root.certPem],
+      purpose: "clientAuth"
+    })).resolves.toEqual({ valid: true, trustedRootIndex: 0 });
+  });
+
   it("honors caller-provided CA private keys", async () => {
     const edgca = await import("../dist/index.js");
     const rootSubject = [{ type: "CN" as const, value: "published-root" }];

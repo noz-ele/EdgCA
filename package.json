@@ -1,7 +1,7 @@
 {
   "name": "@noz-ele/edgca",
-  "version": "0.5.2",
-  "description": "A small Cloudflare Workers-friendly toolkit for issuing self-managed CA and mTLS client certificates.",
+  "version": "0.6.0",
+  "description": "A small Cloudflare Workers-friendly toolkit for issuing and validating bounded self-managed CA chains.",
   "type": "module",
   "license": "MIT",
   "author": "NOZ-ELE",
@@ -46,6 +46,14 @@
     "./pkcs12": {
       "types": "./dist/pkcs12.d.ts",
       "import": "./dist/pkcs12.js"
+    },
+    "./issuer": {
+      "types": "./dist/issuer.d.ts",
+      "import": "./dist/issuer.js"
+    },
+    "./verify": {
+      "types": "./dist/verify.d.ts",
+      "import": "./dist/verify.js"
     }
   },
   "types": "./dist/index.d.ts",

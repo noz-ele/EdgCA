@@ -266,6 +266,7 @@ function assertIssuerChainPem(chainPem: string): void {
 
 async function resolveKeyPair(provided: CryptoKeyPair | undefined): Promise<CryptoKeyPair> {
   if (provided !== undefined) {
+    await assertKeyPairMatches(provided.privateKey, provided.publicKey);
     return provided;
   }
   return generateKeyPair();

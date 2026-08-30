@@ -28,7 +28,14 @@ export { generateKeyPair, type SupportedCurve } from "./crypto.js";
 export { arrayBufferFromBytes, bytesEqual } from "./bytes.js";
 export { exportPkcs12, type ExportPkcs12Input } from "./pkcs12.js";
 export {
+  verifyCertificateChain,
+  verifyCertificateIssuedBy,
   verifyClientCertificateIssuedBy,
+  type CertificateChainVerificationResult,
+  type CertificateVerificationFailureReason,
+  type CertificateVerificationPurpose,
+  type VerifyCertificateChainOptions,
+  type VerifyCertificateIssuedByOptions,
   type VerifyClientCertificateIssuedByOptions,
   type VerifyClientCertificateValidity
 } from "./verify.js";

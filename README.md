@@ -2,27 +2,29 @@
 
 > [日本語](https://github.com/noz-ele/EdgCA/blob/main/docs/jp/README.md) | English
 
-EdgCA is a small TypeScript library for issuing mTLS client certificates and document-signing certificates from a self-managed CA on Cloudflare Workers-compatible runtimes.
+EdgCA is a small TypeScript library for issuing mTLS client certificates and document-signing certificates from a self-managed CA, and for bounded certificate validation against explicit trust anchors, on Cloudflare Workers-compatible runtimes.
 
 ## Features
 
 - **WebCrypto-only, zero runtime dependencies.** All cryptographic operations go through `globalThis.crypto.subtle`. The same code runs on Cloudflare Workers, Node.js 20+, and modern browsers without polyfills or bundler shims.
-- **Lightweight.** v0.5.2 — tarball **45.2 kB** · unpacked **167.3 kB** · 73 files. No transitive dependencies; the CLI uses only `node:util.parseArgs`. (Re-measured on every release.)
+- **Lightweight.** v0.6.0 — tarball **49.8 kB** · unpacked **192.8 kB** · 76 files. No transitive dependencies; the CLI uses only `node:util.parseArgs`. (Re-measured on every release.)
 - **CA hierarchy (two-level).** Create a self-signed root CA and, optionally, issue an intermediate CA from it. Three or more levels of intermediates are intentionally out of scope.
 - **PFX (PKCS#12) bundling.** Wrap a cert + private key (and optional chain) into a password-protected `.pfx` / `.p12` for OS keystore import (Win11+, macOS 15+, iOS/iPadOS 18+, modern Linux). Algorithm-agnostic — accepts arbitrary PKCS#8 DER bytes (ECDSA, RSA, Ed25519, …).
 - **mTLS client certificate issuance.** Issue a leaf with internal key generation, or from a caller-managed key via the CSR path below.
 - **PKCS#10 CSR support.** Build a CSR (with proof-of-possession), parse a received CSR (subject, requested SAN, public key, raw extensions/attributes), verify its POP signature, and issue a cert from a CSR's public key without ever handling the private key.
 - **Document-signing certificates (RFC 9336).** Issue a leaf with EKU `id-kp-documentSigning`, usable as the signer cert for CAdES / CMS / ASiC tooling (containers themselves are built separately).
 - **Issuance check.** Decide whether a received client certificate was issued by your own CA (issuer-identity match — not full mTLS verification).
+- **Bounded chain validation.** Validate a caller-ordered `leaf → intermediate → trusted root` chain, including signatures, validity, CA constraints, and target purpose. Automatic PKI path building and revocation are intentionally out of scope.
 - **PEM/DER encode/decode** for certificates and PKCS#10 CSRs.
 - **Secret key hygiene at the API boundary.** Private keys flow through the public API only as `CryptoKey` (issuance path) or `Uint8Array` PKCS#8 bytes (`exportPkcs12`); never as `string`. JS strings are immutable and stay on the heap until GC, so they cannot be wiped — secret material must not be held in that form. PEM ↔ CryptoKey conversion is the caller's job (so the lifetime of any string representation stays under caller control).
 
 ### Supported algorithms
 
 - **Issuance layer**: ECDSA on NIST P-256 / P-384 / P-521 (with the standard SHA-256 / SHA-384 / SHA-512 pairings). RSA, EdDSA, and other curves are intentionally out of scope at issuance.
+- **Verification layer**: the same ECDSA NIST P-256 / P-384 / P-521 set. It is intentionally not a general algorithm verifier.
 - **PFX bundling (`exportPkcs12`)**: algorithm-agnostic — accepts any PKCS#8 DER bytes verbatim.
 
-> ⚠ **Not a PKI runtime.** EdgCA is an issuance toolkit, not a general-purpose PKI library or runtime. It does **not** provide chain validation, revocation (CRL/OCSP), key storage, or rotation. `verifyClientCertificateIssuedBy` is **not** mTLS verification and does **not** authenticate the presenter — see [Verify](#verify-cloudflare-worker) below. Operating a CA safely is the caller's responsibility. Full list: [docs/en/NON_GOALS.md](https://github.com/noz-ele/EdgCA/blob/main/docs/en/NON_GOALS.md).
+> ⚠ **Not a general PKI runtime.** Chain validation is limited to a caller-ordered hierarchy no deeper than `root → intermediate → leaf`, with explicit trusted roots. EdgCA does not provide automatic path building, AIA fetching, OS trust-store access, revocation (CRL/OCSP), key storage, or rotation. Certificate validation also does not prove that the presenter holds the private key — see [Verify](#verify-cloudflare-worker) below. Full list: [docs/en/NON_GOALS.md](https://github.com/noz-ele/EdgCA/blob/main/docs/en/NON_GOALS.md).
 
 ## Contents
 
@@ -30,12 +32,13 @@ EdgCA is a small TypeScript library for issuing mTLS client certificates and doc
 - [Quick Start](#quick-start) — root → intermediate → client cert (incl. PFX bundling)
 - [Issue a document-signing certificate](#issue-a-document-signing-certificate) — RFC 9336 `id-kp-documentSigning` leaf
 - [Verify on Cloudflare Worker](#verify-cloudflare-worker) — confirm a cert was issued by your CA
+- [Certificate chain verification](#certificate-chain-verification) — validate an explicit chain to a trusted root
 - [Issue from a CSR](#issue-from-a-csr) — accept a caller-managed key via PKCS#10 + POP
 - [Subject](#subject) · [Scope](#scope) · [Key Handling](#key-handling) · [Development](#development) · [API Documentation](#api-documentation)
 
 ## Status
 
-EdgCA is in **v0.3.x — early stabilization**. The author is currently validating the library against real Cloudflare Workers deployments, and the API surface may still shift. To keep that validation focused, **external Issues and PRs are temporarily restricted** and will be re-opened once the API settles. Reading, cloning, forking, and `npm install` are unaffected.
+EdgCA is in **v0.6.x — early stabilization**. The author is currently validating the library against real Cloudflare Workers deployments, and the API surface may still shift. To keep that validation focused, **external Issues and PRs are temporarily restricted** and will be re-opened once the API settles. Reading, cloning, forking, and `npm install` are unaffected.
 
 ## Install
 
@@ -44,6 +47,18 @@ npm install @noz-ele/edgca
 ```
 
 ESM-only (`"type": "module"`). Runs on any runtime where `globalThis.crypto.subtle` is available (Cloudflare Workers, Node.js 20+, modern browsers, etc.). CommonJS `require` is not supported.
+
+### Package entry points
+
+The root `@noz-ele/edgca` entry point remains an aggregate surface for compatibility. Use a purpose-specific subpath when you want an issuance-only bundle to avoid statically importing the verification implementation regardless of tree shaking:
+
+```ts
+import { createRootCA, issueClientCert } from "@noz-ele/edgca/issuer";
+import { verifyCertificateChain } from "@noz-ele/edgca/verify";
+import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
+```
+
+`./issuer` owns CA creation/import and intermediate/leaf issuance. `./verify` validates direct issuers and chains using public certificates only; it does not statically import the issuer module. The package remains `sideEffects: false`.
 
 ## CLI
 
@@ -241,7 +256,7 @@ There is no `issueDocumentSigningCertForPublicKey` (CSR variant) in v1, and EdgC
 >
 > Also out of scope (not checked by this function): `BasicConstraints CA=false`, `EKU clientAuth`, revocation, and chain walking.
 
-This section assumes a deployment where **Cloudflare has already extracted the client certificate** and exposes it to your application via `request.cf.tlsClientAuth`. EdgCA participates in neither the TLS handshake nor DER parsing of the cert; it consumes the values Cloudflare hands you and performs the issuance check above.
+This section assumes a deployment where **Cloudflare has already extracted the client certificate** and exposes it to your application via `request.cf.tlsClientAuth`. EdgCA does not participate in the TLS handshake; it parses the certificate fields needed for the issuance check above.
 
 ### Formats Cloudflare exposes after extraction
 
@@ -325,6 +340,35 @@ export default {
 - "Not issued by us" and "outside the validity window" return `false`; malformed PEM/DER throws. The two error categories are deliberately split.
 - Pass the **direct issuer (one cert)** as `ca`. Verifying a leaf issued via an intermediate against the root will return `false` — chain walking is not performed.
 
+## Certificate chain verification
+
+The `@noz-ele/edgca/verify` surface validates a direct issuer or a bounded chain using public certificates only. No CA private key is required.
+
+```ts
+import { verifyCertificateChain } from "@noz-ele/edgca/verify";
+
+const result = await verifyCertificateChain({
+  certificatePem: clientPem,
+  // Direct issuer first. EdgCA accepts zero or one intermediate.
+  intermediateCertificatesPem: [intermediatePem],
+  // No OS trust store is consulted; trust anchors are explicit.
+  trustedRootCertificatesPem: [rootPem],
+  purpose: "clientAuth"
+});
+
+if (!result.valid) {
+  throw new Error(
+    `certificate chain rejected at ${result.certificateIndex}: ${result.reason}`
+  );
+}
+```
+
+The verifier checks each child/issuer DN, AKI/SKI, and signature; DER validity times; issuer `BasicConstraints`, `keyCertSign`, and `pathLenConstraint`; the requested target purpose; duplicate and unsupported critical extensions; and inner/outer signature-algorithm consistency. The terminal issuer must be one of the explicitly supplied trusted-root certificates.
+
+This is not an automatic PKI path builder. The caller supplies intermediates in order, and the supported maximum is `root → intermediate → leaf`. EdgCA does not fetch AIA URLs, consult an OS trust store, check CRL/OCSP, verify TLS proof-of-possession, or perform server hostname matching. A valid chain does not prove that the presenter holds the leaf private key.
+
+The existing `verifyClientCertificateIssuedBy` remains unchanged for compatibility. New code should use `verifyCertificateIssuedBy` for one direct link or `verifyCertificateChain` to reach an explicit trusted root.
+
 ## Issue from a CSR
 
 When a client manages its own private key and submits a PKCS#10 CSR, EdgCA parses the CSR, verifies its proof-of-possession signature, and issues a certificate that embeds the CSR's public key. The library does **not** auto-adopt the CSR's claimed subject / SAN — the caller passes those explicitly, derived from whatever policy applies in the application layer.
@@ -394,6 +438,9 @@ In scope:
 - Document-signing certificate issuance with EKU `id-kp-documentSigning` (RFC 9336) and `keyUsage digitalSignature, contentCommitment` — internal key generation only, no SAN.
 - CSR (PKCS#10) parsing and proof-of-possession signature verification.
 - Identity check that a cert was issued by your own CA (`verifyClientCertificateIssuedBy`, with optional time-validity check).
+- Direct public-certificate issuer validation (`verifyCertificateIssuedBy`).
+- Caller-ordered chain validation up to `root → intermediate → leaf` (`verifyCertificateChain`), including DER validity, CA/Key Usage/EKU/path-length constraints, and critical-extension policy.
+- Purpose-specific entry points (`@noz-ele/edgca/issuer` and `@noz-ele/edgca/verify`).
 - PEM/DER helpers (certificates only — keys are exchanged as `CryptoKey`).
 - PFX (PKCS#12) export of an issued cert + private key with PBES2 (PBKDF2-HMAC-SHA-256 + AES-256-CBC) and HMAC-SHA-256 MAC, scoped to modern consumers (Win11+, Server 2019+, macOS 15+, iOS/iPadOS 18+).
 - Basic Constraints, Key Usage, Extended Key Usage, Subject Alternative Name, SKI, AKI.
@@ -404,9 +451,12 @@ Intentionally out of scope:
 - Document-signing certificate issuance from a caller-provided public key (`issueDocumentSigningCertForPublicKey`) — not in v1.
 - SAN (`dnsNames` / `ipAddresses` / `emailAddresses`) on document-signing leaves.
 - CAdES / CMS / PAdES / XAdES / ASiC document signing or container building. EdgCA only issues the signing certificate; producing a signed document or container is a separate concern.
-- Public chain-validation APIs.
-- Extracting time fields from a cert. `verifyClientCertificateIssuedBy`'s `validity` option performs the time check, but the `notBefore` / `notAfter` values are passed in by the caller from `cf.tlsClientAuth`.
+- Automatic PKI path building from unordered certificates, issuer discovery, or AIA fetching.
+- OS/runtime trust-store access; trusted roots must be supplied explicitly.
+- Chains with two or more intermediate CAs.
+- Parsing Cloudflare-specific textual times. The verification module reads DER certificate times; the legacy API still accepts caller-supplied validity values.
 - CRL, OCSP, revocation databases, revocation checks.
+- TLS-handshake proof-of-possession and server hostname/SAN identity verification.
 - Key storage, encryption-at-rest, rotation-state persistence, and integration with KV/D1/R2/Secrets.
 - RSA, EdDSA, other elliptic curves (CSRs signed with these algorithms are rejected at parse time).
 - Legacy PKCS#12 algorithms (3DES, RC2, SHA-1 PBE), PBMAC1, empty passwords, crlBag / secretBag / nested safeContents, and consumers older than the modern targets above are intentionally not produced or supported by `exportPkcs12`.
@@ -425,11 +475,14 @@ EdgCA only handles key generation, signing, and SPKI export of public keys. Wher
 
 Root and intermediate CAs are long-lived. To keep key management on the caller's side, `createRootCA` and `issueIntermediateCA` accept an existing `keyPair: CryptoKeyPair`. This lets the caller's key-management infrastructure handle the full key lifecycle (generation, storage, rotation) consistently — including the choice of persistence format — which is the recommended path.
 
+EdgCA verifies a supplied public/private pair with a sign/verify round trip before issuance. If the private key is imported with `extractable: false`, its public key cannot be reconstructed by exporting that private key; persist and import the public SPKI separately.
+
 ```ts
 // Restore a CryptoKeyPair from whatever persistence format you use.
-// Below is one example that converts PKCS#8 PEM stored in a vault.
+// Below is one example that imports separately stored PKCS#8 and SPKI PEM.
 async function loadKeyPair(label: string): Promise<CryptoKeyPair> {
   const pkcs8 = pemToDer(loadFromVault(`${label}-private-pem`));
+  const spki = pemToDer(loadFromVault(`${label}-public-pem`));
   const privateKey = await crypto.subtle.importKey(
     "pkcs8",
     pkcs8,
@@ -437,14 +490,9 @@ async function loadKeyPair(label: string): Promise<CryptoKeyPair> {
     /* extractable */ false,
     ["sign"]
   );
-  // Derive the matching public key. If you also persist the public key as
-  // SPKI, import that directly instead of round-tripping through JWK.
-  const jwk = await crypto.subtle.exportKey("jwk", privateKey);
-  delete jwk.d;
-  jwk.key_ops = ["verify"];
   const publicKey = await crypto.subtle.importKey(
-    "jwk",
-    jwk,
+    "spki",
+    spki,
     { name: "ECDSA", namedCurve: "P-256" },
     true,
     ["verify"]

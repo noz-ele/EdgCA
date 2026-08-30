@@ -2,18 +2,29 @@
 
 > [日本語](../jp/NON_GOALS.md) | English
 
-EdgCA is a stateless issuance library that only "emits a cert based on the input it was given." The following are **intentionally not implemented**. When triaging a bug report or improvement suggestion, check this list first.
+EdgCA is a stateless library for certificate issuance and bounded validation against explicitly supplied trust anchors. It is not a general PKI runtime. The following are **intentionally not implemented**. When triaging a bug report or improvement suggestion, check this list first.
 
 ## 1. Validation
 
-The **only** validation API EdgCA provides is `verifyClientCertificateIssuedBy` (an identity check against a single direct issuer: issuer DN match + AKI/SKI match + signature verify). Anything beyond that is intentionally not implemented:
+Validation is isolated under `@noz-ele/edgca/verify`. The supported boundary is deliberately narrow:
 
-- **Certificate chain validation.** `importCertificateAuthority` does not cryptographically verify whether `issuerChainPem` actually issued `certPem`. If the caller supplies a bogus chain, a bogus chain is what gets emitted. We do not adopt "if we can validate, we should validate."
-- **Chain walking / PKI path building.** `verifyClientCertificateIssuedBy` is also limited to **a single direct issuer**. Verifying a leaf issued via an intermediate against the root is out of scope.
-- **Extracting time fields from the cert itself.** `verifyClientCertificateIssuedBy`'s `validity` option provides a time check, but the values for `notBefore` / `notAfter` **are passed in by the caller** (the cert is not parsed for them). Converting `cf.tlsClientAuth.certNotBefore` / `certNotAfter` strings to `Date` is the application's responsibility. The library does not contain a parser for X.509 textual formats (`"Dec  4 23:59:59 2025 GMT"`, etc.) or for DER `UTCTime` / `GeneralizedTime`.
-- **CRL / OCSP / revocation databases / revocation checks.**
+- `verifyCertificateIssuedBy` checks one certificate/direct-issuer relationship: issuer/subject DN, AKI/SKI, signature, DER validity, and issuer CA constraints.
+- `verifyCertificateChain` validates the caller-ordered chain from the leaf's direct issuer to an explicitly supplied trusted root.
+- Chain validation checks DER `UTCTime`/`GeneralizedTime`, Basic Constraints, Key Usage, Extended Key Usage, `pathLenConstraint`, known critical extensions, and signature-algorithm consistency.
+- Well-formed certificates that fail trust policy return a failure value; unparseable PEM/DER and unsupported algorithms throw.
+
+The following remain intentionally unimplemented:
+
+- **PKI path building / automatic issuer discovery.** EdgCA does not search unordered certificate sets or fetch intermediates from AIA URLs. The caller supplies `leaf → intermediate → root` order.
+- **OS/runtime trust-store access.** Trust anchors are explicit in `trustedRootCertificatesPem`; a matching subject DN alone does not establish trust.
+- **Chains containing two or more intermediates.** The maximum remains `root → intermediate → leaf`.
+- **CRL / OCSP / revocation databases / revocation checks**, including validation that requires network access.
+- **TLS-handshake proof-of-possession.** A valid chain does not prove that the presenter holds the corresponding private key.
+- **Server identity / hostname validation.** EdgCA does not compare SAN dNSName entries with a destination hostname.
+- **Cloudflare-specific text parsers.** The application converts strings such as `cf.tlsClientAuth.certNotBefore`; the verification module parses only DER `UTCTime`/`GeneralizedTime`.
 - **DER sanity checks in `certificateToPem(der)`.** Even a shallow check of "first byte is `0x30` (SEQUENCE)" is not implemented. It cannot distinguish a real cert from junk and would only provide false reassurance. Doing it properly would require a full `parseCertificateDer`, which exceeds the responsibility of an encoder. This stays a low-level encoder.
-- **RFC compliance checks for imported certs.** Passing a `certPem` that is expired, has a broken signature, has unexpected extensions, has multiple basicConstraints, etc., does not raise an error — issuance proceeds based on the input as given.
+- **Automatic validation during issuer import.** `importCertificateAuthority` does not validate the signature, time, or constraints of `issuerChainPem`. A caller that needs this check explicitly invokes `verifyCertificateChain` before issuance. Strict parsing in the verification module does not change issuer-module import behavior.
+- **A public certificate-parsing API.** The certificate parser remains an internal verification implementation, not a general X.509 inspection surface.
 
 ## 2. State management
 
@@ -39,9 +50,9 @@ Bad input should throw. Convenience features such as trim, dedup, and auto-compl
 - **No SAN on document-signing leaves.** `issueDocumentSigningCert` does not accept `dnsNames` / `ipAddresses` / `emailAddresses`. Document-signing certs identify the signer through the Subject DN, not through SAN. If a downstream profile requires SAN, the caller adds it after extending the library; v1 does not.
 - **No CSR-based document-signing variant in v1.** There is no `issueDocumentSigningCertForPublicKey`. Internal-keygen-only. The mTLS counterpart exists because client-managed key flows are common for mTLS; document-signing leaves are typically CA-issued with the key staying on the CA host or HSM, so the parity is not yet justified.
 - **No CAdES / CMS / PAdES / XAdES / ASiC building or verification.** EdgCA only issues the document-signing certificate. Wrapping a document and signing it (CAdES detached, ASiC-E container, etc.) is a separate concern and lives outside this package.
-- **No public certificate parsing API.** `parser.ts` is internal — `cf.tlsClientAuth.cert*` already exposes parsed values from Cloudflare, so duplicating that here adds nothing. CSR parsing **is** in scope (`parseCertificateSigningRequest`) because no Cloudflare-side equivalent exists; CSRs come from the client over the application layer.
+- **No public certificate parsing API.** `parser.ts` is internal to verification and issuance. CSR parsing **is** in scope (`parseCertificateSigningRequest`) because CSRs arrive from clients at the application layer and have no equivalent Cloudflare-side parser.
 - **No CA hierarchy beyond two levels.** At most `root → intermediate → client`. An intermediate cannot have an intermediate underneath it.
-- **No RSA / Ed25519 / non-NIST curves at the issuance layer.** Cert issuance (`createRootCA` / `issueIntermediateCA` / `issueClientCert` / `issueDocumentSigningCert`) and CSR APIs require ECDSA on NIST P-256 / P-384 / P-521 (with their standard SHA-256 / SHA-384 / SHA-512 pairings). Other algorithms are rejected at the issuance/CSR boundary. **`exportPkcs12` is separate**: it is an algorithm-agnostic PKCS#12 packer that accepts any PKCS#8 DER bytes (RSA, Ed25519, ECDSA on any curve, …) because PKCS#12 wrapping is purely byte-level (PBES2-encrypt and embed) and has no need to inspect the inner key algorithm.
+- **No RSA / Ed25519 / non-NIST curves at the issuance or verification layers.** Issuance, CSR, and certificate-verification APIs require ECDSA on NIST P-256 / P-384 / P-521 with the standard SHA-256 / SHA-384 / SHA-512 pairings. **`exportPkcs12` is separate**: it is an algorithm-agnostic PKCS#12 packer that accepts any PKCS#8 DER bytes because wrapping does not inspect the inner key algorithm.
 - **No issuance policy.** When parsing a CSR, the library extracts the requested subject/SAN and verifies POP, but does not decide whether the CSR should be honored. The caller chooses what subject/SAN values go into the issued cert.
 - **No encrypted PKCS#8 PEM (encrypted private key).** PFX (PKCS#12) bundling the encrypted private key is a separate and supported format — see `exportPkcs12` — but standalone `BEGIN ENCRYPTED PRIVATE KEY` PEM is not.
 - **No legacy PKCS#12 algorithms or non-modern consumers.** `exportPkcs12` emits PBES2 + PBKDF2-HMAC-SHA-256 + AES-256-CBC for both bags and HMAC-SHA-256 for the outer MAC, and targets Win11+ / Server 2019+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux PKCS#12 consumers. 3DES / RC2 / SHA-1 PBE algorithms, PBMAC1, crlBag, secretBag, nested safeContents, envelopedData, empty passwords, and Windows 10 (and older) are intentionally out of scope.
@@ -49,6 +60,7 @@ Bad input should throw. Convenience features such as trim, dedup, and auto-compl
 
 ## 5. Conditions for changing these policies
 
-- The validation surface is reconsidered only if "identity verification that cannot be done on the Cloudflare side and can only be done on the application side" grows.
+- Validation can be considered when it remains explicit, stateless, WebCrypto-only, and bounded to the two-level CA hierarchy.
+- Requirements involving issuer discovery, external retrieval, persistent state, or revocation infrastructure belong in a dedicated PKI library/runtime.
 - "Same input → different / unexpected DER" along the single "external input → output cert" path is a **bug** and is in scope for fixing.
 - "If the caller passes lying or duplicate input, the result is wrong" and "if the caller does not share state, things break" are **by design** and are not in scope for fixing.

@@ -2,27 +2,29 @@
 
 > 日本語 | [English](../../README.md)
 
-EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理する自己 CA から mTLS 用 client certificate と文書署名用 certificate を発行するための小さな TypeScript ライブラリです。
+EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理する自己 CA から mTLS 用 client certificate と文書署名用 certificate を発行し、明示した trust anchor に対する限定的な証明書検証を行うための小さな TypeScript ライブラリです。
 
 ## 特徴
 
 - **WebCrypto のみ・runtime 依存ゼロ。** 暗号演算は全て `globalThis.crypto.subtle` に委譲。Cloudflare Workers / Node.js 20+ / modern browser で polyfill や bundler shim なしに同じコードが動く。
-- **軽量。** v0.5.2 — tarball **45.2 kB** / 展開後 **167.3 kB** / 73 files。transitive dependency ゼロ。CLI も `node:util.parseArgs` のみ。(release ごとに再計測)
+- **軽量。** v0.6.0 — tarball **49.8 kB** / 展開後 **192.8 kB** / 76 files。transitive dependency ゼロ。CLI も `node:util.parseArgs` のみ。(release ごとに再計測)
 - **CA 階層 (2 段)。** 自己署名 root CA を作る、必要なら root から intermediate CA を発行する。3 段以上の intermediate は意図的に scope 外。
 - **PFX (PKCS#12) bundling。** 証明書 + 秘密鍵 (+ 任意の chain) を password 付き `.pfx` / `.p12` にまとめ OS 証明書ストア (Win11+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux) 取り込み用に書き出す。algorithm 非依存で、任意の PKCS#8 DER bytes (ECDSA / RSA / Ed25519 等) を受ける。
 - **mTLS client certificate 発行。** 内部鍵生成、または下の CSR 経由で caller 管理の公開鍵から発行。
 - **PKCS#10 CSR サポート。** CSR の生成 (POP 込み)、受け取った CSR の parse (subject、要求 SAN、公開鍵、生 extensions/attributes)、POP 署名検証、CSR の公開鍵を入力とした証明書発行 (秘密鍵は library が一切触らない)。
 - **文書署名用 certificate (RFC 9336)。** EKU `id-kp-documentSigning` の leaf を発行。CAdES / CMS / ASiC tool 等の signer cert として使う (container 生成は別 tool)。
 - **発行元判定。** 受け取った client certificate が自 CA 発行かを判定 (issuer identity 確認のみ、完全な mTLS 検証ではない)。
+- **限定的な chain validation。** caller が順番を明示した `leaf → intermediate → trusted root` の署名、期限、CA 制約、用途を検証。PKI path の自動探索や失効確認は行わない。
 - **PEM/DER の encode/decode** (certificate と PKCS#10 CSR)。
 - **API 境界での秘密鍵 hygiene。** 秘密鍵は public API 上 `CryptoKey` (発行系) または `Uint8Array` PKCS#8 bytes (`exportPkcs12`) のみで扱い、`string` で受け渡さない。JS の string は immutable で GC まで heap に残り wipe できないため、秘密鍵を string で保持することを設計上避ける。PEM ↔ CryptoKey の変換は caller 側 (string 表現の寿命を caller が制御できるようにするため)。
 
 ### 対応アルゴリズム
 
 - **発行 layer**: ECDSA NIST P-256 / P-384 / P-521 (それぞれ標準の SHA-256 / SHA-384 / SHA-512 とペア)。RSA、EdDSA、その他 curve は発行側では意図的に scope 外。
+- **検証 layer**: 発行 layer と同じ ECDSA NIST P-256 / P-384 / P-521。汎用 algorithm verifier にはしない。
 - **PFX bundling (`exportPkcs12`)**: algorithm 非依存。任意の PKCS#8 DER bytes をそのまま wrap する。
 
-> ⚠ **PKI runtime ではありません。** EdgCA は発行 toolkit であり、汎用 PKI library や runtime ではありません。chain validation、失効確認 (CRL/OCSP)、鍵保管、ローテーションは**提供しません**。`verifyClientCertificateIssuedBy` は **mTLS 検証ではなく**、提示者の認証も**しません** — 詳細は下の [Verify](#verify-cloudflare-worker) 参照。CA を安全に運用するのは caller の責任です。完全な対象外 list は [NON_GOALS.md](NON_GOALS.md)。
+> ⚠ **汎用 PKI runtime ではありません。** chain validation は、caller が順序と trusted root を明示する最大 `root → intermediate → leaf` の範囲だけです。PKI path building、OS trust store、AIA 取得、失効確認 (CRL/OCSP)、鍵保管、ローテーションは提供しません。また certificate の検証は、提示者が秘密鍵を持つことの証明ではありません。詳細は [Verify](#verify-cloudflare-worker) と [NON_GOALS.md](NON_GOALS.md) を参照してください。
 
 ## Contents
 
@@ -30,12 +32,13 @@ EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理�
 - [Quick Start](#quick-start) — root → intermediate → client cert を発行 (PFX 束ね手順も含む)
 - [文書署名用 certificate を発行する](#文書署名用-certificate-を発行する) — RFC 9336 `id-kp-documentSigning` の leaf を発行
 - [Verify (Cloudflare Worker)](#verify-cloudflare-worker) — 自 CA から発行されたかを判定
+- [Certificate chain verification](#certificate-chain-verification) — 明示した chain を trusted root まで検証
 - [CSR から発行する](#csr-から発行する) — client が秘密鍵を保持する構成 (PKCS#10 + POP)
 - [Subject](#subject) · [Scope](#scope) · [Key Handling](#key-handling) · [Development](#development) · [API Documentation](#api-documentation)
 
 ## Status
 
-EdgCA は **v0.3.x の初期安定化フェーズ**です。作者が実際の Cloudflare Workers 環境で検証している最中で、API が変わる可能性があります。検証に集中するため、**外部からの Issue と PR は一時的に制限**しており、API が落ち着いた後に再開します。read / clone / fork / `npm install` は通常通り可能です。
+EdgCA は **v0.6.x の初期安定化フェーズ**です。作者が実際の Cloudflare Workers 環境で検証している最中で、API が変わる可能性があります。検証に集中するため、**外部からの Issue と PR は一時的に制限**しており、API が落ち着いた後に再開します。read / clone / fork / `npm install` は通常通り可能です。
 
 ## Install
 
@@ -44,6 +47,23 @@ npm install @noz-ele/edgca
 ```
 
 ESM 専用 (`"type": "module"`) で、`globalThis.crypto.subtle` が動く runtime (Cloudflare Workers、Node.js 20+、modern browser 等) で動作します。CommonJS からの `require` は対象外です。
+
+### Package entry points
+
+root の `@noz-ele/edgca` は後方互換のため全 API を再 export します。用途別 subpath を使うと、発行だけを使う bundle に検証実装が入ることを tree-shaking の成否に依存せず避けられます。
+
+```ts
+// CA 作成・証明書発行だけ
+import { createRootCA, issueClientCert } from "@noz-ele/edgca/issuer";
+
+// 公開証明書による検証だけ (CA 秘密鍵は不要)
+import { verifyCertificateChain } from "@noz-ele/edgca/verify";
+
+// PFX 組み立てだけ
+import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
+```
+
+`./issuer` は CA の作成・import・intermediate / leaf 発行を担当します。`./verify` は直接 issuer と chain の検証を担当し、発行 module を静的 import しません。`package.json` の `sideEffects: false` も維持します。
 
 ## CLI
 
@@ -241,7 +261,7 @@ const signer = await issueDocumentSigningCert({
 >
 > その他の対象外 (この関数では検証しません): `BasicConstraints CA=false`、`EKU clientAuth`、失効確認、chain walking。
 
-このセクションは、**Cloudflare 側で client certificate が抽出済み**で、その値が `request.cf.tlsClientAuth` 経由で application に渡される運用を前提にしています。EdgCA は TLS handshake にも cert の DER parse にも関与せず、Cloudflare が露出した値を入力として受け取って上記の発行元判定を行います。
+このセクションは、**Cloudflare 側で client certificate が抽出済み**で、その値が `request.cf.tlsClientAuth` 経由で application に渡される運用を前提にしています。EdgCA は TLS handshake には関与しません。application が Cloudflare の値を PEM に変換した後、既存 API は発行元判定に必要な証明書 field だけを DER から読み取ります。
 
 ### Cloudflare が抽出した場合に渡される形式
 
@@ -324,6 +344,43 @@ export default {
 - 「自 CA から発行されてない」「ウィンドウ外」は `false` 戻り値、入力 PEM/DER が壊れている等の不正入力は throw。エラー扱いを 2 段階に分けています。
 - `ca` には**直接の発行者 1 本**を渡してください。intermediate を介して発行した leaf を root に対して投げると `false` になります (chain 遡及はしません)。
 
+## Certificate chain verification
+
+新しい `@noz-ele/edgca/verify` surface は CA 秘密鍵を要求せず、公開証明書だけで直接 issuer または chain を検証します。
+
+```ts
+import { verifyCertificateChain } from "@noz-ele/edgca/verify";
+
+const result = await verifyCertificateChain({
+  certificatePem: clientPem,
+  // target の直接 issuer から順番。EdgCA では 0 または 1 本。
+  intermediateCertificatesPem: [intermediatePem],
+  // OS trust store は参照せず、信頼する root を明示する。
+  trustedRootCertificatesPem: [rootPem],
+  purpose: "clientAuth"
+});
+
+if (!result.valid) {
+  return new Response(
+    `invalid certificate chain: ${result.reason}`,
+    { status: 403 }
+  );
+}
+```
+
+検証範囲:
+
+- 各 child / issuer 間の issuer DN、AKI / SKI、署名。
+- target、intermediate、root の DER 内有効期間。
+- issuer の `BasicConstraints CA=true`、`KeyUsage keyCertSign`、`pathLenConstraint`。
+- `purpose` に応じた target の CA / mTLS client / document-signing profile。
+- 重複 extension、未対応 critical extension、署名 algorithm の不整合。
+- chain の終点が caller の明示した trusted root certificate と一致すること。
+
+これは汎用的な PKI path builder ではありません。intermediate の順序は caller が指定し、最大 `root → intermediate → leaf` に限定します。AIA download、OS trust store、CRL / OCSP、server hostname 照合は行いません。また chain が valid でも、提示者が leaf の秘密鍵を持つことは証明されません。
+
+既存の `verifyClientCertificateIssuedBy` は後方互換のため残し、引数と挙動を変えません。新規コードでは、1 link だけなら `verifyCertificateIssuedBy`、trusted root まで確認するなら `verifyCertificateChain` を使います。詳細な契約と失敗理由は [API Documentation](API.md) を参照してください。
+
 ## CSR から発行する
 
 client が秘密鍵を自分で管理し PKCS#10 CSR を送ってくる場合、EdgCA は CSR を parse し、所持証明 (POP) 署名を検証し、CSR 内の公開鍵を埋めた証明書を発行できます。CSR が主張する subject / SAN は **library が自動採用しません** — 発行内容は呼び出し側が application 層のポリシーに従って明示的に渡します。
@@ -389,6 +446,9 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 - 文書署名用 certificate 発行。EKU `id-kp-documentSigning` (RFC 9336)、`keyUsage digitalSignature, contentCommitment`、内部鍵生成のみ、SAN なし。
 - CSR (PKCS#10) の parse と所持証明 (POP) 署名検証。
 - 自己 CA からの発行かを判定する identity 確認 API (`verifyClientCertificateIssuedBy`、任意の時刻有効性 check 付き)。
+- 公開証明書だけを使う直接 issuer 検証 (`verifyCertificateIssuedBy`)。
+- caller が順序と trusted root を明示する最大 `root → intermediate → leaf` の chain validation (`verifyCertificateChain`)。DER 内の時刻、CA / Key Usage / EKU / path length、critical extension を検証する。
+- 発行・検証の用途別 subpath (`@noz-ele/edgca/issuer` / `@noz-ele/edgca/verify`)。
 - PEM/DER helper (証明書のみ — 鍵は CryptoKey でやり取り)。
 - 発行済み証明書 + 秘密鍵の PFX (PKCS#12) export。PBES2 (PBKDF2-HMAC-SHA-256 + AES-256-CBC) と HMAC-SHA-256 MAC で構成し、対象は Win11+ / Server 2019+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux consumer。
 - Basic Constraints、Key Usage、Extended Key Usage、Subject Alternative Name、SKI、AKI。
@@ -399,13 +459,17 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 - 文書署名 cert を持ち込み公開鍵から発行する API (`issueDocumentSigningCertForPublicKey`) — v1 では提供しない。
 - 文書署名 leaf への SAN (`dnsNames` / `ipAddresses` / `emailAddresses`)。
 - CAdES / CMS / PAdES / XAdES / ASiC の文書署名や container 生成。EdgCA は signer cert を発行するだけで、文書署名 container の生成は別の関心事。
-- 公開 chain validation API。
-- cert からの時刻 field の抽出。`verifyClientCertificateIssuedBy` の `validity` option は時刻 check 自体は提供するが、`notBefore` / `notAfter` 値は呼び出し側が `cf.tlsClientAuth` から渡す。
+- unordered な certificate 群からの PKI path building / issuer 自動探索、AIA download。
+- OS / runtime trust store の参照。root は caller が明示する。
+- intermediate を 2 本以上含む CA hierarchy / chain 検証。最大 `root → intermediate → leaf`。
+- Cloudflare 固有 textual time の parse。verify module は certificate DER 内の時刻だけを parse する。
 - CRL、OCSP、失効 DB、失効確認。
+- TLS handshake / proof-of-possession の検証。
+- server certificate の hostname / SAN identity 検証。
 - 鍵の保管、暗号化保存、ローテーション永続化、KV/D1/R2/Secrets 連携。
-- RSA、EdDSA、別 elliptic curve (これらで署名された CSR は parse 時に reject)。
+- 発行・CSR・certificate 検証における RSA、EdDSA、別 elliptic curve。
 - 旧式 PKCS#12 アルゴリズム (3DES、RC2、SHA-1 PBE)、PBMAC1、空 password、crlBag / secretBag / 入れ子 safeContents、上記より古い consumer は意図的に `exportPkcs12` の対象外。
-- 一般的な certificate parsing API (Cloudflare が `cf.tlsClientAuth.cert*` で値を提供するので library で重複実装しない)。
+- 一般的な公開 certificate parsing API。certificate parser は検証内部でのみ使う。
 - 発行可否ポリシー判定 (CSR の主張 subject/SAN を採用するかなど) — caller の責務。
 - DN 文字列 parsing。
 - multi-valued RDN。
@@ -420,12 +484,15 @@ EdgCA が扱うのは鍵の生成・署名・公開鍵の SPKI export だけで�
 
 root CA と intermediate CA は長期保管が前提です。鍵管理を呼び出し側に寄せるため、`createRootCA` と `issueIntermediateCA` は持ち込み鍵ペアを `keyPair: CryptoKeyPair` で受け取れます。鍵のライフサイクル (生成・保管・ローテーション・永続化形式の選択) を呼び出し側の鍵管理基盤で一貫して扱えるため、こちらが推奨ルートです。
 
+持ち込んだ秘密鍵と公開鍵は署名・検証 round-trip で対応を確認し、不一致なら発行前に throw します。秘密鍵は non-extractable でも構いません。公開鍵は証明書の SubjectPublicKeyInfo に埋め込むため、SPKI export 可能である必要があります。
+
 ```ts
-// 永続化形式から CryptoKeyPair を復元する。下は PKCS#8 PEM を vault に
-// 保存している場合の一例。JWK や生バイト列で持っているならその経路で
-// import すればよい。
+// 永続化形式から CryptoKeyPair を復元する。秘密鍵の PKCS#8 PEM と
+// 公開鍵の SPKI PEM を対で vault に保存している場合の例。
 async function loadKeyPair(label: string): Promise<CryptoKeyPair> {
   const pkcs8 = pemToDer(loadFromVault(`${label}-private-pem`));
+  const spki = pemToDer(loadFromVault(`${label}-public-pem`));
+
   const privateKey = await crypto.subtle.importKey(
     "pkcs8",
     pkcs8,
@@ -433,13 +500,12 @@ async function loadKeyPair(label: string): Promise<CryptoKeyPair> {
     /* extractable */ false,
     ["sign"]
   );
-  // 公開鍵の SPKI も別保存しているなら、それを直接 import するほうが速い。
-  const jwk = await crypto.subtle.exportKey("jwk", privateKey);
-  delete jwk.d;
-  jwk.key_ops = ["verify"];
+
+  // non-extractable な秘密鍵から公開鍵を export することはできないため、
+  // 対になる公開鍵を保存済みの SPKI から復元する。
   const publicKey = await crypto.subtle.importKey(
-    "jwk",
-    jwk,
+    "spki",
+    spki,
     { name: "ECDSA", namedCurve: "P-256" },
     true,
     ["verify"]

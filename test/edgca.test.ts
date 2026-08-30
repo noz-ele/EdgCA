@@ -5772,6 +5772,63 @@ describe("CSR additional edge cases and contracts", () => {
 });
 
 describe("CryptoKey reference and input mutability contracts", () => {
+  it("accepts a keyPair restored from separate PKCS#8 and SPKI with a non-extractable private key", async () => {
+    const seed = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const pkcs8 = await crypto.subtle.exportKey("pkcs8", seed.privateKey);
+    const spki = await crypto.subtle.exportKey("spki", seed.publicKey);
+
+    const privateKey = await crypto.subtle.importKey(
+      "pkcs8",
+      pkcs8,
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["sign"]
+    );
+    const publicKey = await crypto.subtle.importKey(
+      "spki",
+      spki,
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["verify"]
+    );
+
+    const root = await createRootCA({
+      subject: rootSubject,
+      days: 3650,
+      keyPair: { privateKey, publicKey }
+    });
+    const parsed = await parseCertificateDer(root.certDer);
+
+    expect(privateKey.extractable).toBe(false);
+    expect(root.privateKey).toBe(privateKey);
+    expect(root.publicKey).toBe(publicKey);
+    expect(await verifyDer(publicKey, parsed.signatureDer, parsed.tbsCertificateDer)).toBe(true);
+  });
+
+  it("rejects mismatched caller-provided keyPair members at CA issuance boundaries", async () => {
+    const first = await generateKeyPair();
+    const second = await generateKeyPair();
+    const mismatched = { privateKey: first.privateKey, publicKey: second.publicKey };
+
+    await expect(createRootCA({
+      subject: rootSubject,
+      days: 3650,
+      keyPair: mismatched
+    })).rejects.toThrow("Private key does not match");
+
+    const root = await createRootCA({ subject: rootSubject, days: 3650 });
+    await expect(issueIntermediateCA({
+      ca: root,
+      subject: intermediateSubject,
+      days: 365,
+      keyPair: mismatched
+    })).rejects.toThrow("Private key does not match");
+  });
+
   it("createRootCA returns the caller-provided keyPair members by reference", async () => {
     const keyPair = await crypto.subtle.generateKey(
       { name: "ECDSA", namedCurve: "P-256" },

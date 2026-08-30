@@ -15,6 +15,8 @@ import {
   createCertificateSigningRequest,
   parseCertificateSigningRequest,
   verifyCertificateSigningRequestSignature,
+  verifyCertificateIssuedBy,
+  verifyCertificateChain,
   verifyClientCertificateIssuedBy,
   certificateToPem,
   csrToPem,
@@ -28,7 +30,27 @@ import {
 } from "@noz-ele/edgca";
 ```
 
-The PFX-only surface is also reachable as `import { exportPkcs12 } from "@noz-ele/edgca/pkcs12"` for consumers who do not want to drag the CA / CSR / verify modules in.
+The root entry point remains an aggregate surface for compatibility. Purpose-specific subpaths provide hard module boundaries independent of tree shaking:
+
+```ts
+import {
+  createRootCA,
+  importCertificateAuthority,
+  issueIntermediateCA,
+  issueClientCert,
+  issueClientCertForPublicKey,
+  issueDocumentSigningCert
+} from "@noz-ele/edgca/issuer";
+
+import {
+  verifyCertificateIssuedBy,
+  verifyCertificateChain
+} from "@noz-ele/edgca/verify";
+
+import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
+```
+
+`./issuer` does not statically import the verification module, and `./verify` needs only PEM/DER certificates and public keys—not `CertificateAuthority.privateKey`. The package remains `sideEffects: false`.
 
 ECDSA on **NIST P-256, P-384, and P-521** is supported. The internal default for auto-generated keys is P-256; callers who want a different curve generate a `CryptoKeyPair` with WebCrypto and pass it via the `keyPair` option. The signature hash for each curve follows the standard pairing (P-256/SHA-256, P-384/SHA-384, P-521/SHA-512). A CA hierarchy may mix curves (e.g., P-256 root → P-384 intermediate → P-521 leaf); each cert's signatureAlgorithm reflects the **issuer**'s curve.
 
@@ -126,6 +148,47 @@ When omitted, a positive random 16-byte serial number is generated.
 
 If you need a deterministic serial number, prefer `bigint`, `number`, or `Uint8Array`. A `string` is interpreted as either decimal digits or hexadecimal text.
 
+### `CertificateVerificationPurpose`
+
+```ts
+type CertificateVerificationPurpose =
+  | "ca"
+  | "clientAuth"
+  | "documentSigning";
+```
+
+The expected profile of the target passed to `verifyCertificateChain`. When omitted, the verifier checks the chain, validity, issuer CA constraints, signatures, and critical-extension policy without imposing a target-purpose profile.
+
+### `CertificateChainVerificationResult`
+
+```ts
+type CertificateVerificationFailureReason =
+  | "not-yet-valid"
+  | "expired"
+  | "issuer-name-mismatch"
+  | "key-identifier-mismatch"
+  | "invalid-signature"
+  | "issuer-not-ca"
+  | "issuer-key-usage-invalid"
+  | "path-length-exceeded"
+  | "target-profile-invalid"
+  | "invalid-chain-order"
+  | "duplicate-extension"
+  | "signature-algorithm-mismatch"
+  | "unsupported-critical-extension"
+  | "untrusted-root";
+
+type CertificateChainVerificationResult =
+  | { valid: true; trustedRootIndex: number }
+  | {
+      valid: false;
+      reason: CertificateVerificationFailureReason;
+      certificateIndex: number;
+    };
+```
+
+`certificateIndex` is `0` for the target and `1` for its direct issuer. For `untrusted-root`, it identifies the terminal issuer position that was required next. A well-formed certificate that fails a trust condition returns `valid: false`; malformed PEM/DER, unsupported signature algorithms, and invalid API options throw.
+
 ### `ExportPkcs12Input`
 
 ```ts
@@ -172,7 +235,7 @@ The root certificate is self-signed. The returned `issuerChainPem` is `""`.
 
 `pathLenConstraint` defaults to `1`. The only allowed values are `0` and `1`. A root with `pathLenConstraint=0` can only issue client certificates; it cannot issue intermediate CAs.
 
-When `keyPair` is provided, the root CA is issued with that key pair. The recommended path is to load a key from long-term storage, turn it into a `CryptoKey` via WebCrypto's `importKey`, and pass it here. When omitted, the library generates a P-256 ECDSA key pair internally (test / PoC use). `privateKey.usages` must include `"sign"` and `publicKey.usages` must include `"verify"`.
+When `keyPair` is provided, the root CA is issued with that key pair. The recommended path is to load a key from long-term storage, turn it into a `CryptoKey` via WebCrypto's `importKey`, and pass it here. When omitted, the library generates a P-256 ECDSA key pair internally (test / PoC use). `privateKey.usages` must include `"sign"` and `publicKey.usages` must include `"verify"`. The library verifies that the supplied keys match with a sign/verify round trip before issuance.
 
 ### `issueIntermediateCA(options)`
 
@@ -392,7 +455,61 @@ When re-importing an intermediate CA, pass the parent chain via `issuerChainPem`
 
 The caller is responsible for turning persisted key material into a `CryptoKey` — for example, `crypto.subtle.importKey("pkcs8", …, { name: "ECDSA", namedCurve: "P-256" }, extractable, ["sign"])` for PKCS#8 PEM. The library does not perform format conversion.
 
+### `verifyCertificateIssuedBy(options)`
+
+Validates one certificate against one direct issuer certificate. No issuer private key or `CertificateAuthority` object is required.
+
+```ts
+function verifyCertificateIssuedBy(options: {
+  certificatePem: string;
+  issuerCertificatePem: string;
+  at?: Date | number;
+}): Promise<boolean>;
+```
+
+Returns `true` only when the child issuer DN matches the issuer subject DN, AKI matches SKI, the signature verifies, both certificates are valid at `at` (default `Date.now()`), the issuer has `BasicConstraints CA=true` and `KeyUsage keyCertSign`, and strict extension/signature-algorithm policy passes. Missing AKI/SKI returns `false`.
+
+This checks one link only. It does not validate a target-purpose EKU or reach a root. Trust failures return `false`; malformed PEM/DER, unsupported algorithms, and an invalid `at` throw.
+
+### `verifyCertificateChain(options)`
+
+Validates a caller-ordered certificate chain to an explicitly supplied trust anchor.
+
+```ts
+function verifyCertificateChain(options: {
+  certificatePem: string;
+  intermediateCertificatesPem?: readonly string[];
+  trustedRootCertificatesPem: readonly string[];
+  at?: Date | number;
+  purpose?: CertificateVerificationPurpose;
+}): Promise<CertificateChainVerificationResult>;
+```
+
+Input and validation rules:
+
+- Supply intermediates from the target's direct issuer upward. EdgCA accepts zero or one intermediate.
+- Supply at least one trusted root explicitly; no OS/runtime trust store is consulted.
+- `at` defaults to `Date.now()` and is applied to the target, intermediate, and selected root using their DER `UTCTime`/`GeneralizedTime` values.
+- `purpose: "ca"` requires `CA=true` and `keyCertSign`; `"clientAuth"` requires `CA=false`, `digitalSignature`, and the clientAuth EKU; `"documentSigning"` requires `CA=false`, `digitalSignature`, `contentCommitment`, and the RFC 9336 document-signing EKU.
+- Each link checks issuer DN, AKI/SKI, signature, issuer CA constraints, and path length. Duplicate extensions, unsupported critical extensions, and inconsistent inner/outer signature algorithms are rejected.
+- The terminal issuer must be an explicitly supplied trusted-root certificate. A selected EdgCA root's self-signature and CA constraints are checked for integrity; trust comes from caller selection, not self-signature alone.
+
+The function does not search unordered issuer candidates, fetch AIA URLs, use an OS trust store, check CRL/OCSP, verify TLS proof-of-possession, or perform server hostname matching.
+
+```ts
+import { verifyCertificateChain } from "@noz-ele/edgca/verify";
+
+const result = await verifyCertificateChain({
+  certificatePem: clientPem,
+  intermediateCertificatesPem: [intermediatePem],
+  trustedRootCertificatesPem: [rootPem],
+  purpose: "clientAuth"
+});
+```
+
 ### `verifyClientCertificateIssuedBy(options)`
+
+> **Compatibility API:** new code should prefer `verifyCertificateIssuedBy` or `verifyCertificateChain` from `@noz-ele/edgca/verify`. This API remains on the root entry point with its existing arguments and behavior.
 
 Decides whether `options.ca` was the issuer of `options.certPem`. This is a post-handshake issuance check intended to be used in a Cloudflare Worker after decoding the PEM from `request.cf.tlsClientAuth.certRFC9440`, to confirm that the client certificate came from your own self-managed CA.
 
@@ -415,7 +532,7 @@ Returns `true` if all of the following hold; `false` otherwise:
 - (when `validity` is provided) `validity.notBefore ≤ now ≤ validity.notAfter`.
 - The issuer DN of `certPem` exactly matches the subject DN of `ca`.
 - The Authority Key Identifier of `certPem` exactly matches the Subject Key Identifier of `ca`. If `certPem` has no AKI, returns `false`.
-- The signature of `certPem` verifies under `ca.publicKey` (ECDSA P-256 / SHA-256).
+- The signature of `certPem` verifies under `ca.publicKey` (ECDSA P-256, P-384, or P-521 with the matching hash).
 
 Inputs that fail to parse as PEM or DER throw an `Error`. The two error categories are deliberately separated: "not issued by us" returns `false`; malformed input throws.
 
@@ -599,7 +716,14 @@ Examples:
 - `privateKey` is not a non-empty `Uint8Array` of PKCS#8 DER bytes (`exportPkcs12`).
 - `iterations` or `macIterations` is not a positive integer (`exportPkcs12`).
 
-`verifyClientCertificateIssuedBy` returns a `boolean` for the issuer-identity check. No result type is provided for other validations (time, chain, revocation).
+Verification APIs distinguish unprocessable input from a processed certificate that fails trust policy:
+
+- Malformed PEM/DER, unsupported algorithms, and invalid options throw `Error`.
+- `verifyCertificateIssuedBy` returns `false` for issuer mismatch, invalid time, or invalid signature.
+- `verifyCertificateChain` returns `{ valid: false, reason, certificateIndex }` for chain, profile, or trust failures.
+- Legacy `verifyClientCertificateIssuedBy` retains its boolean issuer-identity behavior.
+
+Revocation is out of scope and therefore has no result reason.
 
 ## Field Reference
 
@@ -624,7 +748,7 @@ The argument to `createRootCA`. Represents the input set for creating a single s
 | `notBefore` | `Date` | — | call time (`new Date()`) | The validity start time. Encoded as `UTCTime` for 1950–2049 and as `GeneralizedTime` outside that range. |
 | `serialNumber` | `SerialNumber` | — | CSPRNG-derived 16-byte random (positive, MSB cleared, satisfies CAB BR 7.1's ≥64 bit entropy requirement) | Caller's **explicit** specification of the integer that identifies the issued cert within the issuer. Normally omit this and let the default random value handle it (this satisfies both the stateless nature of Workers and industry standards); only pass a value when you need a deterministic one — for audit, test reproducibility, or carrying a serial assigned by an external system. See § `SerialNumber` for input shapes. After DER encoding, exceeding 20 octets throws. |
 | `pathLenConstraint` | `number` | — | `1` | The number of intermediate levels allowed under this root. Only `0` or `1` is allowed. A root with `0` cannot issue intermediates and is reserved for client certs only. |
-| `keyPair` | `CryptoKeyPair` | — | generated internally (P-256 ECDSA, `extractable: true`) | A brought-in key pair. `privateKey.usages` must include `"sign"` and `publicKey.usages` must include `"verify"`. Extractability is the caller's choice; the library only uses `subtle.sign` and `subtle.exportKey("spki", publicKey)` (the private key does not need to be extractable). When omitted, a key pair is generated via WebCrypto. |
+| `keyPair` | `CryptoKeyPair` | — | generated internally (P-256 ECDSA, `extractable: true`) | A brought-in key pair. `privateKey.usages` must include `"sign"` and `publicKey.usages` must include `"verify"`; a sign/verify round trip confirms they match. Extractability is the caller's choice; the library never exports the private key. When omitted, a key pair is generated via WebCrypto. |
 
 #### `IssueIntermediateCAOptions`
 
@@ -746,9 +870,12 @@ EdgCA does not provide:
 - A CSR-based document-signing variant (`issueDocumentSigningCertForPublicKey` does not exist in v1).
 - SAN (`dnsNames` / `ipAddresses` / `emailAddresses`) on document-signing leaves.
 - CAdES / CMS / PAdES / XAdES / ASiC building or verification. EdgCA emits the document-signing certificate only; producing a signed container from documents + this certificate is a separate concern.
-- A public certificate parsing API.
-- Certificate chain validation (chain walking / PKI path building). `verifyClientCertificateIssuedBy` is limited to identity confirmation against a single direct issuer.
-- Extraction of time fields from a cert. `verifyClientCertificateIssuedBy`'s `validity` option provides a time check, but `notBefore` / `notAfter` are passed in by the caller (it is the application's job to convert `cf.tlsClientAuth.certNotBefore` / `certNotAfter` to `Date`).
+- A general public certificate parsing API; certificate parsing remains internal to verification and issuance.
+- Automatic PKI path building from unordered certificates, issuer discovery, or AIA fetching.
+- OS/runtime trust-store access; trusted roots must be passed explicitly.
+- Certificate chains containing two or more intermediate CAs.
+- Parsing Cloudflare-specific textual time values. The verification module parses DER certificate times; the legacy API still accepts caller-provided values.
 - CRL, OCSP, revocation databases, revocation checks.
+- TLS-handshake proof-of-possession and server hostname/SAN identity verification.
 - Key storage, encryption-at-rest, or Cloudflare storage integration.
 - Key format conversion (PEM ↔ CryptoKey, JWK ↔ CryptoKey, etc.). The choice and conversion of a persistence format are done by the caller, using the WebCrypto API directly.
