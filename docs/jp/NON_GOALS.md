@@ -10,6 +10,7 @@ EdgCA は、証明書の発行と、明示的に与えられた trust anchor に
 
 - `verifyCertificateIssuedBy`: certificate と直接の issuer 1 本について、issuer DN / subject DN、AKI / SKI、署名、DER 内の有効期間、issuer の CA 制約を確認する。
 - `verifyCertificateChain`: caller が leaf の直接 issuer から順番に渡した chain を、明示的に渡した trusted root まで検証する。
+- `verifyCertificateSignature`: certificate 内の公開鍵を取得し、caller が渡した任意の byte 列に対する ECDSA DER / IEEE P1363 signature を検証する。certificate の信頼性や challenge の意味はこの関数では判断しない。
 - chain 検証では DER の `UTCTime` / `GeneralizedTime`、Basic Constraints、Key Usage、Extended Key Usage、`pathLenConstraint`、既知の critical extension、署名 algorithm の整合性を検査する。
 - well-formed だが信頼条件を満たさない certificate は理由付きの失敗結果、PEM / DER として処理不能な入力や未対応 algorithm は例外として扱う。
 
@@ -19,7 +20,8 @@ EdgCA は、証明書の発行と、明示的に与えられた trust anchor に
 - **OS / runtime の trust store 参照**。trust anchor は `trustedRootCertificatesPem` で明示する。subject DN の一致だけでは root を信頼せず、渡された root certificate 自体との一致を要求する。
 - **intermediate を 2 本以上含む chain の検証**。発行機能と同じく最大 `root → intermediate → leaf` に限定する。
 - **CRL / OCSP / 失効 DB / 失効確認**。network access を伴う検証も行わない。
-- **TLS handshake / proof-of-possession の検証**。certificate chain が正しくても、その certificate を提示した主体が対応する秘密鍵を持つことは証明しない。
+- **TLS handshake の `CertificateVerify` 検証**。Cloudflare が終端した TLS connection の handshake signature や exporter を application から取得せず、TLS connection 自体への cryptographic binding は提供しない。
+- **application-layer proof-of-possession protocol**。nonce / challenge ID の生成、期限、保存、原子的な一回限りの消費、HTTP message への binding、RFC 9421 header の parse / canonicalization は行わない。`verifyCertificateSignature` は caller が構築した byte 列の署名が certificate 公開鍵で検証できるかだけを返す。
 - **server identity / hostname 検証**。SAN dNSName と接続先 hostname の照合は行わない。検証用途は EdgCA が発行対象とする mTLS client cert と文書署名 cert に限定する。
 - **Cloudflare 固有文字列の parser**。`cf.tlsClientAuth.certNotBefore` / `certNotAfter` の `"Dec  4 23:59:59 2025 GMT"` のような文字列は application が変換する。verify module が parse するのは certificate DER 内の `UTCTime` / `GeneralizedTime`。
 - **`certificateToPem(der)` での DER 妥当性検査**。先頭 byte が `0x30` (SEQUENCE) かどうかの shallow check も実装しない。本物の cert との区別はつかず、誤った安心感を与えるだけ。本気でやるなら `parseCertificateDer` 全実行が必要で、encoder の責務を超える。低 level encoder のまま。
@@ -31,6 +33,7 @@ EdgCA は、証明書の発行と、明示的に与えられた trust anchor に
 - **serialNumber の一意性管理**。同一 issuer に対し同じ `serialNumber` を 2 回指定しても library は止めない。RFC 5280 §4.1.2.2 の一意性保証は呼び出し側責務。発行履歴も持たない。
 - **発行履歴・audit log・カウンタ**。stateless。
 - **鍵の保管・暗号化保存・KV/D1/R2 連携**。
+- **challenge / nonce store とリプレイ防止**。Durable Object、KV、D1 等への保存や compare-and-consume は application / protocol library の責務。
 - **expiry 監視・rotation**。
 
 ## 3. 入力 "配慮" 系
@@ -60,7 +63,7 @@ EdgCA は、証明書の発行と、明示的に与えられた trust anchor に
 
 ## 5. これらの方針が変わる条件
 
-- 明示的な chain と trust anchor だけで完結し、stateless・WebCrypto-only・最大 2-level CA hierarchy を維持できる検証は追加を検討できる。
+- 明示的な certificate と caller が構築した byte 列だけで完結し、stateless・WebCrypto-only・最大 2-level CA hierarchy を維持できる検証は追加を検討できる。
 - issuer 自動探索、外部取得、永続状態、失効基盤が必要な要求は EdgCA ではなく専用 PKI library / runtime に委ねる。
 - 「外部入力 → 出力 cert」の単一 path で「同じ入力なのに違う／想定外の DER が出る」は **bug**。これは修正対象。
 - 「caller が嘘・重複入力を渡したら結果が嘘」「caller が状態を共有しないと壊れる」は **設計通り**。修正対象ではない。

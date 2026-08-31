@@ -72,12 +72,43 @@ export async function signDer(privateKey: CryptoKey, data: Uint8Array): Promise<
 export async function verifyDer(publicKey: CryptoKey, signatureDer: Uint8Array, data: Uint8Array): Promise<boolean> {
   const curve = curveOf(publicKey);
   const profile = CURVE_PROFILE[curve];
-  return crypto.subtle.verify(
-    { name: "ECDSA", hash: profile.hash },
-    publicKey,
-    arrayBufferFromBytes(ecdsaDerToRaw(signatureDer, profile.componentSize)),
-    arrayBufferFromBytes(data)
-  );
+  const signatureP1363 = ecdsaDerToRaw(signatureDer, profile.componentSize);
+  try {
+    return await verifyP1363(publicKey, signatureP1363, data);
+  } finally {
+    signatureP1363.fill(0);
+  }
+}
+
+export async function verifyP1363(
+  publicKey: CryptoKey,
+  signatureP1363: Uint8Array,
+  data: Uint8Array
+): Promise<boolean> {
+  const curve = curveOf(publicKey);
+  const profile = CURVE_PROFILE[curve];
+  const expectedLength = profile.componentSize * 2;
+  if (signatureP1363.length !== expectedLength) {
+    throw new Error(`ECDSA IEEE P1363 signature must be ${expectedLength} bytes for ${curve}`);
+  }
+
+  // WebCrypto accepts BufferSource values, but making exact ArrayBuffer
+  // copies avoids exposing a caller-owned backing buffer or an unrelated
+  // region of a subarray to the runtime. The copies are wiped after the
+  // asynchronous operation completes. Caller-owned inputs are never changed.
+  const signatureBuffer = arrayBufferFromBytes(signatureP1363);
+  const dataBuffer = arrayBufferFromBytes(data);
+  try {
+    return await crypto.subtle.verify(
+      { name: "ECDSA", hash: profile.hash },
+      publicKey,
+      signatureBuffer,
+      dataBuffer
+    );
+  } finally {
+    new Uint8Array(signatureBuffer).fill(0);
+    new Uint8Array(dataBuffer).fill(0);
+  }
 }
 
 export async function digestSha256(data: Uint8Array): Promise<Uint8Array> {
@@ -174,8 +205,9 @@ export function ecdsaDerToRaw(signature: Uint8Array, componentSize: number): Uin
     throw new Error("Invalid DER ECDSA signature");
   }
 
-  const [r, s] = readChildren(root.value);
-  if (!r || !s || r.tag !== TAG.INTEGER || s.tag !== TAG.INTEGER) {
+  const components = readChildren(root.value);
+  const [r, s] = components;
+  if (components.length !== 2 || !r || !s || r.tag !== TAG.INTEGER || s.tag !== TAG.INTEGER) {
     throw new Error("Invalid DER ECDSA signature integers");
   }
 
@@ -186,6 +218,16 @@ export function ecdsaDerToRaw(signature: Uint8Array, componentSize: number): Uin
 }
 
 function integerToFixedWidth(value: Uint8Array, size: number): Uint8Array {
+  if (value.length === 0) {
+    throw new Error("Invalid empty DER ECDSA integer");
+  }
+  if ((value[0]! & 0x80) !== 0) {
+    throw new Error("Negative DER ECDSA integer is not allowed");
+  }
+  if (value.length > 1 && value[0] === 0 && (value[1]! & 0x80) === 0) {
+    throw new Error("Non-minimal DER ECDSA integer");
+  }
+
   let start = 0;
   while (start < value.length - 1 && value[start] === 0) {
     start += 1;

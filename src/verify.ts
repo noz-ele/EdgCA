@@ -3,7 +3,8 @@ import {
   curveOf,
   keyIdentifierFromSpki,
   signatureAlgorithmOidForCurve,
-  verifyDer
+  verifyDer,
+  verifyP1363
 } from "./crypto.js";
 import { OID } from "./oids.js";
 import { pemToDerWithLabel } from "./pem.js";
@@ -40,6 +41,15 @@ export interface VerifyCertificateChainOptions {
   trustedRootCertificatesPem: readonly string[];
   at?: Date | number;
   purpose?: CertificateVerificationPurpose;
+}
+
+export type EcdsaSignatureFormat = "der" | "ieee-p1363";
+
+export interface VerifyCertificateSignatureOptions {
+  certificatePem: string;
+  data: Uint8Array;
+  signature: Uint8Array;
+  signatureFormat: EcdsaSignatureFormat;
 }
 
 export type CertificateVerificationFailureReason =
@@ -183,6 +193,33 @@ export async function verifyCertificateChain(
   }
 
   return firstCandidateFailure ?? failure("untrusted-root", rootIndexInPath);
+}
+
+/**
+ * Verifies an arbitrary byte sequence with the public key embedded in a
+ * certificate. This is a cryptographic primitive only: it does not validate
+ * the certificate chain, certificate policy, challenge freshness, or replay
+ * state, and it never handles private-key material.
+ */
+export async function verifyCertificateSignature(
+  options: VerifyCertificateSignatureOptions
+): Promise<boolean> {
+  assertObject(options, "options");
+  if (!(options.data instanceof Uint8Array)) {
+    throw new Error("data must be a Uint8Array");
+  }
+  if (!(options.signature instanceof Uint8Array)) {
+    throw new Error("signature must be a Uint8Array");
+  }
+  if (options.signatureFormat !== "der" && options.signatureFormat !== "ieee-p1363") {
+    throw new Error("signatureFormat must be der or ieee-p1363");
+  }
+
+  const certificate = await parseVerificationCertificate(options.certificatePem, "certificatePem");
+  if (options.signatureFormat === "der") {
+    return await verifyDer(certificate.publicKey, options.signature, options.data);
+  }
+  return await verifyP1363(certificate.publicKey, options.signature, options.data);
 }
 
 /**

@@ -30,12 +30,15 @@ export { exportPkcs12, type ExportPkcs12Input } from "./pkcs12.js";
 export {
   verifyCertificateChain,
   verifyCertificateIssuedBy,
+  verifyCertificateSignature,
   verifyClientCertificateIssuedBy,
   type CertificateChainVerificationResult,
   type CertificateVerificationFailureReason,
   type CertificateVerificationPurpose,
+  type EcdsaSignatureFormat,
   type VerifyCertificateChainOptions,
   type VerifyCertificateIssuedByOptions,
+  type VerifyCertificateSignatureOptions,
   type VerifyClientCertificateIssuedByOptions,
   type VerifyClientCertificateValidity
 } from "./verify.js";

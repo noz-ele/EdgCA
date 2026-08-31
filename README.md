@@ -7,7 +7,7 @@ EdgCA is a small TypeScript library for issuing mTLS client certificates and doc
 ## Features
 
 - **WebCrypto-only, zero runtime dependencies.** All cryptographic operations go through `globalThis.crypto.subtle`. The same code runs on Cloudflare Workers, Node.js 20+, and modern browsers without polyfills or bundler shims.
-- **Lightweight.** v0.6.0 — tarball **49.8 kB** · unpacked **192.8 kB** · 76 files. No transitive dependencies; the CLI uses only `node:util.parseArgs`. (Re-measured on every release.)
+- **Lightweight.** v0.6.0 — tarball **51.8 kB** · unpacked **200.1 kB** · 76 files. No transitive dependencies; the CLI uses only `node:util.parseArgs`. (Re-measured on every release.)
 - **CA hierarchy (two-level).** Create a self-signed root CA and, optionally, issue an intermediate CA from it. Three or more levels of intermediates are intentionally out of scope.
 - **PFX (PKCS#12) bundling.** Wrap a cert + private key (and optional chain) into a password-protected `.pfx` / `.p12` for OS keystore import (Win11+, macOS 15+, iOS/iPadOS 18+, modern Linux). Algorithm-agnostic — accepts arbitrary PKCS#8 DER bytes (ECDSA, RSA, Ed25519, …).
 - **mTLS client certificate issuance.** Issue a leaf with internal key generation, or from a caller-managed key via the CSR path below.
@@ -15,6 +15,7 @@ EdgCA is a small TypeScript library for issuing mTLS client certificates and doc
 - **Document-signing certificates (RFC 9336).** Issue a leaf with EKU `id-kp-documentSigning`, usable as the signer cert for CAdES / CMS / ASiC tooling (containers themselves are built separately).
 - **Issuance check.** Decide whether a received client certificate was issued by your own CA (issuer-identity match — not full mTLS verification).
 - **Bounded chain validation.** Validate a caller-ordered `leaf → intermediate → trusted root` chain, including signatures, validity, CA constraints, and target purpose. Automatic PKI path building and revocation are intentionally out of scope.
+- **Arbitrary-data signature verification with a certificate public key.** Extract the public key from a validated certificate and verify ECDSA signatures in DER or IEEE P1363 format. Challenge state and replay prevention remain application concerns.
 - **PEM/DER encode/decode** for certificates and PKCS#10 CSRs.
 - **Secret key hygiene at the API boundary.** Private keys flow through the public API only as `CryptoKey` (issuance path) or `Uint8Array` PKCS#8 bytes (`exportPkcs12`); never as `string`. JS strings are immutable and stay on the heap until GC, so they cannot be wiped — secret material must not be held in that form. PEM ↔ CryptoKey conversion is the caller's job (so the lifetime of any string representation stays under caller control).
 
@@ -33,6 +34,7 @@ EdgCA is a small TypeScript library for issuing mTLS client certificates and doc
 - [Issue a document-signing certificate](#issue-a-document-signing-certificate) — RFC 9336 `id-kp-documentSigning` leaf
 - [Verify on Cloudflare Worker](#verify-cloudflare-worker) — confirm a cert was issued by your CA
 - [Certificate chain verification](#certificate-chain-verification) — validate an explicit chain to a trusted root
+- [Certificate signature verification](#certificate-signature-verification) — verify arbitrary data with a certificate public key
 - [Issue from a CSR](#issue-from-a-csr) — accept a caller-managed key via PKCS#10 + POP
 - [Subject](#subject) · [Scope](#scope) · [Key Handling](#key-handling) · [Development](#development) · [API Documentation](#api-documentation)
 
@@ -54,7 +56,10 @@ The root `@noz-ele/edgca` entry point remains an aggregate surface for compatibi
 
 ```ts
 import { createRootCA, issueClientCert } from "@noz-ele/edgca/issuer";
-import { verifyCertificateChain } from "@noz-ele/edgca/verify";
+import {
+  verifyCertificateChain,
+  verifyCertificateSignature
+} from "@noz-ele/edgca/verify";
 import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
 ```
 
@@ -250,7 +255,7 @@ There is no `issueDocumentSigningCertForPublicKey` (CSR variant) in v1, and EdgC
 >
 > A client certificate is, by design, presentable to anyone, and its contents are trivially copyable. You must assume that anyone can be holding a valid copy. Therefore possession of valid certificate data **never** proves legitimate ownership.
 >
-> Proving legitimate ownership additionally requires verifying possession of the corresponding private key — i.e., a signature made by the private key, verified against the certificate's public key. The TLS handshake's `CertificateVerify` message normally does this, but **the Cloudflare Workers runtime does not expose that signature to the application.** On non-Enterprise plans, Cloudflare's TLS layer also does not know about your self-managed CA, so `request.cf.tlsClientAuth.certVerified` will not be `"SUCCESS"` for certificates EdgCA issued. Workers application code (Enterprise plans excluded) has no way to verify proof-of-possession.
+> Proving legitimate ownership additionally requires verifying possession of the corresponding private key — i.e., a signature made by the private key, verified against the certificate's public key. The TLS handshake's `CertificateVerify` message normally does this, but **the Cloudflare Workers runtime does not expose that signature, so a Worker cannot revalidate the TLS-handshake proof-of-possession itself.** On non-Enterprise plans, Cloudflare's TLS layer also does not know about your self-managed CA, so `request.cf.tlsClientAuth.certVerified` will not be `"SUCCESS"` for certificates EdgCA issued. A separate application-layer challenge can nevertheless be signed by the client and checked with `verifyCertificateSignature`.
 >
 > Implication: an attacker who has obtained a copy of a valid certificate (logs, leaked storage, network capture, etc.) can present it and pass this check. Use this function as a *minimum* identity-check layer, not as authentication. For real authentication, either (a) use Cloudflare Enterprise with mTLS configured at the TLS layer (Cloudflare validates the handshake signature against your CA), or (b) add an application-layer challenge-response that has the client sign a server-issued nonce with its private key.
 >
@@ -369,6 +374,45 @@ This is not an automatic PKI path builder. The caller supplies intermediates in 
 
 The existing `verifyClientCertificateIssuedBy` remains unchanged for compatibility. New code should use `verifyCertificateIssuedBy` for one direct link or `verifyCertificateChain` to reach an explicit trusted root.
 
+## Certificate signature verification
+
+`verifyCertificateSignature` verifies an ECDSA signature over caller-supplied bytes using the public key embedded in a certificate. It does not validate the certificate chain, time, Key Usage, EKU, or revocation. Authentication code first validates the same leaf with `verifyCertificateChain({ purpose: "clientAuth" })`.
+
+```ts
+import {
+  verifyCertificateChain,
+  verifyCertificateSignature
+} from "@noz-ele/edgca/verify";
+
+const chain = await verifyCertificateChain({
+  certificatePem: clientPem,
+  intermediateCertificatesPem: [intermediatePem],
+  trustedRootCertificatesPem: [rootPem],
+  purpose: "clientAuth"
+});
+if (!chain.valid) throw new Error(`certificate chain rejected: ${chain.reason}`);
+
+const signatureValid = await verifyCertificateSignature({
+  certificatePem: clientPem,
+  // The exact bytes signed by the client, not a precomputed digest.
+  data: signatureBase,
+  signature: signatureBytes,
+  // RFC 9421 encodes ECDSA signatures as fixed-width r || s.
+  signatureFormat: "ieee-p1363"
+});
+```
+
+ECDSA signatures contain two integers `(r, s)`, with two supported byte encodings:
+
+| `signatureFormat` | Encoding | Typical use |
+| --- | --- | --- |
+| `"der"` | ASN.1 `SEQUENCE { INTEGER r, INTEGER s }`; total length varies. | X.509 and tooling configured for DER output |
+| `"ieee-p1363"` | Fixed-width `r || s`: 64 bytes for P-256, 96 for P-384, 132 for P-521. | RFC 9421 and WebCrypto ECDSA signatures |
+
+The format is mandatory and is never guessed. RFC 9421 registers P-256/SHA-256 and P-384/SHA-384 ECDSA algorithms. EdgCA also supports P-521/SHA-512 within its existing generic verification scope; that does not define a P-521 RFC 9421 algorithm.
+
+A `true` result proves only that the supplied bytes verify under the certificate public key. The caller remains responsible for challenge generation, expiry and one-time consumption; binding the HTTP method, URI, authority, and body digest; RFC 9421 parsing/canonicalization; matching the certificate fingerprint across requests; and mapping the certificate to an identity and permissions. For that reason, this primitive is not named `verifyProofOfPossession`.
+
 ## Issue from a CSR
 
 When a client manages its own private key and submits a PKCS#10 CSR, EdgCA parses the CSR, verifies its proof-of-possession signature, and issues a certificate that embeds the CSR's public key. The library does **not** auto-adopt the CSR's claimed subject / SAN — the caller passes those explicitly, derived from whatever policy applies in the application layer.
@@ -440,6 +484,7 @@ In scope:
 - Identity check that a cert was issued by your own CA (`verifyClientCertificateIssuedBy`, with optional time-validity check).
 - Direct public-certificate issuer validation (`verifyCertificateIssuedBy`).
 - Caller-ordered chain validation up to `root → intermediate → leaf` (`verifyCertificateChain`), including DER validity, CA/Key Usage/EKU/path-length constraints, and critical-extension policy.
+- Arbitrary-data ECDSA signature verification with a certificate public key (`verifyCertificateSignature`), with an explicit DER or IEEE P1363 encoding.
 - Purpose-specific entry points (`@noz-ele/edgca/issuer` and `@noz-ele/edgca/verify`).
 - PEM/DER helpers (certificates only — keys are exchanged as `CryptoKey`).
 - PFX (PKCS#12) export of an issued cert + private key with PBES2 (PBKDF2-HMAC-SHA-256 + AES-256-CBC) and HMAC-SHA-256 MAC, scoped to modern consumers (Win11+, Server 2019+, macOS 15+, iOS/iPadOS 18+).
@@ -456,7 +501,9 @@ Intentionally out of scope:
 - Chains with two or more intermediate CAs.
 - Parsing Cloudflare-specific textual times. The verification module reads DER certificate times; the legacy API still accepts caller-supplied validity values.
 - CRL, OCSP, revocation databases, revocation checks.
-- TLS-handshake proof-of-possession and server hostname/SAN identity verification.
+- TLS `CertificateVerify` validation and proof-of-possession binding to the TLS connection.
+- Application-layer proof-of-possession protocol state, including nonce/challenge management, HTTP message canonicalization, and replay prevention. EdgCA provides only the certificate public-key signature primitive.
+- Server hostname/SAN identity verification.
 - Key storage, encryption-at-rest, rotation-state persistence, and integration with KV/D1/R2/Secrets.
 - RSA, EdDSA, other elliptic curves (CSRs signed with these algorithms are rejected at parse time).
 - Legacy PKCS#12 algorithms (3DES, RC2, SHA-1 PBE), PBMAC1, empty passwords, crlBag / secretBag / nested safeContents, and consumers older than the modern targets above are intentionally not produced or supported by `exportPkcs12`.

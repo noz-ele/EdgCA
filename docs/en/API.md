@@ -17,6 +17,7 @@ import {
   verifyCertificateSigningRequestSignature,
   verifyCertificateIssuedBy,
   verifyCertificateChain,
+  verifyCertificateSignature,
   verifyClientCertificateIssuedBy,
   certificateToPem,
   csrToPem,
@@ -44,7 +45,8 @@ import {
 
 import {
   verifyCertificateIssuedBy,
-  verifyCertificateChain
+  verifyCertificateChain,
+  verifyCertificateSignature
 } from "@noz-ele/edgca/verify";
 
 import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
@@ -188,6 +190,19 @@ type CertificateChainVerificationResult =
 ```
 
 `certificateIndex` is `0` for the target and `1` for its direct issuer. For `untrusted-root`, it identifies the terminal issuer position that was required next. A well-formed certificate that fails a trust condition returns `valid: false`; malformed PEM/DER, unsupported signature algorithms, and invalid API options throw.
+
+### `EcdsaSignatureFormat`
+
+```ts
+type EcdsaSignatureFormat = "der" | "ieee-p1363";
+```
+
+The byte encoding accepted by `verifyCertificateSignature`:
+
+- `"der"`: ASN.1 `SEQUENCE { INTEGER r, INTEGER s }`; the total length varies because of INTEGER sign-preserving encoding.
+- `"ieee-p1363"`: fixed-width `r || s`, zero-padded to the curve component size. P-256 is 64 bytes, P-384 is 96 bytes, and P-521 is 132 bytes.
+
+The format is mandatory and is never inferred from the bytes. RFC 9421 `ecdsa-p256-sha256` and `ecdsa-p384-sha384` signatures use `"ieee-p1363"`.
 
 ### `ExportPkcs12Input`
 
@@ -507,13 +522,60 @@ const result = await verifyCertificateChain({
 });
 ```
 
+### `verifyCertificateSignature(options)`
+
+Verifies an ECDSA signature over caller-supplied bytes using the public key embedded in a certificate.
+
+```ts
+function verifyCertificateSignature(options: {
+  certificatePem: string;
+  data: Uint8Array;
+  signature: Uint8Array;
+  signatureFormat: EcdsaSignatureFormat;
+}): Promise<boolean>;
+```
+
+Input rules:
+
+- `certificatePem` is the certificate used to obtain the public key. Authentication flows normally pass the already validated leaf certificate.
+- `data` is the exact byte sequence passed to the signing operation, before WebCrypto applies its curve-specific hash. Do not pass a precomputed digest.
+- `signature` uses the encoding named by the mandatory `signatureFormat`; EdgCA does not guess the encoding.
+
+The certificate public-key curve selects P-256/SHA-256, P-384/SHA-384, or P-521/SHA-512. Well-formed inputs return `true` for a matching signature and `false` for another key, changed data, or a changed signature. Malformed certificate PEM/DER, unsupported algorithms, invalid DER signatures, invalid options, and P1363 lengths that do not match the curve throw.
+
+This function does not validate certificate trust, time, Basic Constraints, Key Usage, EKU, or revocation. It also does not issue or consume a nonce, bind the bytes to an HTTP request, parse/canonicalize RFC 9421 fields, or validate the TLS handshake's `CertificateVerify`. Authentication code first validates the same certificate with `verifyCertificateChain({ purpose: "clientAuth" })`, then supplies the application-reconstructed signature base.
+
+```ts
+import {
+  verifyCertificateChain,
+  verifyCertificateSignature
+} from "@noz-ele/edgca/verify";
+
+const chain = await verifyCertificateChain({
+  certificatePem: clientPem,
+  intermediateCertificatesPem: [intermediatePem],
+  trustedRootCertificatesPem: [rootPem],
+  purpose: "clientAuth"
+});
+if (!chain.valid) throw new Error(`certificate chain rejected: ${chain.reason}`);
+
+const signatureValid = await verifyCertificateSignature({
+  certificatePem: clientPem,
+  data: signatureBase,
+  signature: signatureBytes,
+  signatureFormat: "ieee-p1363"
+});
+```
+
+This is a cryptographic signature primitive, not a complete `verifyProofOfPossession` operation. The overall protocol becomes proof-of-possession only after the caller enforces challenge freshness, replay prevention, and request binding. The function accepts no private-key material. It does not mutate caller-owned `data` or `signature` buffers; exact temporary copies passed to WebCrypto are wiped after verification completes.
+
 ### `verifyClientCertificateIssuedBy(options)`
 
 > **Compatibility API:** new code should prefer `verifyCertificateIssuedBy` or `verifyCertificateChain` from `@noz-ele/edgca/verify`. This API remains on the root entry point with its existing arguments and behavior.
 
 Decides whether `options.ca` was the issuer of `options.certPem`. This is a post-handshake issuance check intended to be used in a Cloudflare Worker after decoding the PEM from `request.cf.tlsClientAuth.certRFC9440`, to confirm that the client certificate came from your own self-managed CA.
 
-> ⚠ **This is not mTLS verification, and it does not authenticate the presenter.** It only confirms the certificate was issued by the specified CA. A client certificate is by design presentable to anyone, and its contents are trivially copyable; possession of valid certificate data does **not** prove legitimate ownership. Proof-of-possession requires verifying a signature made by the corresponding private key, which the Cloudflare Workers runtime does not expose. On non-Enterprise plans, `request.cf.tlsClientAuth.certVerified` will not be `"SUCCESS"` for self-managed CAs either. An attacker holding a copied certificate will pass this check. For real authentication, use Cloudflare Enterprise mTLS or layer an application-level challenge-response (nonce signed with the client's private key). See [README.md → Verify](../../README.md#verify-cloudflare-worker) for the full discussion.
+> ⚠ **This is not mTLS verification, and it does not authenticate the presenter.** It only confirms the certificate was issued by the specified CA. A client certificate is by design presentable to anyone, and its contents are trivially copyable; possession of valid certificate data does **not** prove legitimate ownership. Cloudflare Workers does not expose the TLS handshake's `CertificateVerify`, so a Worker cannot revalidate the TLS-handshake proof-of-possession itself. On non-Enterprise plans, `request.cf.tlsClientAuth.certVerified` will not be `"SUCCESS"` for self-managed CAs either. An attacker holding a copied certificate will pass this check. For real authentication, use Cloudflare Enterprise mTLS or layer an application challenge that is checked with `verifyCertificateSignature`. See [README.md → Verify](../../README.md#verify-cloudflare-worker) for the full discussion.
 
 ```ts
 function verifyClientCertificateIssuedBy(options: {
@@ -721,6 +783,7 @@ Verification APIs distinguish unprocessable input from a processed certificate t
 - Malformed PEM/DER, unsupported algorithms, and invalid options throw `Error`.
 - `verifyCertificateIssuedBy` returns `false` for issuer mismatch, invalid time, or invalid signature.
 - `verifyCertificateChain` returns `{ valid: false, reason, certificateIndex }` for chain, profile, or trust failures.
+- `verifyCertificateSignature` returns `false` for a cryptographic mismatch on well-formed inputs; malformed signature encodings, invalid P1363 lengths, and invalid options throw.
 - Legacy `verifyClientCertificateIssuedBy` retains its boolean issuer-identity behavior.
 
 Revocation is out of scope and therefore has no result reason.
@@ -876,6 +939,8 @@ EdgCA does not provide:
 - Certificate chains containing two or more intermediate CAs.
 - Parsing Cloudflare-specific textual time values. The verification module parses DER certificate times; the legacy API still accepts caller-provided values.
 - CRL, OCSP, revocation databases, revocation checks.
-- TLS-handshake proof-of-possession and server hostname/SAN identity verification.
+- TLS `CertificateVerify` validation or proof-of-possession binding to the TLS connection.
+- Application-layer proof-of-possession protocol state such as nonce/challenge management, HTTP message canonicalization, one-time consumption, and replay prevention. `verifyCertificateSignature` only verifies caller-supplied bytes.
+- Server hostname/SAN identity verification.
 - Key storage, encryption-at-rest, or Cloudflare storage integration.
 - Key format conversion (PEM ↔ CryptoKey, JWK ↔ CryptoKey, etc.). The choice and conversion of a persistence format are done by the caller, using the WebCrypto API directly.

@@ -17,6 +17,7 @@ EdgCA is a stateless certificate-issuance and bounded-validation toolkit for Clo
 - Memory-safety problems, infinite loops, or unbounded allocations triggered by malformed PEM/DER input to public functions.
 - Public-API surface that allows a caller to produce a certificate that violates the documented invariants (e.g., `issueIntermediateCA` producing `pathLenConstraint > 0`).
 - Incorrect acceptance or rejection by the documented direct-issuer and bounded-chain validation policies.
+- Incorrect acceptance or rejection by `verifyCertificateSignature`, including DER/P1363 conversion or curve/hash selection errors.
 
 The following are **out of scope** (see [docs/en/NON_GOALS.md](docs/en/NON_GOALS.md) for the full list and rationale):
 
@@ -24,6 +25,7 @@ The following are **out of scope** (see [docs/en/NON_GOALS.md](docs/en/NON_GOALS
 - Operational misuse of issued material (leaked private keys, logging secrets, weak storage).
 - Caller-controlled inputs producing wrong outputs by design ("garbage in, garbage out" behavior is documented; e.g., `importCertificateAuthority` does not cryptographically validate that `issuerChainPem` actually issued `certPem`).
 - `verifyClientCertificateIssuedBy` not authenticating the presenter — by design, this function only verifies issuance, not proof-of-possession of the private key. See the Verify section of the README for details.
+- `verifyCertificateSignature` not enforcing challenge freshness, request binding, authorization, or replay prevention — it is intentionally a stateless signature primitive and accepts no private-key material.
 - Vulnerabilities in upstream dependencies (Workers runtime, Node.js, browser WebCrypto). Report those upstream.
 
 ## Audit status

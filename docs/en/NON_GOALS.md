@@ -10,6 +10,7 @@ Validation is isolated under `@noz-ele/edgca/verify`. The supported boundary is 
 
 - `verifyCertificateIssuedBy` checks one certificate/direct-issuer relationship: issuer/subject DN, AKI/SKI, signature, DER validity, and issuer CA constraints.
 - `verifyCertificateChain` validates the caller-ordered chain from the leaf's direct issuer to an explicitly supplied trusted root.
+- `verifyCertificateSignature` obtains the public key from a certificate and verifies a caller-supplied byte sequence against an ECDSA DER or IEEE P1363 signature. It does not decide whether the certificate is trusted or whether the bytes represent a valid challenge.
 - Chain validation checks DER `UTCTime`/`GeneralizedTime`, Basic Constraints, Key Usage, Extended Key Usage, `pathLenConstraint`, known critical extensions, and signature-algorithm consistency.
 - Well-formed certificates that fail trust policy return a failure value; unparseable PEM/DER and unsupported algorithms throw.
 
@@ -19,7 +20,8 @@ The following remain intentionally unimplemented:
 - **OS/runtime trust-store access.** Trust anchors are explicit in `trustedRootCertificatesPem`; a matching subject DN alone does not establish trust.
 - **Chains containing two or more intermediates.** The maximum remains `root → intermediate → leaf`.
 - **CRL / OCSP / revocation databases / revocation checks**, including validation that requires network access.
-- **TLS-handshake proof-of-possession.** A valid chain does not prove that the presenter holds the corresponding private key.
+- **TLS `CertificateVerify` validation.** EdgCA does not obtain a handshake signature or exporter from a Cloudflare-terminated TLS connection and does not provide cryptographic binding to that connection.
+- **Application-layer proof-of-possession protocols.** EdgCA does not generate, expire, store, or atomically consume nonces/challenge IDs; bind an HTTP message; or parse/canonicalize RFC 9421 fields. `verifyCertificateSignature` only verifies the caller-built byte sequence with the certificate public key.
 - **Server identity / hostname validation.** EdgCA does not compare SAN dNSName entries with a destination hostname.
 - **Cloudflare-specific text parsers.** The application converts strings such as `cf.tlsClientAuth.certNotBefore`; the verification module parses only DER `UTCTime`/`GeneralizedTime`.
 - **DER sanity checks in `certificateToPem(der)`.** Even a shallow check of "first byte is `0x30` (SEQUENCE)" is not implemented. It cannot distinguish a real cert from junk and would only provide false reassurance. Doing it properly would require a full `parseCertificateDer`, which exceeds the responsibility of an encoder. This stays a low-level encoder.
@@ -31,6 +33,7 @@ The following remain intentionally unimplemented:
 - **Uniqueness management for `serialNumber`.** Specifying the same `serialNumber` twice for the same issuer does not stop the library. The RFC 5280 §4.1.2.2 uniqueness guarantee is the caller's responsibility. Issuance history is not retained either.
 - **Issuance history / audit log / counters.** Stateless.
 - **Key storage / encryption-at-rest / KV/D1/R2 integration.**
+- **Challenge/nonce storage and replay prevention.** Durable Objects, KV, D1, or other compare-and-consume mechanisms belong to the application or protocol library.
 - **Expiry monitoring / rotation.**
 
 ## 3. Input "considerateness"
@@ -60,7 +63,7 @@ Bad input should throw. Convenience features such as trim, dedup, and auto-compl
 
 ## 5. Conditions for changing these policies
 
-- Validation can be considered when it remains explicit, stateless, WebCrypto-only, and bounded to the two-level CA hierarchy.
+- Validation can be considered when it remains explicit, stateless, WebCrypto-only, and operates only on caller-supplied certificates and byte sequences within the bounded hierarchy.
 - Requirements involving issuer discovery, external retrieval, persistent state, or revocation infrastructure belong in a dedicated PKI library/runtime.
 - "Same input → different / unexpected DER" along the single "external input → output cert" path is a **bug** and is in scope for fixing.
 - "If the caller passes lying or duplicate input, the result is wrong" and "if the caller does not share state, things break" are **by design** and are not in scope for fixing.

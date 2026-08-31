@@ -300,3 +300,83 @@ strict parsing rules:
 - `extractable: false` の秘密鍵を export して公開 JWK を作ろうとしていた Key Handling 例を、PKCS#8 private key と SPKI public key を別々に保存・import する例へ修正し、同じ flow の回帰 test を追加した。
 - Workers-compatible suite は 8 files / 477 tests、Node suite は 2 files / 166 tests、合計 643 tests が成功した。`npm run typecheck`、`npm run build`、`npm pack --dry-run --json` も成功した。
 - v0.5.2 の dry-run package は tarball 49.8 kB、展開後 192.8 kB、76 files、runtime / transitive dependency なし。
+
+## 2026-08-30: Certificate Public-Key Signature Verification
+
+### Summary
+
+- 検証済み certificate に含まれる公開鍵を使い、caller が渡した任意データの ECDSA signature を検証する `verifyCertificateSignature` を追加する。
+- この API は stateless な cryptographic primitive に限定し、`verifyProofOfPossession` とは呼ばない。nonce の新鮮性、HTTP request binding、リプレイ防止が成立して初めて protocol 全体が proof-of-possession になるため。
+- RFC 9421 の ECDSA signature が使用する固定長 `r || s` を直接扱えるよう IEEE P1363 形式を追加し、既存の X.509 / tooling と接続するため DER 形式も公開 API から扱う。
+- 日本語文書で public contract と責務境界を確定した後、実装・tests・英語文書を同期する。
+
+### Public API Addition
+
+```ts
+export type EcdsaSignatureFormat = "der" | "ieee-p1363";
+
+export interface VerifyCertificateSignatureOptions {
+  certificatePem: string;
+  data: Uint8Array;
+  signature: Uint8Array;
+  signatureFormat: EcdsaSignatureFormat;
+}
+
+export function verifyCertificateSignature(
+  options: VerifyCertificateSignatureOptions
+): Promise<boolean>;
+```
+
+- `@noz-ele/edgca/verify` から export し、後方互換の root entry point `@noz-ele/edgca` からも再 export する。
+- `signatureFormat` は必須。DER と P1363 を入力 byte 列から自動判定しない。
+- `data` は事前 hash ではなく、署名 API に渡したものと同じ生 byte 列。certificate の curve に応じて P-256/SHA-256、P-384/SHA-384、P-521/SHA-512 を適用する。
+- `"der"` は ASN.1 `SEQUENCE { INTEGER r, INTEGER s }`、`"ieee-p1363"` は固定長 `r || s`。P1363 signature の長さは P-256=64、P-384=96、P-521=132 bytes。
+- RFC 9421 の標準 ECDSA algorithm として使用するのは P-256/SHA-256 と P-384/SHA-384。P-521 対応は EdgCA の既存 algorithm scope を維持するためであり、RFC 9421 に P-521 algorithm を追加するものではない。
+
+### Verification and Failure Model
+
+- certificate PEM を解析し、SubjectPublicKeyInfo から公開鍵を取得する。
+- well-formed な入力で signature が `data` と certificate 公開鍵に一致すれば `true`、別鍵・改変 data・改変 signature なら `false`。
+- malformed PEM / DER、未対応 algorithm、不正 option、DER signature として処理不能な encode、curve に対して長さが不正な P1363 signature は例外。
+- certificate chain、信頼、有効期間、Basic Constraints、Key Usage、EKU、失効状態は検証しない。認証用途では caller が先に同じ leaf を `verifyCertificateChain({ purpose: "clientAuth" })` で検証する。
+
+### Explicit Non-Goals
+
+- Cloudflare `request.cf.tlsClientAuth` と RFC 9440 certificate field の変換。
+- TLS handshake の `CertificateVerify`、TLS exporter、TLS connection への cryptographic binding。
+- nonce、challenge ID、期限、certificate fingerprint の生成と保存。
+- nonce の原子的な一回限りの消費とリプレイ防止。
+- HTTP method、URI、authority、body digest と署名対象の結合。
+- RFC 9421 の `Accept-Signature`、`Signature-Input`、`Signature` の parse、serialization、canonicalization。
+- certificate と利用者・端末・権限の対応付け。
+- Windows certificate store、P12/PFX、C# client での秘密鍵署名。
+
+### Implementation Plan
+
+1. `src/crypto.ts` に P1363 signature を直接検証する internal helper を追加し、curve profile と WebCrypto verify の重複を避ける。既存 `verifyDer` は DER → P1363 変換後に共通 helper を呼ぶ。
+2. `src/verify.ts` に型と `verifyCertificateSignature` を追加する。既存の internal certificate parser から公開鍵を取得し、指定 format に応じて検証する。
+3. `src/index.ts` と `@noz-ele/edgca/verify` の public surface に関数と型を export する。既存 `./verify` subpath を使うため、新しい package subpath は追加しない。
+4. Workers-compatible tests、Node tests、dist entry-point tests を追加する。
+5. 実装と日本語文書の一致を確認後、英語 README / API / NON_GOALS を同期する。
+
+### Test Plan
+
+- P-256 / P-384 / P-521 について、DER 形式と IEEE P1363 形式の正常な署名を検証できる。
+- data 改変、signature 改変、別 certificate の公開鍵では `false`。
+- DER / P1363 の形式取り違え、不正 DER encode、P1363 の長さ不足・超過を拒否する。
+- malformed certificate PEM / DER、RSA / Ed25519 / unsupported curve を拒否する。
+- 入力の certificate string、data buffer、signature buffer を変更しない。
+- root entry point と `@noz-ele/edgca/verify` の両方から関数・型を import できる。
+- `@noz-ele/edgca/issuer` に verify implementation が混入しない。
+
+### Implementation Result
+
+2026-08-30 に計画範囲を実装した。
+
+- `src/crypto.ts` に `verifyP1363` を追加し、curve 別の固定長確認と WebCrypto verify を共通化した。`verifyDer` は DER → P1363 変換後に同じ helper を呼ぶ。
+- `verifyP1363` は caller buffer の backing storage を直接渡さず、対象範囲だけの `ArrayBuffer` copy を WebCrypto に渡す。非同期検証完了後に copy をゼロクリアし、caller 所有の `data` / `signature` は変更しない。
+- `src/verify.ts` に `EcdsaSignatureFormat`、`VerifyCertificateSignatureOptions`、`verifyCertificateSignature` を追加した。API は private key material を受け取らない。
+- root entry point と `@noz-ele/edgca/verify` から新 API / type を export し、`@noz-ele/edgca/issuer` には検証実装を含めていない。
+- P-256 / P-384 / P-521、DER / IEEE P1363、改変 data / signature、別 certificate、不正 encode / 長さ、RSA / Ed25519 rejection、入力非破壊、dist entry point を tests で確認した。
+- Workers-compatible suite は 9 files / 486 tests、Node suite は 2 files / 166 tests、合計 652 tests が成功した。
+- v0.6.0 の dry-run package は tarball 51.8 kB、展開後 200.1 kB、76 files、runtime / transitive dependency なし。

@@ -7,7 +7,7 @@ EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理�
 ## 特徴
 
 - **WebCrypto のみ・runtime 依存ゼロ。** 暗号演算は全て `globalThis.crypto.subtle` に委譲。Cloudflare Workers / Node.js 20+ / modern browser で polyfill や bundler shim なしに同じコードが動く。
-- **軽量。** v0.6.0 — tarball **49.8 kB** / 展開後 **192.8 kB** / 76 files。transitive dependency ゼロ。CLI も `node:util.parseArgs` のみ。(release ごとに再計測)
+- **軽量。** v0.6.0 — tarball **51.8 kB** / 展開後 **200.1 kB** / 76 files。transitive dependency ゼロ。CLI も `node:util.parseArgs` のみ。(release ごとに再計測)
 - **CA 階層 (2 段)。** 自己署名 root CA を作る、必要なら root から intermediate CA を発行する。3 段以上の intermediate は意図的に scope 外。
 - **PFX (PKCS#12) bundling。** 証明書 + 秘密鍵 (+ 任意の chain) を password 付き `.pfx` / `.p12` にまとめ OS 証明書ストア (Win11+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux) 取り込み用に書き出す。algorithm 非依存で、任意の PKCS#8 DER bytes (ECDSA / RSA / Ed25519 等) を受ける。
 - **mTLS client certificate 発行。** 内部鍵生成、または下の CSR 経由で caller 管理の公開鍵から発行。
@@ -15,6 +15,7 @@ EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理�
 - **文書署名用 certificate (RFC 9336)。** EKU `id-kp-documentSigning` の leaf を発行。CAdES / CMS / ASiC tool 等の signer cert として使う (container 生成は別 tool)。
 - **発行元判定。** 受け取った client certificate が自 CA 発行かを判定 (issuer identity 確認のみ、完全な mTLS 検証ではない)。
 - **限定的な chain validation。** caller が順番を明示した `leaf → intermediate → trusted root` の署名、期限、CA 制約、用途を検証。PKI path の自動探索や失効確認は行わない。
+- **certificate 公開鍵による任意データの署名検証。** 検証済み certificate から公開鍵を取り出し、ECDSA DER または IEEE P1363 形式の署名を検証する。challenge の生成・保存やリプレイ防止は application の責務。
 - **PEM/DER の encode/decode** (certificate と PKCS#10 CSR)。
 - **API 境界での秘密鍵 hygiene。** 秘密鍵は public API 上 `CryptoKey` (発行系) または `Uint8Array` PKCS#8 bytes (`exportPkcs12`) のみで扱い、`string` で受け渡さない。JS の string は immutable で GC まで heap に残り wipe できないため、秘密鍵を string で保持することを設計上避ける。PEM ↔ CryptoKey の変換は caller 側 (string 表現の寿命を caller が制御できるようにするため)。
 
@@ -33,6 +34,7 @@ EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理�
 - [文書署名用 certificate を発行する](#文書署名用-certificate-を発行する) — RFC 9336 `id-kp-documentSigning` の leaf を発行
 - [Verify (Cloudflare Worker)](#verify-cloudflare-worker) — 自 CA から発行されたかを判定
 - [Certificate chain verification](#certificate-chain-verification) — 明示した chain を trusted root まで検証
+- [Certificate signature verification](#certificate-signature-verification) — certificate の公開鍵で任意データの署名を検証
 - [CSR から発行する](#csr-から発行する) — client が秘密鍵を保持する構成 (PKCS#10 + POP)
 - [Subject](#subject) · [Scope](#scope) · [Key Handling](#key-handling) · [Development](#development) · [API Documentation](#api-documentation)
 
@@ -57,7 +59,10 @@ root の `@noz-ele/edgca` は後方互換のため全 API を再 export しま�
 import { createRootCA, issueClientCert } from "@noz-ele/edgca/issuer";
 
 // 公開証明書による検証だけ (CA 秘密鍵は不要)
-import { verifyCertificateChain } from "@noz-ele/edgca/verify";
+import {
+  verifyCertificateChain,
+  verifyCertificateSignature
+} from "@noz-ele/edgca/verify";
 
 // PFX 組み立てだけ
 import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
@@ -255,7 +260,7 @@ const signer = await issueDocumentSigningCert({
 >
 > client certificate はそもそも誰にでも提示してよい情報なので、内容は容易にコピーできます。**「誰でも client certificate の情報は持ち得る」と仮定しなければなりません**。したがって証明書情報を持っているという事実は、正当な持ち主であることの根拠には**絶対になりません**。
 >
-> 正当な持ち主であることを確認するには、加えて対応する秘密鍵を所持していることの確認 — すなわち秘密鍵で署名された情報を証明書中の公開鍵で検証する作業 — が必要です。通常の TLS handshake では client が `CertificateVerify` message でこれを行いますが、**Cloudflare Workers の runtime はこの署名を application に公開しません**。また Enterprise プラン以外では Cloudflare 自身の TLS レイヤーも自前 CA を知らないため、EdgCA で発行した証明書に対して `request.cf.tlsClientAuth.certVerified === "SUCCESS"` になることはありません。Workers 上の application code が proof-of-possession を検証する手段は (Enterprise プランを除き) 存在しません。
+> 正当な持ち主であることを確認するには、加えて対応する秘密鍵を所持していることの確認 — すなわち秘密鍵で署名された情報を証明書中の公開鍵で検証する作業 — が必要です。通常の TLS handshake では client が `CertificateVerify` message でこれを行いますが、**Cloudflare Workers の runtime はこの署名を application に公開しないため、Worker は TLS handshake 自体の proof-of-possession を再検証できません**。また Enterprise プラン以外では Cloudflare 自身の TLS レイヤーも自前 CA を知らないため、EdgCA で発行した証明書に対して `request.cf.tlsClientAuth.certVerified === "SUCCESS"` になることはありません。一方、application layer で server が nonce を発行し、client が対応する秘密鍵で署名した別のデータは、`verifyCertificateSignature` を使って certificate の公開鍵で検証できます。
 >
 > 実用上の含意: どこかで (log、漏洩 storage、handshake 中のネットワーク観測など) 有効な証明書のコピーを入手した攻撃者は、それを提示してこの check を通過できます。この関数は *最低限の identity check の 1 層* として使うものであり、認証としては使えません。本物の認証には (a) Cloudflare Enterprise で TLS レイヤー mTLS を使うか、(b) server が発行した nonce を client が秘密鍵で署名して返す application layer の challenge-response を追加してください。
 >
@@ -381,6 +386,56 @@ if (!result.valid) {
 
 既存の `verifyClientCertificateIssuedBy` は後方互換のため残し、引数と挙動を変えません。新規コードでは、1 link だけなら `verifyCertificateIssuedBy`、trusted root まで確認するなら `verifyCertificateChain` を使います。詳細な契約と失敗理由は [API Documentation](API.md) を参照してください。
 
+## Certificate signature verification
+
+`verifyCertificateSignature` は、certificate 内の公開鍵で caller が渡した任意の byte 列の ECDSA 署名を検証します。certificate chain、期限、Key Usage、EKU、失効状態はこの関数では検証しません。認証用途では、先に `verifyCertificateChain({ purpose: "clientAuth" })` を成功させ、その同じ leaf certificate を渡します。
+
+```ts
+import {
+  verifyCertificateChain,
+  verifyCertificateSignature
+} from "@noz-ele/edgca/verify";
+
+const chain = await verifyCertificateChain({
+  certificatePem: clientPem,
+  intermediateCertificatesPem: [intermediatePem],
+  trustedRootCertificatesPem: [rootPem],
+  purpose: "clientAuth"
+});
+if (!chain.valid) {
+  throw new Error(`certificate chain rejected: ${chain.reason}`);
+}
+
+const signatureValid = await verifyCertificateSignature({
+  certificatePem: clientPem,
+  // nonce、HTTP method、URI、body digest 等を application が結合した
+  // 署名対象そのもの。事前 hash ではなく、署名時と同じ生 byte 列を渡す。
+  data: signatureBase,
+  signature: signatureBytes,
+  // RFC 9421 の ECDSA signature は固定長 r || s 形式。
+  signatureFormat: "ieee-p1363"
+});
+```
+
+ECDSA signature は 2 つの整数 `(r, s)` から成り、同じ署名でも byte 表現に次の 2 形式があります。
+
+| `signatureFormat` | 表現 | 用途 |
+| --- | --- | --- |
+| `"der"` | ASN.1 `SEQUENCE { INTEGER r, INTEGER s }`。整数 encode により全体長が変わる。 | X.509、DER 出力を選んだ C# / OpenSSL 等 |
+| `"ieee-p1363"` | curve ごとの固定長 `r || s`。P-256 は 64 bytes、P-384 は 96 bytes、P-521 は 132 bytes。 | RFC 9421、WebCrypto の ECDSA signature 表現 |
+
+形式は自動判定せず、caller が必ず指定します。RFC 9421 の標準 ECDSA algorithm は P-256/SHA-256 と P-384/SHA-384 です。EdgCA 自体の署名検証は既存の algorithm 範囲に合わせて P-521/SHA-512 も扱いますが、P-521 を RFC 9421 algorithm として扱う意味ではありません。
+
+この関数が返す `true` は「指定された `data` が、その certificate の公開鍵に対応する秘密鍵で署名された」ことだけを示します。次は caller が別途保証します。
+
+- nonce と challenge ID の生成、期限、保存、一回限りの消費。
+- HTTP method、URI、authority、body digest 等を署名対象へ結び付ける処理。
+- RFC 9421 の `Accept-Signature`、`Signature-Input`、`Signature` の parse・正規化。
+- 初回 request と再送 request の certificate fingerprint 一致確認。
+- certificate と利用者・端末・権限の対応付け。
+
+したがって関数名は `verifyProofOfPossession` ではありません。nonce の新鮮性やリプレイ防止を含む application protocol が成立して初めて、全体として proof-of-possession になります。
+
 ## CSR から発行する
 
 client が秘密鍵を自分で管理し PKCS#10 CSR を送ってくる場合、EdgCA は CSR を parse し、所持証明 (POP) 署名を検証し、CSR 内の公開鍵を埋めた証明書を発行できます。CSR が主張する subject / SAN は **library が自動採用しません** — 発行内容は呼び出し側が application 層のポリシーに従って明示的に渡します。
@@ -448,6 +503,7 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 - 自己 CA からの発行かを判定する identity 確認 API (`verifyClientCertificateIssuedBy`、任意の時刻有効性 check 付き)。
 - 公開証明書だけを使う直接 issuer 検証 (`verifyCertificateIssuedBy`)。
 - caller が順序と trusted root を明示する最大 `root → intermediate → leaf` の chain validation (`verifyCertificateChain`)。DER 内の時刻、CA / Key Usage / EKU / path length、critical extension を検証する。
+- certificate の公開鍵による任意データの ECDSA 署名検証 (`verifyCertificateSignature`)。DER / IEEE P1363 形式を caller が明示する。
 - 発行・検証の用途別 subpath (`@noz-ele/edgca/issuer` / `@noz-ele/edgca/verify`)。
 - PEM/DER helper (証明書のみ — 鍵は CryptoKey でやり取り)。
 - 発行済み証明書 + 秘密鍵の PFX (PKCS#12) export。PBES2 (PBKDF2-HMAC-SHA-256 + AES-256-CBC) と HMAC-SHA-256 MAC で構成し、対象は Win11+ / Server 2019+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux consumer。
@@ -464,7 +520,8 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 - intermediate を 2 本以上含む CA hierarchy / chain 検証。最大 `root → intermediate → leaf`。
 - Cloudflare 固有 textual time の parse。verify module は certificate DER 内の時刻だけを parse する。
 - CRL、OCSP、失効 DB、失効確認。
-- TLS handshake / proof-of-possession の検証。
+- TLS handshake の `CertificateVerify` と TLS connection 自体への proof-of-possession binding。
+- nonce、challenge、HTTP message 正規化、リプレイ防止を含む application-layer proof-of-possession protocol。EdgCA は certificate 公開鍵による署名検証プリミティブだけを提供する。
 - server certificate の hostname / SAN identity 検証。
 - 鍵の保管、暗号化保存、ローテーション永続化、KV/D1/R2/Secrets 連携。
 - 発行・CSR・certificate 検証における RSA、EdDSA、別 elliptic curve。

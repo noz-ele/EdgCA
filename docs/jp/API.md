@@ -17,6 +17,7 @@ import {
   verifyCertificateSigningRequestSignature,
   verifyCertificateIssuedBy,
   verifyCertificateChain,
+  verifyCertificateSignature,
   verifyClientCertificateIssuedBy,
   certificateToPem,
   csrToPem,
@@ -46,7 +47,8 @@ import {
 // 公開証明書による検証だけ。issuer module と CA 秘密鍵は不要。
 import {
   verifyCertificateIssuedBy,
-  verifyCertificateChain
+  verifyCertificateChain,
+  verifyCertificateSignature
 } from "@noz-ele/edgca/verify";
 
 // PFX 組み立てだけ。
@@ -194,6 +196,19 @@ type CertificateChainVerificationResult =
 ```
 
 `certificateIndex` は `0` が target certificate、`1` がその直接 issuer で、chain 上の位置を表します。`untrusted-root` では次に必要だった terminal issuer の位置を示します。trust 条件を満たさない well-formed certificate は `valid: false`。PEM / DER として解析不能、未対応 signature algorithm、API option 不正は結果値ではなく例外です。
+
+### `EcdsaSignatureFormat`
+
+```ts
+type EcdsaSignatureFormat = "der" | "ieee-p1363";
+```
+
+`verifyCertificateSignature` に渡す ECDSA signature の byte 表現です。
+
+- `"der"`: ASN.1 `SEQUENCE { INTEGER r, INTEGER s }`。各 INTEGER の符号保持 encode により全体長は可変。
+- `"ieee-p1363"`: `r` と `s` を curve の component size にゼロ埋めし、`r || s` の順に連結した固定長表現。P-256 は 64 bytes、P-384 は 96 bytes、P-521 は 132 bytes。
+
+形式の自動判定は行いません。caller は署名を生成した API / protocol に合わせて必ず明示します。RFC 9421 の `ecdsa-p256-sha256` と `ecdsa-p384-sha384` は `"ieee-p1363"` に対応します。
 
 ### `ExportPkcs12Input`
 
@@ -533,13 +548,73 @@ if (!result.valid) {
 }
 ```
 
+### `verifyCertificateSignature(options)`
+
+certificate に含まれる公開鍵を使い、caller が渡した任意データの ECDSA signature を検証します。
+
+```ts
+function verifyCertificateSignature(options: {
+  certificatePem: string;
+  data: Uint8Array;
+  signature: Uint8Array;
+  signatureFormat: EcdsaSignatureFormat;
+}): Promise<boolean>;
+```
+
+入力規則:
+
+- `certificatePem` は公開鍵を取得する leaf certificate PEM。先頭の `BEGIN CERTIFICATE` block を読む。
+- `data` は署名時に使用したものと同じ生 byte 列。事前計算した digest ではなく、WebCrypto が対応 hash を適用する前の message を渡す。
+- `signature` は `signatureFormat` で指定した byte 表現の ECDSA signature。
+- `signatureFormat` は `"der"` または `"ieee-p1363"` の必須指定。形式を byte 列から推測しない。
+
+certificate の公開鍵 curve に応じて、P-256/SHA-256、P-384/SHA-384、P-521/SHA-512 の標準ペアリングで検証します。well-formed な入力で cryptographic signature が一致すれば `true`、別の鍵、改変された `data`、または改変された署名なら `false` を返します。不正な PEM / DER、未対応 algorithm、不正な署名形式、curve に対して不正な長さの P1363 signature は例外です。
+
+この関数は次を検証しません。
+
+- certificate chain、trust anchor、有効期間、Basic Constraints、Key Usage、EKU、失効状態。
+- nonce / challenge の発行時刻、有効期限、一意性、未使用状態。
+- HTTP method、URI、authority、body digest と `data` の対応。
+- RFC 9421 の `Accept-Signature`、`Signature-Input`、`Signature` の parse と canonicalization。
+- TLS handshake の `CertificateVerify` や TLS connection への binding。
+
+認証用途では、先に同じ `certificatePem` を `verifyCertificateChain({ purpose: "clientAuth" })` で検証し、application が nonce、HTTP request、certificate fingerprint 等から再構築した署名対象を `data` に渡します。
+
+```ts
+import {
+  verifyCertificateChain,
+  verifyCertificateSignature
+} from "@noz-ele/edgca/verify";
+
+const chain = await verifyCertificateChain({
+  certificatePem: clientPem,
+  intermediateCertificatesPem: [intermediatePem],
+  trustedRootCertificatesPem: [rootPem],
+  purpose: "clientAuth"
+});
+if (!chain.valid) {
+  throw new Error(`certificate chain rejected: ${chain.reason}`);
+}
+
+const signatureValid = await verifyCertificateSignature({
+  certificatePem: clientPem,
+  data: signatureBase,
+  signature: signatureBytes,
+  signatureFormat: "ieee-p1363"
+});
+```
+
+この API は cryptographic signature primitive であり、それ単体を `verifyProofOfPossession` とは呼びません。nonce の新鮮性、リプレイ防止、request binding を caller が成立させた時に、protocol 全体として private key の proof-of-possession になります。
+
+この関数は private key material を入力に取りません。caller 所有の `data` / `signature` buffer は変更せず、WebCrypto に渡すために作成した範囲ぴったりの一時 `ArrayBuffer` copy は検証完了後にゼロクリアします。certificate と signature は公開情報ですが、`data` に機密性のある request 内容が含まれる可能性を考慮し、library が作った余分な copy の寿命を検証処理内に限定します。
+
 ### `verifyClientCertificateIssuedBy(options)`
 
 > **互換 API:** 新規コードでは `@noz-ele/edgca/verify` の `verifyCertificateIssuedBy` または `verifyCertificateChain` を推奨します。この API は既存 caller のため root entry point に残し、現在の引数と挙動を変更しません。
 
 `options.ca` が `options.certPem` を発行した issuer か判定します。Cloudflare Workers で `request.cf.tlsClientAuth.certRFC9440` を decode した PEM を受け取り、自分の自己 CA が発行した cert かを application 側で確認するための post-handshake な発行元 check です。
 
-> ⚠ **これは mTLS の検証ではなく、提示者の認証もしません。** 単に「証明書が指定 CA で発行されたか」を判定するだけです。client certificate は誰にでも提示できる情報で内容は容易にコピーできるため、証明書情報を持っていることは正当な持ち主であることの根拠になりません。Proof-of-possession には対応する秘密鍵による署名検証が必要ですが、Cloudflare Workers runtime はその署名を公開しません。非 Enterprise プランでは自前 CA に対して `request.cf.tlsClientAuth.certVerified === "SUCCESS"` にもなりません。コピーした証明書を提示する攻撃者はこの check を通過します。本物の認証には Cloudflare Enterprise mTLS、または application 層の challenge-response (nonce を秘密鍵で署名させる) を重ねてください。詳細は [README.md → Verify](README.md#verify-cloudflare-worker) を参照。
+> ⚠ **これは mTLS の検証ではなく、提示者の認証もしません。** 単に「証明書が指定 CA で発行されたか」を判定するだけです。client certificate は誰にでも提示できる情報で内容は容易にコピーできるため、証明書情報を持っていることは正当な持ち主であることの根拠になりません。Cloudflare Workers runtime は TLS handshake の `CertificateVerify` を公開しないため、Worker は TLS handshake 自体の proof-of-possession を再検証できません。非 Enterprise プランでは自前 CA に対して `request.cf.tlsClientAuth.certVerified === "SUCCESS"` にもなりません。コピーした証明書を提示する攻撃者はこの check を通過します。本物の認証には Cloudflare Enterprise mTLS、または application 層で nonce 等を署名させ、`verifyCertificateSignature` で検証する challenge-response を重ねてください。詳細は [README.md → Verify](README.md#verify-cloudflare-worker) を参照。
 
 ```ts
 function verifyClientCertificateIssuedBy(options: {
@@ -747,6 +822,7 @@ EdgCA は invalid input や対象外操作に対して `Error` を投げます�
 - 壊れた PEM / DER、未対応 algorithm、不正な option は `Error`。
 - `verifyCertificateIssuedBy` の issuer 不一致、期限外、署名不正は `false`。
 - `verifyCertificateChain` の chain / profile / trust 不成立は `CertificateChainVerificationResult` の `{ valid: false, reason, certificateIndex }`。
+- `verifyCertificateSignature` は well-formed な入力に対する署名不一致を `false`、不正な署名 encode、P1363 の長さ不一致、不正 option を `Error` とする。
 - legacy `verifyClientCertificateIssuedBy` は従来どおり CA 局判定の `boolean`。
 
 失効状態は検証対象外なので result reason に含めません。
@@ -902,7 +978,8 @@ EdgCA は限定的な chain validation を提供しますが、次は提供し�
 - intermediate を 2 本以上含む CA hierarchy / chain 検証。最大 `root → intermediate → leaf`。
 - Cloudflare 固有の textual time parser。certificate DER 内の `UTCTime` / `GeneralizedTime` は verify module が parse するが、`cf.tlsClientAuth.certNotBefore` / `certNotAfter` の文字列変換は application 側。
 - CRL、OCSP、失効 DB、失効確認。
-- TLS handshake と certificate private key の proof-of-possession 検証。
+- TLS handshake の `CertificateVerify` と TLS connection 自体への proof-of-possession binding。
+- nonce、challenge、HTTP message canonicalization、保存、一回限りの消費、リプレイ防止を含む application-layer proof-of-possession protocol。`verifyCertificateSignature` は caller が渡した byte 列の署名検証だけを行う。
 - server certificate の hostname / SAN identity 検証。
 - 鍵の保管、暗号化保存、Cloudflare storage 連携。
 - key の format 変換 (PEM ↔ CryptoKey、JWK ↔ CryptoKey 等)。永続化形式の選択と変換は呼び出し側で WebCrypto API を直接使って行う。

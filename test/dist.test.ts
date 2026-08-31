@@ -21,6 +21,7 @@ describe("published dist API", () => {
     const issuer = await import("../dist/issuer.js");
     const verifier = await import("../dist/verify.js");
     expect("verifyCertificateChain" in issuer).toBe(false);
+    expect("verifyCertificateSignature" in issuer).toBe(false);
     expect("createRootCA" in verifier).toBe(false);
 
     const root = await issuer.createRootCA({
@@ -37,6 +38,20 @@ describe("published dist API", () => {
       trustedRootCertificatesPem: [root.certPem],
       purpose: "clientAuth"
     })).resolves.toEqual({ valid: true, trustedRootIndex: 0 });
+
+    const data = new TextEncoder().encode("published-signature-verifier");
+    const dataBuffer = new Uint8Array(data).buffer;
+    const signature = new Uint8Array(await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      client.privateKey,
+      dataBuffer
+    ));
+    await expect(verifier.verifyCertificateSignature({
+      certificatePem: client.certPem,
+      data,
+      signature,
+      signatureFormat: "ieee-p1363"
+    })).resolves.toBe(true);
   });
 
   it("honors caller-provided CA private keys", async () => {
