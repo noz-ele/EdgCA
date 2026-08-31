@@ -495,5 +495,5 @@ signature=$(edgca sign-data \
 - malformed base64url と file I/O を同時に開始しないよう、inline data の UsageError 検証を I/O より先に完了させ、CLI の exit code を決定的にした。
 - P-256 / P-384 / P-521、DER / P1363、改変 data、invalid key / usage / options、caller buffer 非破壊、CLI の base64url / file input、entry point isolation を tests で確認した。
 - Workers-compatible suite は 10 files / 494 tests、Node suite は 2 files / 170 tests、合計 664 tests が成功した。`npm run typecheck`、`npm run build`、`npm pack --dry-run --json` も成功した。
-- 現在の version 0.7.0 設定での dry-run package は tarball 54.3 kB、展開後 210.1 kB、82 files、runtime / transitive dependency なし。version bump / release はこの実装には含めていない。
-- sign library の Node.js / Workers-compatible runtime tests と built ESM dependency の Node-only import 不在を確認した。既存 test harness に実 browser runner はないため、browser の自動 smoke test 追加は release 前の残作業とする。
+- v0.8.0 の publish dry-run package は tarball 54.1 kB、展開後 209.8 kB、82 files、runtime / transitive dependency なし。
+- sign library の Node.js / Workers-compatible runtime tests と built ESM dependency の Node-only import 不在を確認した。さらに実 browser で `dist/sign.js` を読み込み、P-256 / IEEE P1363 の署名生成と WebCrypto 検証が成功する smoke test を実施した。

@@ -7,7 +7,7 @@ EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理�
 ## 特徴
 
 - **WebCrypto のみ・runtime 依存ゼロ。** 暗号演算は全て `globalThis.crypto.subtle` に委譲。Cloudflare Workers / Node.js 20+ / modern browser で polyfill や bundler shim なしに同じコードが動く。
-- **軽量。** v0.7.0 — tarball **51.8 kB** / 展開後 **200.1 kB** / 76 files。transitive dependency ゼロ。CLI も `node:util.parseArgs` のみ。(release ごとに再計測)
+- **軽量。** v0.8.0 — tarball **54.1 kB** / 展開後 **209.8 kB** / 82 files。transitive dependency ゼロ。CLI も `node:util.parseArgs` のみ。(release ごとに再計測)
 - **CA 階層 (2 段)。** 自己署名 root CA を作る、必要なら root から intermediate CA を発行する。3 段以上の intermediate は意図的に scope 外。
 - **PFX (PKCS#12) bundling。** 証明書 + 秘密鍵 (+ 任意の chain) を password 付き `.pfx` / `.p12` にまとめ OS 証明書ストア (Win11+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux) 取り込み用に書き出す。algorithm 非依存で、任意の PKCS#8 DER bytes (ECDSA / RSA / Ed25519 等) を受ける。
 - **mTLS client certificate 発行。** 内部鍵生成、または下の CSR 経由で caller 管理の公開鍵から発行。
@@ -42,9 +42,7 @@ EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理�
 
 ## Status
 
-EdgCA は **v0.7.x の初期安定化フェーズ**です。作者が実際の Cloudflare Workers 環境で検証している最中で、API が変わる可能性があります。検証に集中するため、**外部からの Issue と PR は一時的に制限**しており、API が落ち着いた後に再開します。read / clone / fork / `npm install` は通常通り可能です。
-
-`@noz-ele/edgca/sign` と `edgca sign-data` は現在の repository HEAD に実装済みですが、まだ npm release には含まれていません。publish 前の `npx @noz-ele/edgca sign-data ...` は npm 上の既存 release を実行するため使えません。local build は `node dist/cli.js sign-data ...` で検証できます。
+EdgCA は **v0.8.x の初期安定化フェーズ**です。作者が実際の Cloudflare Workers 環境で検証している最中で、API が変わる可能性があります。検証に集中するため、**外部からの Issue と PR は一時的に制限**しており、API が落ち着いた後に再開します。read / clone / fork / `npm install` は通常通り可能です。
 
 ## Install
 
@@ -56,7 +54,7 @@ ESM 専用 (`"type": "module"`) で、`globalThis.crypto.subtle` が動く runti
 
 ### Package entry points
 
-v0.7.0 の root `@noz-ele/edgca` は後方互換のため現行 public API を再 export します。用途別 subpath を使うと、発行だけを使う bundle に検証実装が入ることを tree-shaking の成否に依存せず避けられます。
+v0.8.0 の root `@noz-ele/edgca` は後方互換のため現行 public API を再 export します。用途別 subpath を使うと、発行だけを使う bundle に検証実装が入ることを tree-shaking の成否に依存せず避けられます。
 
 ```ts
 // CA 作成・証明書発行だけ

@@ -31,7 +31,7 @@ import {
 } from "@noz-ele/edgca";
 ```
 
-v0.7.0 の root entry point は後方互換の aggregate surface とし、現行 public API を再 export します。用途を限定して bundle したい場合は次の subpath を使います。
+v0.8.0 の root entry point は後方互換の aggregate surface とし、現行 public API を再 export します。用途を限定して bundle したい場合は次の subpath を使います。
 
 ```ts
 // CA 作成・証明書発行だけ。verify module を静的 import しない。

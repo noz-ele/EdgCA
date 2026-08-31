@@ -7,7 +7,7 @@ EdgCA is a small TypeScript library for issuing mTLS client certificates and doc
 ## Features
 
 - **WebCrypto-only, zero runtime dependencies.** All cryptographic operations go through `globalThis.crypto.subtle`. The same code runs on Cloudflare Workers, Node.js 20+, and modern browsers without polyfills or bundler shims.
-- **Lightweight.** v0.7.0 — tarball **51.8 kB** · unpacked **200.1 kB** · 76 files. No transitive dependencies; the CLI uses only `node:util.parseArgs`. (Re-measured on every release.)
+- **Lightweight.** v0.8.0 — tarball **54.1 kB** · unpacked **209.8 kB** · 82 files. No transitive dependencies; the CLI uses only `node:util.parseArgs`. (Re-measured on every release.)
 - **CA hierarchy (two-level).** Create a self-signed root CA and, optionally, issue an intermediate CA from it. Three or more levels of intermediates are intentionally out of scope.
 - **PFX (PKCS#12) bundling.** Wrap a cert + private key (and optional chain) into a password-protected `.pfx` / `.p12` for OS keystore import (Win11+, macOS 15+, iOS/iPadOS 18+, modern Linux). Algorithm-agnostic — accepts arbitrary PKCS#8 DER bytes (ECDSA, RSA, Ed25519, …).
 - **mTLS client certificate issuance.** Issue a leaf with internal key generation, or from a caller-managed key via the CSR path below.
@@ -42,9 +42,7 @@ EdgCA is a small TypeScript library for issuing mTLS client certificates and doc
 
 ## Status
 
-EdgCA is in **v0.7.x — early stabilization**. The author is currently validating the library against real Cloudflare Workers deployments, and the API surface may still shift. To keep that validation focused, **external Issues and PRs are temporarily restricted** and will be re-opened once the API settles. Reading, cloning, forking, and `npm install` are unaffected.
-
-`@noz-ele/edgca/sign` and `edgca sign-data` are implemented on the current repository HEAD but have not yet been included in an npm release. Until a new version is published, `npx @noz-ele/edgca sign-data ...` resolves the existing npm release and will not provide this command. Test a local build with `node dist/cli.js sign-data ...`.
+EdgCA is in **v0.8.x — early stabilization**. The author is currently validating the library against real Cloudflare Workers deployments, and the API surface may still shift. To keep that validation focused, **external Issues and PRs are temporarily restricted** and will be re-opened once the API settles. Reading, cloning, forking, and `npm install` are unaffected.
 
 ## Install
 
