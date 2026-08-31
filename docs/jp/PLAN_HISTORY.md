@@ -379,4 +379,4 @@ export function verifyCertificateSignature(
 - root entry point と `@noz-ele/edgca/verify` から新 API / type を export し、`@noz-ele/edgca/issuer` には検証実装を含めていない。
 - P-256 / P-384 / P-521、DER / IEEE P1363、改変 data / signature、別 certificate、不正 encode / 長さ、RSA / Ed25519 rejection、入力非破壊、dist entry point を tests で確認した。
 - Workers-compatible suite は 9 files / 486 tests、Node suite は 2 files / 166 tests、合計 652 tests が成功した。
-- v0.6.0 の dry-run package は tarball 51.8 kB、展開後 200.1 kB、76 files、runtime / transitive dependency なし。
+- v0.7.0 の dry-run package は tarball 51.8 kB、展開後 200.1 kB、76 files、runtime / transitive dependency なし。

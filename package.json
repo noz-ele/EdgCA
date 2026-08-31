@@ -1,6 +1,6 @@
 {
   "name": "@noz-ele/edgca",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "A small Cloudflare Workers-friendly toolkit for issuing and validating bounded self-managed CA chains.",
   "type": "module",
   "license": "MIT",
@@ -58,7 +58,7 @@
   },
   "types": "./dist/index.d.ts",
   "bin": {
-    "edgca": "./dist/cli.js"
+    "edgca": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
