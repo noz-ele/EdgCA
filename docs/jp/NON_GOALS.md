@@ -21,7 +21,7 @@ EdgCA は、証明書の発行と、明示的に与えられた trust anchor に
 - **intermediate を 2 本以上含む chain の検証**。発行機能と同じく最大 `root → intermediate → leaf` に限定する。
 - **CRL / OCSP / 失効 DB / 失効確認**。network access を伴う検証も行わない。
 - **TLS handshake の `CertificateVerify` 検証**。Cloudflare が終端した TLS connection の handshake signature や exporter を application から取得せず、TLS connection 自体への cryptographic binding は提供しない。
-- **application-layer proof-of-possession protocol**。nonce / challenge ID の生成、期限、保存、原子的な一回限りの消費、HTTP message への binding、RFC 9421 header の parse / canonicalization は行わない。`verifyCertificateSignature` は caller が構築した byte 列の署名が certificate 公開鍵で検証できるかだけを返す。
+- **application-layer proof-of-possession protocol**。nonce / challenge ID の生成、期限、保存、原子的な一回限りの消費、HTTP message への binding、RFC 9421 header の parse / canonicalization は行わない。`verifyCertificateSignature` は caller が構築した byte 列の署名を検証するだけ。`signData` も caller が構築した byte 列を署名するだけで、challenge protocol の意味を解釈しない。
 - **server identity / hostname 検証**。SAN dNSName と接続先 hostname の照合は行わない。検証用途は EdgCA が発行対象とする mTLS client cert と文書署名 cert に限定する。
 - **Cloudflare 固有文字列の parser**。`cf.tlsClientAuth.certNotBefore` / `certNotAfter` の `"Dec  4 23:59:59 2025 GMT"` のような文字列は application が変換する。verify module が parse するのは certificate DER 内の `UTCTime` / `GeneralizedTime`。
 - **`certificateToPem(der)` での DER 妥当性検査**。先頭 byte が `0x30` (SEQUENCE) かどうかの shallow check も実装しない。本物の cert との区別はつかず、誤った安心感を与えるだけ。本気でやるなら `parseCertificateDer` 全実行が必要で、encoder の責務を超える。低 level encoder のまま。
@@ -49,6 +49,18 @@ EdgCA は、証明書の発行と、明示的に与えられた trust anchor に
 
 ## 4. 機能スコープ
 
+### 限定的な署名 surface
+
+caller が保持する ECDSA `CryptoKey` と任意の生 byte 列を受ける stateless な `signData` を `@noz-ele/edgca/sign` からのみ提供する。
+
+- P-256/SHA-256、P-384/SHA-384、P-521/SHA-512 の固定ペアのみ。
+- signature 表現は DER / IEEE P1363 を caller が明示する。
+- library API は `CryptoKey` / `Uint8Array` だけを受け、PEM string、key path、保管先を扱わない。
+- sign subpath は root entry point から再 export しない。発行・検証・PFX だけを使う application からの static dependency を作らない。
+- CLI には PKCS#8 PEM を読む `edgca sign-data` を提供するが、internal PEM importer は public library API にしない。CLI は入力 bytes の署名と base64url 出力までを担当し、HTTP 送信は行わない。
+
+この限定的な signing primitive を追加しても、nonce、challenge、HTTP message canonicalization、状態管理、リプレイ防止を EdgCA の scope に入れない。
+
 - **server certificate 発行なし**。leaf は mTLS client cert (`issueClientCert` / `issueClientCertForPublicKey`) と文書署名用 cert (`issueDocumentSigningCert`、RFC 9336 `id-kp-documentSigning`) を対象とし、TLS server cert は対象外。
 - **文書署名 leaf に SAN なし**。`issueDocumentSigningCert` は `dnsNames` / `ipAddresses` / `emailAddresses` を受け取らない。文書署名 cert における署名者の identity は Subject DN で示すという方針。下流 profile が SAN を要求する場合は library を拡張する側の責任で、v1 では持たない。
 - **文書署名の CSR 経由発行なし (v1)**。`issueDocumentSigningCertForPublicKey` は提供しない。内部鍵生成のみ。mTLS 側に CSR 版があるのは「client が自分の秘密鍵を保持する flow」が一般的だからで、文書署名 leaf は CA host / HSM 側で鍵保管したまま発行する flow が一般的なため、対称性は v1 では入れない。
@@ -64,6 +76,7 @@ EdgCA は、証明書の発行と、明示的に与えられた trust anchor に
 ## 5. これらの方針が変わる条件
 
 - 明示的な certificate と caller が構築した byte 列だけで完結し、stateless・WebCrypto-only・最大 2-level CA hierarchy を維持できる検証は追加を検討できる。
+- caller が保持する `CryptoKey` と caller が構築した byte 列だけで完結し、stateless・WebCrypto-only・既存 ECDSA profile を維持できる署名 primitive は追加を検討できる。
 - issuer 自動探索、外部取得、永続状態、失効基盤が必要な要求は EdgCA ではなく専用 PKI library / runtime に委ねる。
 - 「外部入力 → 出力 cert」の単一 path で「同じ入力なのに違う／想定外の DER が出る」は **bug**。これは修正対象。
 - 「caller が嘘・重複入力を渡したら結果が嘘」「caller が状態を共有しないと壊れる」は **設計通り**。修正対象ではない。

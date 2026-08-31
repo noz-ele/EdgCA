@@ -28,6 +28,8 @@ export type Subject = SubjectAttribute[];
 
 export type SerialNumber = bigint | number | string | Uint8Array;
 
+export type EcdsaSignatureFormat = "der" | "ieee-p1363";
+
 export interface CertificateAuthority {
   certPem: string;
   certDer: Uint8Array;

@@ -63,10 +63,33 @@ export async function generateKeyPair(curve: SupportedCurve = "P-256"): Promise<
 export async function signDer(privateKey: CryptoKey, data: Uint8Array): Promise<Uint8Array> {
   const curve = curveOf(privateKey);
   const profile = CURVE_PROFILE[curve];
-  const raw = new Uint8Array(
-    await crypto.subtle.sign({ name: "ECDSA", hash: profile.hash }, privateKey, arrayBufferFromBytes(data))
-  );
-  return ecdsaRawToDer(raw, profile.componentSize);
+  const raw = await signP1363(privateKey, data);
+  try {
+    return ecdsaRawToDer(raw, profile.componentSize);
+  } finally {
+    raw.fill(0);
+  }
+}
+
+export async function signP1363(privateKey: CryptoKey, data: Uint8Array): Promise<Uint8Array> {
+  const curve = curveOf(privateKey);
+  const profile = CURVE_PROFILE[curve];
+  const dataBuffer = arrayBufferFromBytes(data);
+  let raw: Uint8Array;
+  try {
+    raw = new Uint8Array(
+      await crypto.subtle.sign({ name: "ECDSA", hash: profile.hash }, privateKey, dataBuffer)
+    );
+  } finally {
+    new Uint8Array(dataBuffer).fill(0);
+  }
+
+  const expectedLength = profile.componentSize * 2;
+  if (raw.length !== expectedLength) {
+    raw.fill(0);
+    throw new Error(`WebCrypto ECDSA signature must be ${expectedLength} bytes for ${curve}`);
+  }
+  return raw;
 }
 
 export async function verifyDer(publicKey: CryptoKey, signatureDer: Uint8Array, data: Uint8Array): Promise<boolean> {

@@ -2,7 +2,7 @@
 
 > 日本語 | [English](../en/API.md)
 
-この文書は `@noz-ele/edgca` から export される public API のドラフトです。
+この文書は npm package `@noz-ele/edgca` の public API を説明します。
 
 ```ts
 import {
@@ -31,7 +31,7 @@ import {
 } from "@noz-ele/edgca";
 ```
 
-root entry point は後方互換の aggregate surface とし、全 API を再 export します。用途を限定して bundle したい場合は次の subpath を使います。
+v0.7.0 の root entry point は後方互換の aggregate surface とし、現行 public API を再 export します。用途を限定して bundle したい場合は次の subpath を使います。
 
 ```ts
 // CA 作成・証明書発行だけ。verify module を静的 import しない。
@@ -56,6 +56,16 @@ import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
 ```
 
 `package.json` は `sideEffects: false` を維持する。subpath は tree-shaking の有無に依存せず、発行だけを使う consumer が今後拡大する verify module を静的 import しないための境界です。`./verify` の public API は PEM / DER と公開鍵だけを扱い、`CertificateAuthority.privateKey` を要求しません。
+
+`signData` と `SignDataOptions` は `@noz-ele/edgca/sign` だけから export し、root entry point からは再 export しません。既存の `EcdsaSignatureFormat` type は後方互換のため root / verify export を維持し、sign subpath からも type-only で export します。`./issuer`、`./verify`、`./pkcs12` から sign module への static import は作らず、明示的に sign subpath を import した application だけが public signing module を dependency / bundle に含めます。
+
+```ts
+import {
+  signData,
+  type EcdsaSignatureFormat,
+  type SignDataOptions
+} from "@noz-ele/edgca/sign";
+```
 
 ECDSA は **NIST P-256 / P-384 / P-521** をサポートします。内部生成のデフォルト curve は P-256 で、それ以外を使う場合は WebCrypto で `CryptoKeyPair` を生成し `keyPair` option で渡します。各 curve に対応する hash は標準ペアリング (P-256/SHA-256、P-384/SHA-384、P-521/SHA-512) です。CA hierarchy 内で curve を混在できます (例: P-256 root → P-384 intermediate → P-521 leaf)。各 cert の signatureAlgorithm は **issuer** の curve を反映します。
 
@@ -203,12 +213,28 @@ type CertificateChainVerificationResult =
 type EcdsaSignatureFormat = "der" | "ieee-p1363";
 ```
 
-`verifyCertificateSignature` に渡す ECDSA signature の byte 表現です。
+`verifyCertificateSignature` に渡す ECDSA signature の byte 表現です。`signData` も同じ type を使います。
 
 - `"der"`: ASN.1 `SEQUENCE { INTEGER r, INTEGER s }`。各 INTEGER の符号保持 encode により全体長は可変。
 - `"ieee-p1363"`: `r` と `s` を curve の component size にゼロ埋めし、`r || s` の順に連結した固定長表現。P-256 は 64 bytes、P-384 は 96 bytes、P-521 は 132 bytes。
 
 形式の自動判定は行いません。caller は署名を生成した API / protocol に合わせて必ず明示します。RFC 9421 の `ecdsa-p256-sha256` と `ecdsa-p384-sha384` は `"ieee-p1363"` に対応します。
+
+### `SignDataOptions`
+
+```ts
+interface SignDataOptions {
+  privateKey: CryptoKey;
+  data: Uint8Array;
+  signatureFormat: EcdsaSignatureFormat;
+}
+```
+
+| field | type | 必須 | 意味 |
+| --- | --- | --- | --- |
+| `privateKey` | `CryptoKey` | ✅ | ECDSA private key。P-256 / P-384 / P-521、usage `"sign"` を要求。 |
+| `data` | `Uint8Array` | ✅ | 事前 hash ではなく署名対象そのもの。 |
+| `signatureFormat` | `EcdsaSignatureFormat` | ✅ | `"der"` または `"ieee-p1363"`。返す ECDSA signature の byte 表現。自動判定なし。 |
 
 ### `ExportPkcs12Input`
 
@@ -547,6 +573,38 @@ if (!result.valid) {
   );
 }
 ```
+
+### `signData(options)`
+
+caller が保持する ECDSA private `CryptoKey` で任意の生 byte 列を署名します。
+
+```ts
+function signData(options: SignDataOptions): Promise<Uint8Array>;
+```
+
+```ts
+import { signData } from "@noz-ele/edgca/sign";
+
+const signature = await signData({
+  privateKey,
+  data: signingInput,
+  signatureFormat: "ieee-p1363"
+});
+```
+
+入力・出力規則:
+
+- `privateKey` は ECDSA private key、curve は P-256 / P-384 / P-521、usage は `"sign"` を要求します。public key、RSA / EdDSA key、未対応 curve は例外です。
+- `data` は事前 hash ではなく署名対象そのものです。curve に応じて P-256/SHA-256、P-384/SHA-384、P-521/SHA-512 を適用します。
+- `signatureFormat` は `"der"` または `"ieee-p1363"` の必須指定です。形式は自動判定しません。
+- `"ieee-p1363"` では固定長 `r || s`、`"der"` では ASN.1 `SEQUENCE { INTEGER r, INTEGER s }` を返します。
+- caller 所有の `privateKey` と `data` は変更しません。
+
+library implementation は `globalThis.crypto.subtle`、`CryptoKey`、`Uint8Array` のみを使い、Node.js、Cloudflare Workers、modern browser で共通利用できる構成とします。Node 専用の file I/O、`Buffer`、`process` は `./sign` dependency graph に入れません。
+
+PEM string、PKCS#8 DER、key path はこの library API の入力ではありません。鍵の import は caller が WebCrypto で行います。PKCS#8 PEM file を直接扱う shell client 向けには、Node.js 専用の `edgca sign-data` CLI を提供します。CLI は内部で同じ `signData` を呼びます。
+
+`signData` は nonce / challenge の生成・保存・消費、HTTP message canonicalization、リプレイ防止、送信を行いません。caller が渡した byte 列の署名だけが public contract です。
 
 ### `verifyCertificateSignature(options)`
 
@@ -979,7 +1037,7 @@ EdgCA は限定的な chain validation を提供しますが、次は提供し�
 - Cloudflare 固有の textual time parser。certificate DER 内の `UTCTime` / `GeneralizedTime` は verify module が parse するが、`cf.tlsClientAuth.certNotBefore` / `certNotAfter` の文字列変換は application 側。
 - CRL、OCSP、失効 DB、失効確認。
 - TLS handshake の `CertificateVerify` と TLS connection 自体への proof-of-possession binding。
-- nonce、challenge、HTTP message canonicalization、保存、一回限りの消費、リプレイ防止を含む application-layer proof-of-possession protocol。`verifyCertificateSignature` は caller が渡した byte 列の署名検証だけを行う。
+- nonce、challenge、HTTP message canonicalization、保存、一回限りの消費、リプレイ防止を含む application-layer proof-of-possession protocol。EdgCA が扱うのは caller が構築した byte 列の署名生成 (`signData`) と署名検証 (`verifyCertificateSignature`) まで。
 - server certificate の hostname / SAN identity 検証。
 - 鍵の保管、暗号化保存、Cloudflare storage 連携。
 - key の format 変換 (PEM ↔ CryptoKey、JWK ↔ CryptoKey 等)。永続化形式の選択と変換は呼び出し側で WebCrypto API を直接使って行う。

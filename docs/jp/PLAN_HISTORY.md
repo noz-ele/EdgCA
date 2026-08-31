@@ -380,3 +380,120 @@ export function verifyCertificateSignature(
 - P-256 / P-384 / P-521、DER / IEEE P1363、改変 data / signature、別 certificate、不正 encode / 長さ、RSA / Ed25519 rejection、入力非破壊、dist entry point を tests で確認した。
 - Workers-compatible suite は 9 files / 486 tests、Node suite は 2 files / 166 tests、合計 652 tests が成功した。
 - v0.7.0 の dry-run package は tarball 51.8 kB、展開後 200.1 kB、76 files、runtime / transitive dependency なし。
+
+## 2026-09-01: Opt-in Arbitrary-Data Signing
+
+### Summary
+
+- caller が保持する ECDSA `CryptoKey` で任意の生 byte 列を署名する `signData` を追加する。
+- public library API は `@noz-ele/edgca/sign` だけから export する opt-in surface とし、root entry point `@noz-ele/edgca` からは再 export しない。発行・検証・PFX だけを使う consumer の application bundle に新しい public signing module を含めないため。
+- `verifyCertificateSignature` と同じく、ECDSA signature の byte 表現は `"der"` / `"ieee-p1363"` の必須指定とし、自動判定しない。
+- Node.js、Cloudflare Workers、modern browser で共通利用できるよう、library implementation は `globalThis.crypto.subtle`、`CryptoKey`、`Uint8Array` だけに依存させる。
+- curl 等の shell client から専用 JavaScript helper を置かず使えるよう、zero-runtime-dependency CLI に `edgca sign-data` を追加する。CLI は Node.js 上で動くが、追加 npm dependency は導入しない。
+
+### Public API Addition
+
+```ts
+export interface SignDataOptions {
+  privateKey: CryptoKey;
+  data: Uint8Array;
+  signatureFormat: EcdsaSignatureFormat;
+}
+
+export function signData(options: SignDataOptions): Promise<Uint8Array>;
+```
+
+```ts
+import {
+  signData,
+  type EcdsaSignatureFormat,
+  type SignDataOptions
+} from "@noz-ele/edgca/sign";
+```
+
+- `privateKey` は `type === "private"`、algorithm は ECDSA、curve は P-256 / P-384 / P-521、usage は `"sign"` を要求する。
+- `data` は事前 hash ではなく署名対象そのもの。curve に応じて P-256/SHA-256、P-384/SHA-384、P-521/SHA-512 を使う。
+- `"ieee-p1363"` では WebCrypto が返す固定長 `r || s` を返す。`"der"` では同じ署名を ASN.1 `SEQUENCE { INTEGER r, INTEGER s }` へ変換して返す。
+- caller 所有の `privateKey` / `data` は変更しない。形式変換用に作成した一時 buffer は必要な範囲で zero clear する。
+- PEM string、PKCS#8 DER、key path は library API に渡さない。PEM → `CryptoKey` の変換は従来どおり caller の責務とする。
+
+### Package Boundary
+
+`package.json` に次を追加する。
+
+```json
+"./sign": {
+  "types": "./dist/sign.d.ts",
+  "import": "./dist/sign.js"
+}
+```
+
+- `src/index.ts`、`src/issuer.ts`、`src/verify.ts`、`src/pkcs12.ts` から `signData` を再 export しない。
+- existing entry point から `src/sign.ts` への static import を作らない。CLI entry point だけは `sign-data` command 実行のために signing surface を参照してよい。
+- この分離が保証するのは application の module dependency / bundle 境界。同一 npm package の tarball に `dist/sign.*` が入ることは許容する。インストールファイル自体まで分離するための別 package は作らない。
+- root aggregate から再 export しないことは新規 API の opt-in policy であり、後方互換性の問題はない。
+
+### CLI Addition
+
+```text
+edgca sign-data --key <private-key.pem>
+                 (--data-file <path> | --data-base64url <value>)
+                 --signature-format <der|ieee-p1363>
+```
+
+- `--key` は非暗号化 PKCS#8 `-----BEGIN PRIVATE KEY-----` PEM のみ。SEC1 `EC PRIVATE KEY`、`ENCRYPTED PRIVATE KEY`、RSA / EdDSA、未対応 curve は reject する。
+- `--data-file` と `--data-base64url` は排他。`--data-file` は file bytes をそのまま署名し、`--data-base64url` は unpadded base64url を decode した bytes を署名する。
+- 出力は署名 bytes の unpadded base64url 1 行とし、HTTP header にそのまま渡せる。秘密鍵、署名対象、DER の debug dump は stdout / stderr に出さない。
+- curve は PKCS#8 から import できた P-256 / P-384 / P-521 を自動選択し、caller に hash 指定を求めない。
+- `src/cli/io.ts` の internal PEM importer を再利用するが、その importer 自体は package exports に入れない。
+
+curl 等からは次の形で呼び出せる。
+
+```sh
+signature=$(edgca sign-data \
+  --key "$client_key" \
+  --data-base64url "$signing_input" \
+  --signature-format ieee-p1363)
+```
+
+### Explicit Non-Goals
+
+- nonce / challenge ID の生成、期限、保存、原子的な一回限りの消費、リプレイ防止。
+- HTTP method、URI、authority、body digest の canonicalization と署名対象の構築。
+- RFC 9421 header の parse / serialization / canonicalization。
+- HTTP client、curl wrapper、challenge endpoint への送信。CLI は渡された bytes への署名と encode だけを行う。
+- 鍵の保管、HSM、ローテーション、暗号化 PEM。
+- RSA、EdDSA、P-256 / P-384 / P-521 以外の curve、curve と hash の任意な組み合わせ。
+
+### Implementation Plan
+
+1. 共通の `EcdsaSignatureFormat` type を signing / verification のどちらからも type-only で参照できる neutral module へ移し、既存の `@noz-ele/edgca/verify` export は維持する。
+2. `src/crypto.ts` の ECDSA signing を P1363 生成と DER 変換に分ける。既存 `signDer` は internal helper のまま新しい共通処理へ delegate し、証明書 / CSR 発行の挙動を変えない。
+3. `src/sign.ts` に option validation と `signData` を実装し、`./sign` だけから export する。root と既存 subpath には追加しない。
+4. `src/cli/commands/sign-data.ts` を追加し、CLI parser / help へ command と flags を組み込む。library の `signData` を呼び、重複した署名実装を CLI に持たない。
+5. Workers-compatible tests、Node CLI tests、dist / package entry-point tests を追加する。
+6. 実装後に日本語文書の「次期変更予定」表示を実装済みの public contract へ更新し、英語 README / API / NON_GOALS を同期する。
+
+### Test Plan
+
+- P-256 / P-384 / P-521 で DER / IEEE P1363 の署名を生成し、既存 `verifyCertificateSignature` または対応 public key で検証できる。
+- P1363 の長さが P-256=64、P-384=96、P-521=132 bytes、DER は strict DER ECDSA signature である。
+- public key、RSA / Ed25519 key、未対応 curve、`"sign"` usage のない private key、不正 option / signature format を reject する。
+- caller 所有の data buffer と key を変更しない。
+- Node.js、Workers-compatible runtime、実 browser の smoke test で同じ API が動く。browser test は signing API の WebCrypto / ESM 互換性だけを対象とする。
+- `@noz-ele/edgca/sign` からの import は成功し、root / issuer / verify / pkcs12 に `signData` が export されない。既存 entry point から sign module への static dependency がない。
+- CLI は file bytes / unpadded base64url input、DER / P1363 output、malformed base64url、誤った PEM label、未対応 key、排他 flag、stdout の 1-line base64url contract を検証する。
+
+### Implementation Result
+
+2026-09-01 に計画範囲を実装した。
+
+- `src/sign.ts` に `SignDataOptions` / `signData` を追加し、`@noz-ele/edgca/sign` だけから public export した。root / issuer / verify / pkcs12 に `signData` は export していない。
+- `EcdsaSignatureFormat` を neutral な `types.ts` へ移し、既存 root / verify type export と新規 sign type export を両立した。runtime の sign module dependency は既存 entry point に追加していない。
+- `src/crypto.ts` に P1363 生成 helper を追加し、既存 `signDer` も共通処理へ delegate した。WebCrypto に渡す data copy と DER 変換用 P1363 一時 buffer は使用後に zero clear する。
+- CLI に `sign-data` を追加した。非暗号化 PKCS#8 PEM、file / canonical unpadded-base64url の排他入力、DER / P1363 の必須指定、unpadded-base64url 1 行出力を実装した。
+- malformed base64url と file I/O を同時に開始しないよう、inline data の UsageError 検証を I/O より先に完了させ、CLI の exit code を決定的にした。
+- P-256 / P-384 / P-521、DER / P1363、改変 data、invalid key / usage / options、caller buffer 非破壊、CLI の base64url / file input、entry point isolation を tests で確認した。
+- Workers-compatible suite は 10 files / 494 tests、Node suite は 2 files / 170 tests、合計 664 tests が成功した。`npm run typecheck`、`npm run build`、`npm pack --dry-run --json` も成功した。
+- 現在の version 0.7.0 設定での dry-run package は tarball 54.3 kB、展開後 210.1 kB、82 files、runtime / transitive dependency なし。version bump / release はこの実装には含めていない。
+- sign library の Node.js / Workers-compatible runtime tests と built ESM dependency の Node-only import 不在を確認した。既存 test harness に実 browser runner はないため、browser の自動 smoke test 追加は release 前の残作業とする。

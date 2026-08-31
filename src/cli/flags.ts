@@ -1,4 +1,5 @@
 import type { SupportedCurve } from "../index.js";
+import type { EcdsaSignatureFormat } from "../types.js";
 
 export class UsageError extends Error {
   override name = "UsageError";
@@ -29,6 +30,13 @@ export function parseCurveFlag(value: string): SupportedCurve {
     return value as SupportedCurve;
   }
   throw new UsageError(`--curve must be one of P-256, P-384, P-521 (got: ${value})`);
+}
+
+export function parseSignatureFormatFlag(value: string): EcdsaSignatureFormat {
+  if (value === "der" || value === "ieee-p1363") {
+    return value;
+  }
+  throw new UsageError(`--signature-format must be one of der, ieee-p1363 (got: ${value})`);
 }
 
 export function requireString(value: string | undefined, flagName: string): string {

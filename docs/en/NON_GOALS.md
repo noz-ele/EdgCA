@@ -21,7 +21,7 @@ The following remain intentionally unimplemented:
 - **Chains containing two or more intermediates.** The maximum remains `root → intermediate → leaf`.
 - **CRL / OCSP / revocation databases / revocation checks**, including validation that requires network access.
 - **TLS `CertificateVerify` validation.** EdgCA does not obtain a handshake signature or exporter from a Cloudflare-terminated TLS connection and does not provide cryptographic binding to that connection.
-- **Application-layer proof-of-possession protocols.** EdgCA does not generate, expire, store, or atomically consume nonces/challenge IDs; bind an HTTP message; or parse/canonicalize RFC 9421 fields. `verifyCertificateSignature` only verifies the caller-built byte sequence with the certificate public key.
+- **Application-layer proof-of-possession protocols.** EdgCA does not generate, expire, store, or atomically consume nonces/challenge IDs; bind an HTTP message; or parse/canonicalize RFC 9421 fields. `signData` signs caller-built bytes and `verifyCertificateSignature` verifies caller-built bytes; neither interprets the challenge protocol.
 - **Server identity / hostname validation.** EdgCA does not compare SAN dNSName entries with a destination hostname.
 - **Cloudflare-specific text parsers.** The application converts strings such as `cf.tlsClientAuth.certNotBefore`; the verification module parses only DER `UTCTime`/`GeneralizedTime`.
 - **DER sanity checks in `certificateToPem(der)`.** Even a shallow check of "first byte is `0x30` (SEQUENCE)" is not implemented. It cannot distinguish a real cert from junk and would only provide false reassurance. Doing it properly would require a full `parseCertificateDer`, which exceeds the responsibility of an encoder. This stays a low-level encoder.
@@ -49,6 +49,18 @@ Bad input should throw. Convenience features such as trim, dedup, and auto-compl
 
 ## 4. Functional scope
 
+### Bounded signing surface
+
+`@noz-ele/edgca/sign` provides stateless arbitrary-data signing with a caller-owned ECDSA `CryptoKey`.
+
+- Only P-256/SHA-256, P-384/SHA-384, and P-521/SHA-512.
+- The caller explicitly selects DER or IEEE P1363 encoding.
+- The library accepts only `CryptoKey` and `Uint8Array`, not PEM text, key paths, or storage locations.
+- The sign subpath is not re-exported from the root; issuer, verify, and pkcs12 do not statically import it.
+- The Node.js CLI may read unencrypted PKCS#8 PEM for `edgca sign-data`, but its internal PEM importer is not a public library API. The CLI signs and base64url-encodes bytes; it does not send HTTP requests.
+
+This primitive does not bring nonce management, request canonicalization, persistence, or replay prevention into scope.
+
 - **No server certificate issuance.** Leaf scope is mTLS client certs (`issueClientCert` / `issueClientCertForPublicKey`) and document-signing certs (`issueDocumentSigningCert`, RFC 9336 `id-kp-documentSigning`). TLS server certs are out of scope.
 - **No SAN on document-signing leaves.** `issueDocumentSigningCert` does not accept `dnsNames` / `ipAddresses` / `emailAddresses`. Document-signing certs identify the signer through the Subject DN, not through SAN. If a downstream profile requires SAN, the caller adds it after extending the library; v1 does not.
 - **No CSR-based document-signing variant in v1.** There is no `issueDocumentSigningCertForPublicKey`. Internal-keygen-only. The mTLS counterpart exists because client-managed key flows are common for mTLS; document-signing leaves are typically CA-issued with the key staying on the CA host or HSM, so the parity is not yet justified.
@@ -64,6 +76,7 @@ Bad input should throw. Convenience features such as trim, dedup, and auto-compl
 ## 5. Conditions for changing these policies
 
 - Validation can be considered when it remains explicit, stateless, WebCrypto-only, and operates only on caller-supplied certificates and byte sequences within the bounded hierarchy.
+- Signing can be considered when it remains stateless, WebCrypto-only, uses the existing ECDSA profiles, and operates only on a caller-owned `CryptoKey` and caller-supplied bytes.
 - Requirements involving issuer discovery, external retrieval, persistent state, or revocation infrastructure belong in a dedicated PKI library/runtime.
 - "Same input → different / unexpected DER" along the single "external input → output cert" path is a **bug** and is in scope for fixing.
 - "If the caller passes lying or duplicate input, the result is wrong" and "if the caller does not share state, things break" are **by design** and are not in scope for fixing.

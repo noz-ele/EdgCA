@@ -15,6 +15,7 @@ import {
   issueClientCertForPublicKey,
   issueIntermediateCA,
   parseCertificateSigningRequest,
+  verifyCertificateSignature,
   type SupportedCurve
 } from "../src/index.js";
 import { createRootCaCommand } from "../src/cli/commands/create-root-ca.js";
@@ -1349,6 +1350,7 @@ describe("dispatcher (spawned)", () => {
     const { stdout, exitCode } = await runCli(["--help"]);
     expect(stdout).toMatch(/Usage:/);
     expect(stdout).toMatch(/create-root-ca/);
+    expect(stdout).toMatch(/sign-data/);
     expect(exitCode).toBe(0);
   });
 
@@ -1386,6 +1388,114 @@ describe("dispatcher (spawned)", () => {
     ]);
     expect(stderr.length).toBeGreaterThan(0);
     expect(exitCode).toBe(1);
+  });
+
+  it("signs base64url challenge bytes as IEEE P1363", async () => {
+    const keyPair = await generateKeyPair("P-256");
+    const certificate = await createRootCA({
+      subject: [{ type: "CN", value: "CLI P1363 signer" }],
+      days: 30,
+      keyPair
+    });
+    await writeFile(
+      path.join(tempDir, "signer.key.pem"),
+      await cryptoKeyToPkcs8Pem(keyPair.privateKey),
+      "utf8"
+    );
+
+    const data = new TextEncoder().encode("curl challenge bytes");
+    const result = await runCli([
+      "sign-data",
+      "--key", "signer.key.pem",
+      "--data-base64url", Buffer.from(data).toString("base64url"),
+      "--signature-format", "ieee-p1363"
+    ]);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toMatch(/^[A-Za-z0-9_-]+\n$/);
+    expect(result.stdout).not.toContain("=");
+    await expect(verifyCertificateSignature({
+      certificatePem: certificate.certPem,
+      data,
+      signature: new Uint8Array(Buffer.from(result.stdout.trim(), "base64url")),
+      signatureFormat: "ieee-p1363"
+    })).resolves.toBe(true);
+  });
+
+  it("signs file bytes as DER and auto-detects P-384", async () => {
+    const keyPair = await generateKeyPair("P-384");
+    const certificate = await createRootCA({
+      subject: [{ type: "CN", value: "CLI DER signer" }],
+      days: 30,
+      keyPair
+    });
+    const data = new TextEncoder().encode("file-backed signing input");
+    await Promise.all([
+      writeFile(
+        path.join(tempDir, "signer.key.pem"),
+        await cryptoKeyToPkcs8Pem(keyPair.privateKey),
+        "utf8"
+      ),
+      writeFile(path.join(tempDir, "signing-input.bin"), data)
+    ]);
+
+    const result = await runCli([
+      "sign-data",
+      "--key", "signer.key.pem",
+      "--data-file", "signing-input.bin",
+      "--signature-format", "der"
+    ]);
+
+    expect(result.exitCode).toBe(0);
+    const signature = new Uint8Array(Buffer.from(result.stdout.trim(), "base64url"));
+    expect(signature[0]).toBe(0x30);
+    await expect(verifyCertificateSignature({
+      certificatePem: certificate.certPem,
+      data,
+      signature,
+      signatureFormat: "der"
+    })).resolves.toBe(true);
+  });
+
+  it("rejects missing or conflicting sign-data inputs with exit 2", async () => {
+    const missing = await runCli([
+      "sign-data",
+      "--key", "unused.pem",
+      "--signature-format", "der"
+    ]);
+    expect(missing.exitCode).toBe(2);
+    expect(missing.stderr).toMatch(/exactly one/);
+
+    const conflicting = await runCli([
+      "sign-data",
+      "--key", "unused.pem",
+      "--data-file", "input.bin",
+      "--data-base64url", "AQ",
+      "--signature-format", "der"
+    ]);
+    expect(conflicting.exitCode).toBe(2);
+    expect(conflicting.stderr).toMatch(/exactly one/);
+  });
+
+  it("rejects malformed base64url and signature formats with exit 2", async () => {
+    const malformed = await runCli([
+      "sign-data",
+      "--key", "unused.pem",
+      "--data-base64url", "not+base64",
+      "--signature-format", "der"
+    ]);
+    expect(malformed.exitCode).toBe(2);
+    expect(malformed.stderr).toMatch(/unpadded base64url/);
+
+    const badFormat = await runCli([
+      "sign-data",
+      "--key", "unused.pem",
+      "--data-base64url", "AQ",
+      "--signature-format", "auto"
+    ]);
+    expect(badFormat.exitCode).toBe(2);
+    expect(badFormat.stderr).toMatch(/signature-format/);
   });
 
   it("runs the full root → intermediate → client → pfx pipeline end-to-end", async () => {

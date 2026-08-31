@@ -3,6 +3,7 @@ import { createRootCaCommand } from "./cli/commands/create-root-ca.js";
 import { issueClientCommand } from "./cli/commands/issue-client.js";
 import { issueIntermediateCaCommand } from "./cli/commands/issue-intermediate-ca.js";
 import { pemToPfxCommand } from "./cli/commands/pem-to-pfx.js";
+import { signDataCommand } from "./cli/commands/sign-data.js";
 import { UsageError } from "./cli/flags.js";
 
 const USAGE = `Usage:
@@ -19,6 +20,10 @@ const USAGE = `Usage:
 
   edgca pem-to-pfx --cert <pem> --key <pem> --password <pw>
                    [--chain <pem>] [--out <pfx>]
+
+  edgca sign-data --key <private-key.pem>
+                  (--data-file <path> | --data-base64url <value>)
+                  --signature-format <der|ieee-p1363>
 `;
 
 async function main(): Promise<void> {
@@ -36,6 +41,9 @@ async function main(): Promise<void> {
       return;
     case "pem-to-pfx":
       await pemToPfxCommand(rest);
+      return;
+    case "sign-data":
+      await signDataCommand(rest);
       return;
     case undefined:
     case "-h":

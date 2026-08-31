@@ -16,6 +16,7 @@ EdgCA is a small TypeScript library for issuing mTLS client certificates and doc
 - **Issuance check.** Decide whether a received client certificate was issued by your own CA (issuer-identity match — not full mTLS verification).
 - **Bounded chain validation.** Validate a caller-ordered `leaf → intermediate → trusted root` chain, including signatures, validity, CA constraints, and target purpose. Automatic PKI path building and revocation are intentionally out of scope.
 - **Arbitrary-data signature verification with a certificate public key.** Extract the public key from a validated certificate and verify ECDSA signatures in DER or IEEE P1363 format. Challenge state and replay prevention remain application concerns.
+- **Opt-in arbitrary-data signing.** `@noz-ele/edgca/sign` signs caller-supplied bytes with an ECDSA `CryptoKey` and returns DER or IEEE P1363. It is not re-exported from the root entry point.
 - **PEM/DER encode/decode** for certificates and PKCS#10 CSRs.
 - **Secret key hygiene at the API boundary.** Private keys flow through the public API only as `CryptoKey` (issuance path) or `Uint8Array` PKCS#8 bytes (`exportPkcs12`); never as `string`. JS strings are immutable and stay on the heap until GC, so they cannot be wiped — secret material must not be held in that form. PEM ↔ CryptoKey conversion is the caller's job (so the lifetime of any string representation stays under caller control).
 
@@ -29,18 +30,21 @@ EdgCA is a small TypeScript library for issuing mTLS client certificates and doc
 
 ## Contents
 
-- [CLI](#cli) — `npx edgca …` one-liners for the four most common tasks
+- [CLI](#cli) — `npx @noz-ele/edgca …` one-liners for the five most common tasks
 - [Quick Start](#quick-start) — root → intermediate → client cert (incl. PFX bundling)
 - [Issue a document-signing certificate](#issue-a-document-signing-certificate) — RFC 9336 `id-kp-documentSigning` leaf
 - [Verify on Cloudflare Worker](#verify-cloudflare-worker) — confirm a cert was issued by your CA
 - [Certificate chain verification](#certificate-chain-verification) — validate an explicit chain to a trusted root
 - [Certificate signature verification](#certificate-signature-verification) — verify arbitrary data with a certificate public key
+- [Arbitrary-data signing](#arbitrary-data-signing) — opt-in library and CLI signing
 - [Issue from a CSR](#issue-from-a-csr) — accept a caller-managed key via PKCS#10 + POP
 - [Subject](#subject) · [Scope](#scope) · [Key Handling](#key-handling) · [Development](#development) · [API Documentation](#api-documentation)
 
 ## Status
 
 EdgCA is in **v0.7.x — early stabilization**. The author is currently validating the library against real Cloudflare Workers deployments, and the API surface may still shift. To keep that validation focused, **external Issues and PRs are temporarily restricted** and will be re-opened once the API settles. Reading, cloning, forking, and `npm install` are unaffected.
+
+`@noz-ele/edgca/sign` and `edgca sign-data` are implemented on the current repository HEAD but have not yet been included in an npm release. Until a new version is published, `npx @noz-ele/edgca sign-data ...` resolves the existing npm release and will not provide this command. Test a local build with `node dist/cli.js sign-data ...`.
 
 ## Install
 
@@ -61,13 +65,14 @@ import {
   verifyCertificateSignature
 } from "@noz-ele/edgca/verify";
 import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
+import { signData } from "@noz-ele/edgca/sign";
 ```
 
-`./issuer` owns CA creation/import and intermediate/leaf issuance. `./verify` validates direct issuers and chains using public certificates only; it does not statically import the issuer module. The package remains `sideEffects: false`.
+`./issuer` owns CA creation/import and intermediate/leaf issuance. `./verify` validates direct issuers and chains using public certificates only; it does not statically import the issuer module. `./sign` is opt-in and is not re-exported by the root, issuer, verify, or pkcs12 entry points, so consumers that do not import it do not add the public signing module to their application dependency graph. The package remains `sideEffects: false`.
 
 ## CLI
 
-EdgCA ships a small zero-dependency CLI (`bin: edgca`) for the four most common one-shot tasks. It is a thin wrapper over the library API and uses `node:util.parseArgs` — no transitive dependencies are pulled in for non-CLI consumers.
+EdgCA ships a small zero-dependency CLI (`bin: edgca`) for the five most common one-shot tasks. It is a thin wrapper over the library API and uses `node:util.parseArgs` — no transitive dependencies are pulled in for non-CLI consumers.
 
 > `npx` runs the CLI **without installing** it — it fetches the package into npm's local cache, executes the `bin`, and leaves your project's `node_modules` / `package.json` untouched. Use this for one-shot tasks (creating a local dev CA, building a PFX). For repeated use, install globally with `npm install -g @noz-ele/edgca` and then call `edgca …` directly.
 
@@ -119,6 +124,10 @@ edgca issue-client           --ca-cert <pem> --ca-key <pem> [--ca-chain <pem>]
 
 edgca pem-to-pfx             --cert <pem> --key <pem> --password <pw>
                              [--chain <pem>] [--out <pfx>]
+
+edgca sign-data              --key <private-key.pem>
+                             (--data-file <path> | --data-base64url <value>)
+                             --signature-format <der|ieee-p1363>
 ```
 
 `--subject` accepts an OpenSSL-style DN string (`"CN=foo,O=bar,C=JP"`); short names are case-insensitive (`CN`/`O`/`OU`/`C`/`ST`/`L`/`E`/`DC`/`SERIALNUMBER`/`STREET`/`POSTALCODE`/`TITLE`/`GIVENNAME`/`SURNAME`/`UID`), and dotted OID attributes (`1.2.840.113549.1.9.1=...`) are accepted as-is. Private keys are read/written as PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`); SEC1 (`EC PRIVATE KEY`) is not supported.
@@ -413,6 +422,33 @@ The format is mandatory and is never guessed. RFC 9421 registers P-256/SHA-256 a
 
 A `true` result proves only that the supplied bytes verify under the certificate public key. The caller remains responsible for challenge generation, expiry and one-time consumption; binding the HTTP method, URI, authority, and body digest; RFC 9421 parsing/canonicalization; matching the certificate fingerprint across requests; and mapping the certificate to an identity and permissions. For that reason, this primitive is not named `verifyProofOfPossession`.
 
+## Arbitrary-data signing
+
+`signData` signs caller-supplied bytes with an ECDSA private `CryptoKey`. The implementation uses only `globalThis.crypto.subtle`, `CryptoKey`, and `Uint8Array`, and runs on Node.js, Cloudflare Workers, and modern browsers.
+
+```ts
+import { signData } from "@noz-ele/edgca/sign";
+
+const signature = await signData({
+  privateKey,
+  data: signingInput,
+  signatureFormat: "ieee-p1363"
+});
+```
+
+P-256, P-384, and P-521 use SHA-256, SHA-384, and SHA-512 respectively. `signatureFormat` is mandatory and is never guessed. The library API accepts a `CryptoKey`, not PEM text or a key path; shell clients can use the Node.js CLI instead:
+
+```sh
+signature=$(npx @noz-ele/edgca sign-data \
+  --key "$client_key" \
+  --data-base64url "$signing_input" \
+  --signature-format ieee-p1363)
+```
+
+`npx @noz-ele/edgca sign-data ...` and `edgca sign-data ...` execute the same CLI command. The former asks `npx` to fetch/cache the package and launch its `bin: edgca`; the latter directly launches the same bin from a local or global installation.
+
+The CLI accepts exactly one of `--data-file` and `--data-base64url`, and writes one unpadded-base64url signature line to stdout. Neither API constructs or stores challenges, canonicalizes HTTP messages, prevents replay, or sends requests.
+
 ## Issue from a CSR
 
 When a client manages its own private key and submits a PKCS#10 CSR, EdgCA parses the CSR, verifies its proof-of-possession signature, and issues a certificate that embeds the CSR's public key. The library does **not** auto-adopt the CSR's claimed subject / SAN — the caller passes those explicitly, derived from whatever policy applies in the application layer.
@@ -485,7 +521,8 @@ In scope:
 - Direct public-certificate issuer validation (`verifyCertificateIssuedBy`).
 - Caller-ordered chain validation up to `root → intermediate → leaf` (`verifyCertificateChain`), including DER validity, CA/Key Usage/EKU/path-length constraints, and critical-extension policy.
 - Arbitrary-data ECDSA signature verification with a certificate public key (`verifyCertificateSignature`), with an explicit DER or IEEE P1363 encoding.
-- Purpose-specific entry points (`@noz-ele/edgca/issuer` and `@noz-ele/edgca/verify`).
+- Arbitrary-data ECDSA signing with a caller-supplied `CryptoKey` (`signData`), with an explicit DER or IEEE P1363 encoding.
+- Purpose-specific entry points (`@noz-ele/edgca/issuer`, `@noz-ele/edgca/verify`, and opt-in `@noz-ele/edgca/sign`).
 - PEM/DER helpers (certificates only — keys are exchanged as `CryptoKey`).
 - PFX (PKCS#12) export of an issued cert + private key with PBES2 (PBKDF2-HMAC-SHA-256 + AES-256-CBC) and HMAC-SHA-256 MAC, scoped to modern consumers (Win11+, Server 2019+, macOS 15+, iOS/iPadOS 18+).
 - Basic Constraints, Key Usage, Extended Key Usage, Subject Alternative Name, SKI, AKI.
@@ -502,7 +539,7 @@ Intentionally out of scope:
 - Parsing Cloudflare-specific textual times. The verification module reads DER certificate times; the legacy API still accepts caller-supplied validity values.
 - CRL, OCSP, revocation databases, revocation checks.
 - TLS `CertificateVerify` validation and proof-of-possession binding to the TLS connection.
-- Application-layer proof-of-possession protocol state, including nonce/challenge management, HTTP message canonicalization, and replay prevention. EdgCA provides only the certificate public-key signature primitive.
+- Application-layer proof-of-possession protocol state, including nonce/challenge management, HTTP message canonicalization, and replay prevention. EdgCA only signs caller-built bytes (`signData`) and verifies caller-built bytes (`verifyCertificateSignature`).
 - Server hostname/SAN identity verification.
 - Key storage, encryption-at-rest, rotation-state persistence, and integration with KV/D1/R2/Secrets.
 - RSA, EdDSA, other elliptic curves (CSRs signed with these algorithms are rejected at parse time).

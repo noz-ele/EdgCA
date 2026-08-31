@@ -16,6 +16,7 @@ EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理�
 - **発行元判定。** 受け取った client certificate が自 CA 発行かを判定 (issuer identity 確認のみ、完全な mTLS 検証ではない)。
 - **限定的な chain validation。** caller が順番を明示した `leaf → intermediate → trusted root` の署名、期限、CA 制約、用途を検証。PKI path の自動探索や失効確認は行わない。
 - **certificate 公開鍵による任意データの署名検証。** 検証済み certificate から公開鍵を取り出し、ECDSA DER または IEEE P1363 形式の署名を検証する。challenge の生成・保存やリプレイ防止は application の責務。
+- **opt-in の任意データ署名。** `@noz-ele/edgca/sign` で caller が保持する ECDSA `CryptoKey` から DER または IEEE P1363 署名を生成する。root entry point からは再 export しない。
 - **PEM/DER の encode/decode** (certificate と PKCS#10 CSR)。
 - **API 境界での秘密鍵 hygiene。** 秘密鍵は public API 上 `CryptoKey` (発行系) または `Uint8Array` PKCS#8 bytes (`exportPkcs12`) のみで扱い、`string` で受け渡さない。JS の string は immutable で GC まで heap に残り wipe できないため、秘密鍵を string で保持することを設計上避ける。PEM ↔ CryptoKey の変換は caller 側 (string 表現の寿命を caller が制御できるようにするため)。
 
@@ -29,18 +30,21 @@ EdgCA は、Cloudflare Workers 互換の runtime で、利用者自身が管理�
 
 ## Contents
 
-- [CLI](#cli) — `npx @noz-ele/edgca …` で 4 つの定番作業をワンライナーで実行
+- [CLI](#cli) — `npx @noz-ele/edgca …` で 5 つの定番作業をワンライナーで実行
 - [Quick Start](#quick-start) — root → intermediate → client cert を発行 (PFX 束ね手順も含む)
 - [文書署名用 certificate を発行する](#文書署名用-certificate-を発行する) — RFC 9336 `id-kp-documentSigning` の leaf を発行
 - [Verify (Cloudflare Worker)](#verify-cloudflare-worker) — 自 CA から発行されたかを判定
 - [Certificate chain verification](#certificate-chain-verification) — 明示した chain を trusted root まで検証
 - [Certificate signature verification](#certificate-signature-verification) — certificate の公開鍵で任意データの署名を検証
+- [Arbitrary-data signing](#arbitrary-data-signing) — opt-in subpath と CLI で任意データを署名
 - [CSR から発行する](#csr-から発行する) — client が秘密鍵を保持する構成 (PKCS#10 + POP)
 - [Subject](#subject) · [Scope](#scope) · [Key Handling](#key-handling) · [Development](#development) · [API Documentation](#api-documentation)
 
 ## Status
 
 EdgCA は **v0.7.x の初期安定化フェーズ**です。作者が実際の Cloudflare Workers 環境で検証している最中で、API が変わる可能性があります。検証に集中するため、**外部からの Issue と PR は一時的に制限**しており、API が落ち着いた後に再開します。read / clone / fork / `npm install` は通常通り可能です。
+
+`@noz-ele/edgca/sign` と `edgca sign-data` は現在の repository HEAD に実装済みですが、まだ npm release には含まれていません。publish 前の `npx @noz-ele/edgca sign-data ...` は npm 上の既存 release を実行するため使えません。local build は `node dist/cli.js sign-data ...` で検証できます。
 
 ## Install
 
@@ -52,7 +56,7 @@ ESM 専用 (`"type": "module"`) で、`globalThis.crypto.subtle` が動く runti
 
 ### Package entry points
 
-root の `@noz-ele/edgca` は後方互換のため全 API を再 export します。用途別 subpath を使うと、発行だけを使う bundle に検証実装が入ることを tree-shaking の成否に依存せず避けられます。
+v0.7.0 の root `@noz-ele/edgca` は後方互換のため現行 public API を再 export します。用途別 subpath を使うと、発行だけを使う bundle に検証実装が入ることを tree-shaking の成否に依存せず避けられます。
 
 ```ts
 // CA 作成・証明書発行だけ
@@ -70,9 +74,17 @@ import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
 
 `./issuer` は CA の作成・import・intermediate / leaf 発行を担当します。`./verify` は直接 issuer と chain の検証を担当し、発行 module を静的 import しません。`package.json` の `sideEffects: false` も維持します。
 
+任意データ署名は `@noz-ele/edgca/sign` だけから opt-in で公開します。root entry point からは再 export せず、`./issuer`、`./verify`、`./pkcs12` から sign module への static import も作りません。そのため、明示的に次を import した application だけが public signing module を dependency / bundle に含めます。
+
+```ts
+import { signData } from "@noz-ele/edgca/sign";
+```
+
+同一 npm package の tarball に `dist/sign.*` が入ることは許容します。インストールファイル自体の分離を目的とした別 package は作りません。
+
 ## CLI
 
-EdgCA には、4 つの定番ワンショット作業向けの小さな zero-dependency CLI (`bin: edgca`) が同梱されています。library API を薄くラップしただけのもので、`node:util.parseArgs` を使っているため CLI を使わない consumer の依存にも何も増えません。
+EdgCA には、5 つの定番ワンショット作業向けの小さな zero-dependency CLI (`bin: edgca`) が同梱されています。library API を薄くラップしただけのもので、`node:util.parseArgs` を使っているため CLI を使わない consumer の依存にも何も増えません。
 
 > `npx` は CLI を **インストールせずに** 実行します。パッケージは npm のローカルキャッシュにダウンロードされ、`bin` が実行され、プロジェクトの `node_modules` / `package.json` には何も追加されません。1 回だけ試したい用途 (ローカル開発用 CA を作る、PFX を組む等) はこれで済みます。繰り返し使うなら `npm install -g @noz-ele/edgca` で global install し、以降は `edgca …` を直接呼べます。
 
@@ -125,6 +137,25 @@ edgca issue-client           --ca-cert <pem> --ca-key <pem> [--ca-chain <pem>]
 edgca pem-to-pfx             --cert <pem> --key <pem> --password <pw>
                              [--chain <pem>] [--out <pfx>]
 ```
+
+入力 bytes を ECDSA 秘密鍵で署名し、HTTP header へそのまま渡せる unpadded base64url 1 行を stdout へ出力する `sign-data` command も利用できます。
+
+```text
+edgca sign-data --key <private-key.pem>
+                 (--data-file <path> | --data-base64url <value>)
+                 --signature-format <der|ieee-p1363>
+```
+
+curl 等の shell client では、専用 JavaScript helper を置かず次の形で使えます。
+
+```sh
+signature=$(edgca sign-data \
+  --key "$client_key" \
+  --data-base64url "$signing_input" \
+  --signature-format ieee-p1363)
+```
+
+`npx @noz-ele/edgca sign-data ...` と `edgca sign-data ...` は同じ CLI command を実行します。前者は `npx` がnpm package を cache へ取得して `bin: edgca` を起動する呼び出し方、後者は local / global install 済みの同じ `bin` を直接起動する呼び出し方です。
 
 `--subject` は OpenSSL 互換の DN 文字列 (`"CN=foo,O=bar,C=JP"`) を受け取ります。短縮名は大文字小文字を区別せず (`CN`/`O`/`OU`/`C`/`ST`/`L`/`E`/`DC`/`SERIALNUMBER`/`STREET`/`POSTALCODE`/`TITLE`/`GIVENNAME`/`SURNAME`/`UID`)、dotted OID 形式 (`1.2.840.113549.1.9.1=...`) もそのまま受理します。秘密鍵は PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`) として読み書きします。SEC1 (`EC PRIVATE KEY`) は非対応です。
 
@@ -436,6 +467,26 @@ ECDSA signature は 2 つの整数 `(r, s)` から成り、同じ署名でも by
 
 したがって関数名は `verifyProofOfPossession` ではありません。nonce の新鮮性やリプレイ防止を含む application protocol が成立して初めて、全体として proof-of-possession になります。
 
+## Arbitrary-data signing
+
+`signData` は caller が保持する ECDSA `CryptoKey` で任意の生 byte 列を署名します。Node.js、Cloudflare Workers、modern browser で同じ API を使えるよう、署名本体は `globalThis.crypto.subtle`、`CryptoKey`、`Uint8Array` だけで実装します。
+
+```ts
+import { signData } from "@noz-ele/edgca/sign";
+
+const signature = await signData({
+  privateKey,
+  // 事前 hash ではなく署名対象そのもの。
+  data: signingInput,
+  signatureFormat: "ieee-p1363"
+});
+```
+
+- ECDSA NIST P-256 / P-384 / P-521 のみを受け、それぞれ SHA-256 / SHA-384 / SHA-512 を使います。
+- `signatureFormat` は `"der"` または `"ieee-p1363"` の必須指定で、形式は推測しません。
+- library API は PEM string や key path を受けません。`CryptoKey` の生成・import・保管は caller が担当します。PEM file を直接扱う利用者には Node.js 専用の `edgca sign-data` CLI を提供します。
+- `signData` は nonce、challenge、HTTP request canonicalization、期限、保存、リプレイ防止を扱いません。渡された bytes への署名だけを行います。
+
 ## CSR から発行する
 
 client が秘密鍵を自分で管理し PKCS#10 CSR を送ってくる場合、EdgCA は CSR を parse し、所持証明 (POP) 署名を検証し、CSR 内の公開鍵を埋めた証明書を発行できます。CSR が主張する subject / SAN は **library が自動採用しません** — 発行内容は呼び出し側が application 層のポリシーに従って明示的に渡します。
@@ -509,6 +560,10 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 - 発行済み証明書 + 秘密鍵の PFX (PKCS#12) export。PBES2 (PBKDF2-HMAC-SHA-256 + AES-256-CBC) と HMAC-SHA-256 MAC で構成し、対象は Win11+ / Server 2019+ / macOS 15+ / iOS/iPadOS 18+ / modern Linux consumer。
 - Basic Constraints、Key Usage、Extended Key Usage、Subject Alternative Name、SKI、AKI。
 
+- caller が渡した `CryptoKey` による任意データの ECDSA 署名 (`signData`)。DER / IEEE P1363 形式を caller が明示する。
+- root からは再 export しない opt-in subpath `@noz-ele/edgca/sign`。
+- PKCS#8 PEM を読み、渡された file bytes または base64url bytes を署名し、base64url で出力する `edgca sign-data` CLI。
+
 意図的に対象外:
 
 - server certificate 発行。leaf scope は mTLS client cert と文書署名 cert のみ。
@@ -521,7 +576,7 @@ dotted OID 文字列も受け付けます。値の ASN.1 文字列型は UTF8Str
 - Cloudflare 固有 textual time の parse。verify module は certificate DER 内の時刻だけを parse する。
 - CRL、OCSP、失効 DB、失効確認。
 - TLS handshake の `CertificateVerify` と TLS connection 自体への proof-of-possession binding。
-- nonce、challenge、HTTP message 正規化、リプレイ防止を含む application-layer proof-of-possession protocol。EdgCA は certificate 公開鍵による署名検証プリミティブだけを提供する。
+- nonce、challenge、HTTP message 正規化、リプレイ防止を含む application-layer proof-of-possession protocol。EdgCA が扱うのは caller が構築した byte 列の署名生成 (`signData`) と certificate 公開鍵による署名検証 (`verifyCertificateSignature`) まで。
 - server certificate の hostname / SAN identity 検証。
 - 鍵の保管、暗号化保存、ローテーション永続化、KV/D1/R2/Secrets 連携。
 - 発行・CSR・certificate 検証における RSA、EdDSA、別 elliptic curve。

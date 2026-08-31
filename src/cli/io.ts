@@ -15,25 +15,35 @@ import {
 const EC_CURVES = ["P-256", "P-384", "P-521"] as const;
 type EcCurve = (typeof EC_CURVES)[number];
 
-export async function importPkcs8PrivateKeyFromPem(pem: string): Promise<CryptoKey> {
+export async function importPkcs8PrivateKeyFromPem(
+  pem: string,
+  extractable = true
+): Promise<CryptoKey> {
   const der = pemToDerWithLabel(pem, "PRIVATE KEY");
   let lastError: unknown;
-  for (const namedCurve of EC_CURVES) {
-    try {
-      return await crypto.subtle.importKey(
-        "pkcs8",
-        arrayBufferFromBytes(der),
-        { name: "ECDSA", namedCurve },
-        true,
-        ["sign"]
-      );
-    } catch (err) {
-      lastError = err;
+  try {
+    for (const namedCurve of EC_CURVES) {
+      const importBuffer = arrayBufferFromBytes(der);
+      try {
+        return await crypto.subtle.importKey(
+          "pkcs8",
+          importBuffer,
+          { name: "ECDSA", namedCurve },
+          extractable,
+          ["sign"]
+        );
+      } catch (err) {
+        lastError = err;
+      } finally {
+        new Uint8Array(importBuffer).fill(0);
+      }
     }
+    throw new Error(
+      `Unable to import PRIVATE KEY as ECDSA P-256/P-384/P-521 PKCS#8: ${describe(lastError)}`
+    );
+  } finally {
+    der.fill(0);
   }
-  throw new Error(
-    `Unable to import PRIVATE KEY as ECDSA P-256/P-384/P-521 PKCS#8: ${describe(lastError)}`
-  );
 }
 
 export async function cryptoKeyToPkcs8Pem(key: CryptoKey): Promise<string> {

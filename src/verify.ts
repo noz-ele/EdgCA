@@ -13,7 +13,9 @@ import {
   parseCertificateDerForVerification,
   type ParsedCertificateForVerification
 } from "./parser.js";
-import type { CertificateAuthority } from "./types.js";
+import type { CertificateAuthority, EcdsaSignatureFormat } from "./types.js";
+
+export type { EcdsaSignatureFormat } from "./types.js";
 
 export interface VerifyClientCertificateValidity {
   notBefore: Date | number;
@@ -42,8 +44,6 @@ export interface VerifyCertificateChainOptions {
   at?: Date | number;
   purpose?: CertificateVerificationPurpose;
 }
-
-export type EcdsaSignatureFormat = "der" | "ieee-p1363";
 
 export interface VerifyCertificateSignatureOptions {
   certificatePem: string;

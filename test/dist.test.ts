@@ -20,9 +20,18 @@ describe("published dist API", () => {
   it("exposes isolated issuer and verify entry points", async () => {
     const issuer = await import("../dist/issuer.js");
     const verifier = await import("../dist/verify.js");
+    const signer = await import("../dist/sign.js");
+    const rootEntry = await import("../dist/index.js");
+    const pkcs12 = await import("../dist/pkcs12.js");
     expect("verifyCertificateChain" in issuer).toBe(false);
     expect("verifyCertificateSignature" in issuer).toBe(false);
     expect("createRootCA" in verifier).toBe(false);
+    expect("signData" in signer).toBe(true);
+    expect("createRootCA" in signer).toBe(false);
+    expect("signData" in rootEntry).toBe(false);
+    expect("signData" in issuer).toBe(false);
+    expect("signData" in verifier).toBe(false);
+    expect("signData" in pkcs12).toBe(false);
 
     const root = await issuer.createRootCA({
       subject: [{ type: "CN", value: "entrypoint-root" }],
@@ -50,6 +59,18 @@ describe("published dist API", () => {
       certificatePem: client.certPem,
       data,
       signature,
+      signatureFormat: "ieee-p1363"
+    })).resolves.toBe(true);
+
+    const signedBySubpath = await signer.signData({
+      privateKey: client.privateKey,
+      data,
+      signatureFormat: "ieee-p1363"
+    });
+    await expect(verifier.verifyCertificateSignature({
+      certificatePem: client.certPem,
+      data,
+      signature: signedBySubpath,
       signatureFormat: "ieee-p1363"
     })).resolves.toBe(true);
   });

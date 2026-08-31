@@ -2,7 +2,7 @@
 
 > [日本語](../jp/API.md) | English
 
-This document describes the public API exported by `@noz-ele/edgca`.
+This document describes the public API of the `@noz-ele/edgca` npm package.
 
 ```ts
 import {
@@ -50,9 +50,15 @@ import {
 } from "@noz-ele/edgca/verify";
 
 import { exportPkcs12 } from "@noz-ele/edgca/pkcs12";
+
+import {
+  signData,
+  type EcdsaSignatureFormat,
+  type SignDataOptions
+} from "@noz-ele/edgca/sign";
 ```
 
-`./issuer` does not statically import the verification module, and `./verify` needs only PEM/DER certificates and public keys—not `CertificateAuthority.privateKey`. The package remains `sideEffects: false`.
+`signData` and `SignDataOptions` are exported only from `./sign`, not from the root. The existing `EcdsaSignatureFormat` type remains available from the root and `./verify` for compatibility and is also exported type-only from `./sign`. Existing entry points do not statically import the sign module. `./issuer` does not statically import the verification module, and `./verify` needs only PEM/DER certificates and public keys—not `CertificateAuthority.privateKey`. The package remains `sideEffects: false`.
 
 ECDSA on **NIST P-256, P-384, and P-521** is supported. The internal default for auto-generated keys is P-256; callers who want a different curve generate a `CryptoKeyPair` with WebCrypto and pass it via the `keyPair` option. The signature hash for each curve follows the standard pairing (P-256/SHA-256, P-384/SHA-384, P-521/SHA-512). A CA hierarchy may mix curves (e.g., P-256 root → P-384 intermediate → P-521 leaf); each cert's signatureAlgorithm reflects the **issuer**'s curve.
 
@@ -197,12 +203,24 @@ type CertificateChainVerificationResult =
 type EcdsaSignatureFormat = "der" | "ieee-p1363";
 ```
 
-The byte encoding accepted by `verifyCertificateSignature`:
+The byte encoding accepted by `verifyCertificateSignature` and returned by `signData`:
 
 - `"der"`: ASN.1 `SEQUENCE { INTEGER r, INTEGER s }`; the total length varies because of INTEGER sign-preserving encoding.
 - `"ieee-p1363"`: fixed-width `r || s`, zero-padded to the curve component size. P-256 is 64 bytes, P-384 is 96 bytes, and P-521 is 132 bytes.
 
 The format is mandatory and is never inferred from the bytes. RFC 9421 `ecdsa-p256-sha256` and `ecdsa-p384-sha384` signatures use `"ieee-p1363"`.
+
+### `SignDataOptions`
+
+```ts
+interface SignDataOptions {
+  privateKey: CryptoKey;
+  data: Uint8Array;
+  signatureFormat: EcdsaSignatureFormat;
+}
+```
+
+`privateKey` must be a private ECDSA key on P-256, P-384, or P-521 whose usages include `"sign"`. `data` is the message passed to WebCrypto before hashing, not a precomputed digest. `signatureFormat` is mandatory.
 
 ### `ExportPkcs12Input`
 
@@ -521,6 +539,30 @@ const result = await verifyCertificateChain({
   purpose: "clientAuth"
 });
 ```
+
+### `signData(options)`
+
+Signs caller-supplied bytes with an ECDSA private `CryptoKey`.
+
+```ts
+function signData(options: SignDataOptions): Promise<Uint8Array>;
+```
+
+```ts
+import { signData } from "@noz-ele/edgca/sign";
+
+const signature = await signData({
+  privateKey,
+  data: signingInput,
+  signatureFormat: "ieee-p1363"
+});
+```
+
+P-256, P-384, and P-521 select SHA-256, SHA-384, and SHA-512 respectively. `"ieee-p1363"` returns fixed-width `r || s`; `"der"` returns ASN.1 `SEQUENCE { INTEGER r, INTEGER s }`. The function does not mutate caller-owned inputs.
+
+The implementation uses only `globalThis.crypto.subtle`, `CryptoKey`, and `Uint8Array`, so the same library API runs on Node.js, Cloudflare Workers, and modern browsers. It does not accept PEM text, PKCS#8 bytes, or a key path. The Node.js-only `edgca sign-data` CLI handles unencrypted PKCS#8 PEM files and delegates the signing operation to this function.
+
+This primitive does not construct, store, or consume challenges; canonicalize HTTP messages; prevent replay; or send requests.
 
 ### `verifyCertificateSignature(options)`
 
@@ -940,7 +982,7 @@ EdgCA does not provide:
 - Parsing Cloudflare-specific textual time values. The verification module parses DER certificate times; the legacy API still accepts caller-provided values.
 - CRL, OCSP, revocation databases, revocation checks.
 - TLS `CertificateVerify` validation or proof-of-possession binding to the TLS connection.
-- Application-layer proof-of-possession protocol state such as nonce/challenge management, HTTP message canonicalization, one-time consumption, and replay prevention. `verifyCertificateSignature` only verifies caller-supplied bytes.
+- Application-layer proof-of-possession protocol state such as nonce/challenge management, HTTP message canonicalization, one-time consumption, and replay prevention. `signData` signs caller-supplied bytes and `verifyCertificateSignature` verifies caller-supplied bytes; neither implements the protocol.
 - Server hostname/SAN identity verification.
 - Key storage, encryption-at-rest, or Cloudflare storage integration.
 - Key format conversion (PEM ↔ CryptoKey, JWK ↔ CryptoKey, etc.). The choice and conversion of a persistence format are done by the caller, using the WebCrypto API directly.
